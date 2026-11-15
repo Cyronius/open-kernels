@@ -1,9 +1,10 @@
-# Sync ledger: phlegm <-> openflowlm-next
+# Sync ledger: open-kernels <-> openflowlm-next
 
-phlegm is the canonical home of `open_kernels/` and `specs/open-engine/`. openflowlm-next
-(https://github.com/Atomic-Germ/openflowlm-next) receives the work as pull requests. Both trees use the same paths, so a
-sync is a plain diff of these directories and the matching `src/open_qwen36/`
-reader changes. Phlegm keeps the C++ engine permanently; Rust owns its application.
+open-kernels (https://github.com/Cyronius/open-kernels) is the canonical home of `open_kernels/`, `src/open_qwen36/`,
+`npu_offload/`, `viz/` and `specs/open-engine/`. It was split from phlegm on 2026-11-15, at phlegm `c9ec357`, with
+full history; phlegm now mounts it as a submodule at `open-kernels/`. Earlier entries below say "phlegm" for this tree.
+openflowlm-next (https://github.com/Atomic-Germ/openflowlm-next) receives the work as pull requests. Both trees use
+the same paths, so a sync is a plain diff of these directories and the matching `src/open_qwen36/` reader changes.
 
 ## Rules
 

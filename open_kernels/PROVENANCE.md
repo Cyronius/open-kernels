@@ -2,7 +2,8 @@
 
 ## Where this tree lives
 
-phlegm (https://github.com/Cyronius/phlegm) is the canonical home of `open_kernels/` from 2026-10-19 on. Work flows
+phlegm (https://github.com/Cyronius/phlegm) was the canonical home of `open_kernels/` from 2026-10-19. On 2026-11-15 it
+moved, with full history, to open-kernels (https://github.com/Cyronius/open-kernels), its home since then. Work flows
 out to openflowlm-next (https://github.com/Atomic-Germ/openflowlm-next) as pull requests; `UPSTREAM.md` is the
 ledger of what went each way.
 
