@@ -280,3 +280,20 @@ def test_dxl_score_split_is_on_by_default_and_the_probe_turns_it_off(monkeypatch
     monkeypatch.setenv("ATTN_T8_SPLIT", "0")
     assert attnknobs.t8_split_flags() == []
     assert "ATTN_T8_SPLIT" in attnknobs.PROBE_VARS
+
+
+def test_four_cores_a_kv_head_only_for_the_measured_shape(monkeypatch):
+    """OPEN-ATTN-KVSLICE KVCORES 4: MiniCPM5-2B (llama3, 16 over 2 at hd 128) by default; other shapes keep theirs."""
+    from recipes import attnknobs as A
+    for var in ("ATTN_KVCORES", "ATTN_KVSLICE", "ATTN_G4CORES"):
+        monkeypatch.delenv(var, raising=False)
+    want = {"minicpm5-2b": (4, 4), "qwen25-3b": (0, 0), "granite42-3b": (4, 2), "llama32-1b": (0, 0),
+            "llama32-3b": (0, 0), "llama31-8b": (0, 0)}
+    for name, (ks, kvc) in want.items():
+        s = load_spec(SPECS / f"{name}.json")
+        assert (A.kvslice(s, 4, 4), A.kv_cores(s, s.num_heads, s.num_kv_heads, s.head_dim, 4, 4)) == (ks, kvc), name
+    s = load_spec(SPECS / "minicpm5-2b.json")
+    monkeypatch.setenv("ATTN_KVCORES", "0")
+    assert A.kv_cores(s, 16, 2, 128, 4, 4) == 0          # the probe turns it off for an A/B build
+    monkeypatch.setenv("ATTN_KVCORES", "4")
+    assert A.kv_cores(s, 16, 2, 128, 4, 0) == 0          # never without per-core windows

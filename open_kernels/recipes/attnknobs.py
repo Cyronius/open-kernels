@@ -104,6 +104,16 @@ def tree8(spec: ModelSpec, nhl: int, rb: int, hd: int) -> bool:
 # Measured bit-identical (OPEN-ATTN-KVSLICE): each attention core streams its own kv heads of the window; ATTN_KVSLICE=0 / 1 forces it.
 KVSLICE_MEASURED = ("granite",)
 
+# Shapes measured with 4 attention cores a kv head (attn.h ATTN_G5 at 2 heads a core) on top of KVSLICE, by
+# (family, heads, kv heads, head dim) so a family's other shapes keep their kernels. MiniCPM5-2B (2026-11-15, O7):
+# 256 forced decode steps after 4352- and 16320-token prefixes byte-identical to the shipped 4-core broadcast
+# kernel; paired decode 65-70 -> 45-48 ms at 1k, 278-288 -> 146-157 ms at 16k (OPEN-FAMILY-LLAMA3).
+KVCORES4_MEASURED = (("llama3", 16, 2, 128),)
+
+
+def _kvcores4_measured(spec: ModelSpec) -> bool:
+    return (spec.family, spec.num_heads, spec.num_kv_heads, spec.head_dim) in KVCORES4_MEASURED
+
 
 def kv_slices(nh: int, kvh: int, acores: int, share: int = 1, h0s: list[int] | None = None) -> tuple[int, list[int]]:
     """(kv heads a window slice, each core's first kv head), attn.h attn_kvb's rule: clamped inside the row, or with
@@ -124,7 +134,7 @@ KVCORES_MEASURED: dict[str, int] = {"granite": 2}
 
 
 def kv_cores(spec: ModelSpec, nh: int, kvh: int, hd: int, rb: int, kvsl: int) -> int:
-    """Attention cores per kv head: 0 (the head split of attn_cores), 1 or 2 (attn.h ATTN_G5)."""
+    """Attention cores per kv head: 0 (the head split of attn_cores), 1, 2 or 4 (attn.h ATTN_G5)."""
     forced = os.environ.get("ATTN_KVCORES")
     # An explicit Llama experiment: the existing G5 implementation also handles
     # four heads. Share each two-KV-head stream between two attention cores.
@@ -133,6 +143,11 @@ def kv_cores(spec: ModelSpec, nh: int, kvh: int, hd: int, rb: int, kvsl: int) ->
             and kvsl and nh == 32 and kvh == 8 and hd == 64 and rb == 4):
         return 1
     n = int(forced) if forced is not None else KVCORES_MEASURED.get(spec.family, 0)
+    # 4 cores a kv head: each kv head's query heads split evenly over 4 cores (2 a core at 16 over 2) that read
+    # that kv head's window slice. The measured shapes by default, ATTN_KVCORES=4 / 0 forces it on / off.
+    if ((forced == "4" or (forced is None and _kvcores4_measured(spec))) and spec.family == "llama3" and kvsl
+            and kvh * 4 <= 16 and nh % (4 * kvh) == 0 and nh // (4 * kvh) <= 5 and rb in (2, 4)):
+        return 4
     return n if n in (1, 2) and kvsl and kvh == 8 and nh == 5 * kvh and hd == 64 and rb in (4, 8) else 0
 
 
@@ -140,7 +155,8 @@ def kvslice(spec: ModelSpec, acores: int, rb: int, qkv_bias: bool = False, windo
             env: str = "ATTN_KVSLICE", measured: tuple[str, ...] | None = None) -> int:
     """Rows a per-core window element holds (the manifest's `kvslice`); 0 keeps the broadcast (bias: no free column)."""
     forced = os.environ.get(env)
-    on = (forced == "1") if forced is not None else spec.family in (KVSLICE_MEASURED if measured is None else measured)
+    on = (forced == "1") if forced is not None else (spec.family in (KVSLICE_MEASURED if measured is None else measured)
+                                                     or (measured is None and _kvcores4_measured(spec)))
     return rb if on and acores > 1 and rb > 1 and not qkv_bias and not window else 0
 
 

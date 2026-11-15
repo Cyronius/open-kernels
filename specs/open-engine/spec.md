@@ -515,7 +515,12 @@ of one kv head share every K and V row they load, and give logits byte-identical
 - **`dxl`** (the L-row pass) takes the same per-core windows when its family is in `DXL_KVSLICE_MEASURED`: core c of every row
   group reads one slice stream shared by the groups, each group walking its own blocks and tail element and skipping the rest
   (`dxl_attn_skipw`), so `dxl` stays bit-identical to `dx`.
-- Probe variables (OPEN-ATTN-CONTEXT): `ATTN_KVSLICE`, `ATTN_DXL_KVSLICE`, `ATTN_KVCORES`, `ATTN_G5_PVROLL`.
+- **4 cores a kv head (`KVCORES` 4)** for the shapes in `KVCORES4_MEASURED`, keyed by (family, heads, kv heads, head dim) so
+  a family's other shapes keep their kernels: a kv head's query heads split evenly over 4 cores (MiniCPM5-2B, 16 over 2 at
+  head dim 128: 8 cores of 2 heads on row 4, attn.h `ATTN_G5` at `ATTN_NHL=2`, the original exponential, `ATTN_EXPA=0`).
+  Each kv head is its own window stream (`KVS` 1, two streams read by 4 cores each); kv heads share a stream in pairs only
+  when one stream a kv head would need more free shim channels than there are (Granite, Gemma 4 unchanged).
+- Probe variables (OPEN-ATTN-CONTEXT): `ATTN_KVSLICE`, `ATTN_DXL_KVSLICE`, `ATTN_KVCORES` (0 / 1 / 2 / 4), `ATTN_G5_PVROLL`.
 
 **Acceptance criteria:**
 - `--dump-logits` over 70 prompt tokens + 20 decoded, one token at a time, on the set and on the broadcast set: every logit file
@@ -1806,6 +1811,23 @@ a token, development machine). A second prompt (a Fibonacci function) is coheren
 (`make_decode.py` reads only a q4nx container) and `flm-test`; the new attention tuple is in the catalogue on the strength of the
 two-request llama.cpp match and the unit test, not the OPEN-FAMILY-QWEN3 slice procedure. `chat.py` does not know MiniCPM's
 `<|im_start|>` template; the runs above pass token ids to `open_qwen36_cli`.
+
+**Decode attention, 2026-11-15 (MiniCPM5-2B, O7; Strix Halo, Linux, in-tree engine, compact GGUF set, development runs under the
+npu lease, host load ~15 from other sessions):** the 4-core head split broadcast both kv heads to every core and gave each core
+4 heads. `KVSLICE` alone (4 cores, one kv head each) and then `KVCORES` 4 (8 cores of 2 heads, OPEN-ATTN-KVSLICE) were measured
+in two alternating rounds of 31 decode tokens after 993-, 8191- and 16320-token prompts (`open_qwen36_cli --gemm-block`, OMP 16):
+
+| context | shipped (4 cores, broadcast) | `KVSLICE` | `KVCORES` 4 |
+|---|---|---|---|
+| 1k | 70 / 65 ms | 53 / 64 ms | 48 / 45 ms |
+| 8k | 160 / 170 ms | 137 / 134 ms | 95 / 92 ms |
+| 16k | 278 / 288 ms | 231 / 231 ms | 157 / 146 ms |
+
+The context slope goes from about 14 to 6.8 us a cached position; at 16k the 42 layers take 139 ms against 277 (the head
+7-9 ms in both). Greedy tokens are identical to the shipped kernel in all twelve runs, and the logits of 256 forced decode
+steps after 4352- and 16320-token prefixes are byte-identical to it (fp32 torch reference, same for both: median cos
+0.999871 / 0.999850, argmax 250 / 244 of 256, loss ratio 0.9997 / 1.0004); forced decode 99.5 -> 65.8 ms at 4352 and
+284 -> 152 ms at 16320. `dx` program memory 13616 of 16384 B. The shape joined `KVCORES4_MEASURED` on this evidence.
 
 **Nanbeige4.1-3B (2026-09-10).** Declares `model_type: llama` and is one for the
 recipe: 2560 / 32 / 10752, 20 query heads over 4 kv heads at head_dim 128 (GQA group

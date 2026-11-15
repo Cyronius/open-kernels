@@ -185,7 +185,7 @@ if AWIDE or G.KVSLICE:
     # program memory by up to 448 B at 2 rows a call: the integer scalar routines and one exponential, both
     # bit-identical, leave 656 B free at 4
     ATTN_FLAGS.extend(["-DATTN_INTFP=1", "-DATTN_EXP32=1"])
-KVC = kv_cores(SPEC, G.NH, G.KVH, G.HD, RB, KVSL)       # attention cores per kv head (attn.h ATTN_G5): 0, 1 or 2
+KVC = kv_cores(SPEC, G.NH, G.KVH, G.HD, RB, KVSL)       # attention cores per kv head (attn.h ATTN_G5): 0, 1, 2 or 4
 GRP = G.NH // G.KVH
 if KVC == 2:
     SPLIT = (3, 2)                                     # the 5 heads of a kv head: the longer part sets the pace
@@ -193,8 +193,8 @@ if KVC == 2:
     CORE_NHL = [SPLIT[c % 2] for c in range(ACORES)]
     CORE_H0 = [(c // 2) * GRP + (0 if c % 2 == 0 else SPLIT[0]) for c in range(ACORES)]
     NHL = max(SPLIT)
-elif KVC:
-    ACORES, NHL = G.KVH, GRP
+elif KVC:                                              # KVC cores a kv head, its GRP heads split evenly
+    ACORES, NHL = KVC * G.KVH, GRP // KVC
 if KVC:
     ATTN_FLAGS = [f for f in ATTN_FLAGS if not f.startswith("-DATTN_NHL=")] + [f"-DATTN_NHL={NHL}"]
 if KVC != 2:
@@ -204,7 +204,7 @@ if T8:
     ATTN_FLAGS.extend(tree8_flags(4))
 elif KVC:                                              # TREE8's companions, the G5 tree in its place
     ATTN_FLAGS.extend([f for f in tree8_flags(4) if not f.startswith("-DATTN_TREE8")] + ["-DATTN_G5=1"])
-    if GRP == 4 and "ATTN_EXPA" not in os.environ:
+    if GRP != 5 and "ATTN_EXPA" not in os.environ:
         # The Llama placement probe keeps its original exponential. Granite's
         # measured G5 default uses EXPA=2; that is a separate arithmetic change.
         ATTN_FLAGS = [f for f in ATTN_FLAGS if not f.startswith("-DATTN_EXPA=")]
@@ -216,7 +216,7 @@ if KVSL:
     KW_COLS = [c for c in range(NSHIM) if _mm2s[c] < 2]
     # The cores of `share` kv heads read one stream when one slice a core needs more streams than
     # there are free channels (Gemma 4's local layers on 8 cores: 8 kv heads, 5 free columns -> 4 pairs).
-    KV_SHARE = 2 if KVC else 1
+    KV_SHARE = 2 if KVC and G.KVH > len(KW_COLS) else 1    # pairs only when one stream a kv head does not fit
     while not KVC and len(set(kv_slices(G.NH, G.KVH, ACORES, KV_SHARE, CORE_H0)[1])) > len(KW_COLS) \
             and G.KVH % (2 * KV_SHARE) == 0 and G.NH // ACORES <= G.NH // G.KVH:
         KV_SHARE *= 2
