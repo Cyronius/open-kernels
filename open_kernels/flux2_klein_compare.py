@@ -4,7 +4,8 @@ published reference (flux2_klein_reference.py) with the same prompt and noise.
     python open_kernels/flux2_klein_compare.py --native <native out> --reference <ref out>
 
 Reports final packed latents (relative L2, cosine) and pixels (MAE in 8-bit levels,
-PSNR), and writes compare.json into the native directory.
+PSNR, and with --lpips the AlexNet LPIPS, which needs torch and lpips), and writes
+compare.json into the native directory.
 """
 
 from __future__ import annotations
@@ -18,10 +19,20 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 
+def lpips_alex(x: np.ndarray, y: np.ndarray) -> float:
+    import lpips
+    import torch
+    net = lpips.LPIPS(net="alex", verbose=False)
+    t = [torch.from_numpy(v / 127.5 - 1).permute(2, 0, 1)[None].float() for v in (x, y)]
+    with torch.no_grad():
+        return float(net(t[0], t[1]).item())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--native", type=Path, required=True)
     ap.add_argument("--reference", type=Path, required=True)
+    ap.add_argument("--lpips", action="store_true", help="also LPIPS (AlexNet), needs torch + lpips")
     a = ap.parse_args()
     from PIL import Image
 
@@ -43,6 +54,8 @@ def main() -> int:
            "edit": ns["edit"], "latents_rel_l2": rel, "latents_cosine": cos,
            "latents_finite": bool(np.isfinite(got).all()),
            "pixel_mae_255": mae, "pixel_psnr_db": psnr}
+    if a.lpips:
+        out["lpips_alex"] = lpips_alex(x, y)
     (a.native / "compare.json").write_text(json.dumps(out, indent=1))
     print(json.dumps(out, indent=1))
     return 0

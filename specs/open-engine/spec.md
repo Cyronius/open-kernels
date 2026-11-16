@@ -9389,3 +9389,52 @@ is declared before measurements: median cosine >=.9990, at most5pp argmax drop,
 NLL <=sequential*1.01; strict remains .9999/1pp/*1.005. Record CPU||route KL.
 See utilities/gguf-prefill/README.md and the active performance plan for commands
 and actual hardware evidence; the interface alone is not a speed or quality claim.
+
+### IMAGE-FLUX2-GGUF: the FLUX.2 [klein] DiT from a published GGUF
+**Applies to:** phlegm (`open_kernels/klein_gguf.py`, `open_kernels/flux2_native_generate.py`, `phlegm-core/src/image.rs`)
+**Verification:** test
+**Tests:** `specs/open-engine/tests/test_klein_gguf.py`
+
+With `--transformer-gguf FILE` (config `transformer_gguf`), the native FLUX.2
+runner shall read the DiT from the GGUF and the text encoder, VAE and tokenizer
+from the diffusers checkpoint, because no GGUF of those exists. BFL names map to
+diffusers names, fused q|k|v splits in q, k, v order, the geometry comes from the
+tensor shapes, and the final adaLN halves swap when the file is in BFL's
+(scale, shift) order (detected against the checkpoint's own tensor, locally or by
+an HTTP range read, else assumed BFL with a warning). The packed-weight cache is
+`packed_gguf_<stem>/`, fingerprinted with the file's identity and the modulation
+order. Ported from OFLM c2a9e094.
+
+**Acceptance criteria:**
+- F32, F16, BF16, Q8_0, Q4_0 and Q4_1 decode to the stored values in HF layout.
+- Fused q|k|v tensors split into q, k, v per stream; single-block and norm names map.
+- A K-quant tensor is refused with "K-quant" in the error.
+- `bfl_modulation=True` swaps the halves of `norm_out.linear.weight` only.
+- The geometry read from tensor shapes matches the transformer config keys.
+
+### IMAGE-FLUX2-GGUF-FETCH: one command installs klein from a GGUF repo
+**Applies to:** phlegm (`open_kernels/klein_fetch.py`)
+**Verification:** manual
+
+`klein_fetch.py --out DIR --kernels SET` takes the best DiT quant from the repo
+(default `Atomic-Germ/FLUX.2-Klein-4B-OpenFLM-GGUF`, Q8_0 first), fetches or links
+the checkpoint parts its README's `base_model` names, records the modulation
+order, and writes a `phlegm image` config.
+
+**Verification (manual):** run it with `--gguf` and `--checkpoint` (or without, to
+download); the config it writes passes `phlegm image --config` and gives a
+coherent 512 image. Done 2026-11-14 on Windows (see the sub-spec).
+
+### IMAGE-FLUX2-WINDOWS: the flux2 backend on native Windows
+**Applies to:** phlegm (`phlegm-core/src/image.rs`, `open_kernels/flux2_native_generate.py`, `open_kernels/harness/npu_host.py`)
+**Verification:** manual
+
+On Windows, `phlegm image` and `phlegm serve-images` with `backend=flux2` shall run
+the runner directly (no bash), with the environment a PowerShell `env_script`
+leaves behind. The prompt reaches the runner byte for byte. The runner's default
+dispatch is one hardware context from the configuration's full ELF.
+
+**Verification (manual):** `phlegm image` with a prompt holding `"`, `;`, `$HOME`,
+`&` and `%PATH%` arrives unchanged in `summary.json`; `serve-images` answers
+`/v1/models`, a 1024 generation, 512 and 1024 edits with 200, and
+`guidance_scale` or an unsupported size with 400. Done 2026-11-14.
