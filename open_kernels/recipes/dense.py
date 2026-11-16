@@ -100,6 +100,7 @@ class DenseGeometry:
     QLOCAL: int = 0                                                 # attn.h ATTN_QLOCAL: a core keeps only its q heads
     AWIDE: int = 0                                                  # dx.py: attention cores on row 4, og joined in memtiles
     KVSLICE: int = 0                                                # dx.py: rows a per-core window element holds; 0 = attnknobs.kvslice
+    KVJOIN: int = 0                                                 # dx.py: k | v split as one 2*KVW projection (kv_join_cores)
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,28 @@ def cores_for(spec: ModelSpec) -> int:
         if all(w % (BAND_ROWS * n) == 0 for w in widths):
             return n
     return 1
+
+
+def kv_join_cores(spec: ModelSpec) -> int:
+    """Main cores for the decode layer when k | v are split as one 2*KVW-row projection, or 0.
+
+    cores_for caps a spec at the core count whose 64-row bands divide every width, and a
+    narrow kv width (MiniCPM5-2B: 2 kv heads x 128 = 256 rows) caps it at 4 while every other
+    width divides by 8. k and v sit next to each other in the pool and in the activation
+    buffer, so the 2*KVW rows can be banded as one run: core c streams band c of [k | v]
+    (cores 0-3 k, 4-7 v at 256). Every core still runs Q_PC + (one run of) kv bands, so the
+    core body is unchanged; only the runtime sequence's offsets differ.
+
+    Opt-in (DENSE_KVJOIN=1, a probe variable) until measured. Plain q4 attn role only: a
+    per-tensor q8 v (tensor_quant) has its own band size and symbol."""
+    if os.environ.get("DENSE_KVJOIN") != "1" or spec.tensor_quant or qkv_bias(spec):
+        return 0
+    base = cores_for(spec)
+    widths = (spec.hidden, spec.intermediate, spec.attn_q_width, 2 * spec.attn_kv_width)
+    for n in range(LIMITS["n_cols"], base, -1):
+        if all(w % (BAND_ROWS * n) == 0 for w in widths):
+            return n
+    return 0
 
 
 def pool_quant(spec: ModelSpec) -> str:
@@ -358,7 +381,7 @@ from .attnknobs import probe_env as attn_knobs_probe_env
 #                    FF fits whole, so the split can be compared against the whole path
 #                    on a model that is already tested end to end.
 #   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
-DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM", "DENSE_KVJOIN")
 
 
 def probe_env() -> dict[str, str]:
@@ -374,6 +397,8 @@ def probe_env() -> dict[str, str]:
 
 def geometry(spec: ModelSpec) -> DenseGeometry:
     n = cores_for(spec)
+    kvj = kv_join_cores(spec)
+    n = kvj or n
     hid, ff, nh, kvh, hd = spec.hidden, spec.intermediate, spec.num_heads, spec.num_kv_heads, spec.head_dim
     qw, kvw = nh * hd, kvh * hd
     e_a = kvw * 2
@@ -399,7 +424,7 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
         EPS=spec.norm_eps, ACT=spec.activation, SANDWICH=spec.sandwich_norms,
         WINDOW=spec.sliding_window if spec.has_local else 0, PER_CALL=pc, CALL_BYTES=pc * ch,
         QW=qw, KVW=kvw,
-        Q_PC=qw // BAND_ROWS // n, KV_PC=kvw // BAND_ROWS // n, O_PC=hid // BAND_ROWS // n,
+        Q_PC=qw // BAND_ROWS // n, KV_PC=0 if kvj else kvw // BAND_ROWS // n, O_PC=hid // BAND_ROWS // n,
         UP_PC=ff // BAND_ROWS // n, DOWN_PC=hid // BAND_ROWS // n,
         XN_ELEMS=roundup(hid * 2, ELEM) // ELEM, XN_BLOCKS=hid // 32,
         OG_ELEMS=roundup(qw * 2, ELEM) // ELEM, OG_BLOCKS=qw // 32,
@@ -413,6 +438,7 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
         NORM_SPLIT=os.environ.get("DENSE_NORM_SPLIT") == "1" or norm_split(spec),
         NORM_Q=norm_quarter(spec),
         **({"AWIDE": 1, "QLOCAL": 1} if aw else {}),
+        **({"KVJOIN": 1} if kvj else {}),
     )
 
 
