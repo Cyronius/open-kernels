@@ -358,12 +358,19 @@ from .attnknobs import (PROBE_VARS, RB_SUPPORTED, FAST_ATTENTION, MAX_ATTN_CORES
 
 # OPEN-DECODE-STREAM: families measured on dx's memtile weight ring and early weight issue (bit-identical).
 STREAM_MEASURED: tuple[str, ...] = ("granite",)
+# ... and single shapes (family, hidden, heads, kv heads, head dim) of other families. MiniCPM5-2B,
+# 2026-11-16, ring 16 + early issue against none, alternating, logits byte-identical: decode 41.1 ->
+# 38.8 ms/token at 1k (5 of 6 pairs; layers 34.2 -> 32.0 ms), 87.9 -> 85.6 at 8k. A GEMV_NULL build
+# of the ringless layer ran at the same 34.2 ms: the layer is stream-bound, not arithmetic-bound.
+STREAM_MEASURED_SHAPES: tuple[tuple, ...] = (("llama3", 2048, 16, 2, 128),)
 WRING_DEPTH = 16
 
 
 def stream_knobs(spec: ModelSpec) -> tuple[int, bool]:
     """(memtile ring depth in weight elements, 0 = shim straight to the core; early weight issue)."""
-    on = spec.family in STREAM_MEASURED and not spec.sandwich_norms and spec.quant == "q4_1"
+    shape = (spec.family, spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim)
+    on = ((spec.family in STREAM_MEASURED or shape in STREAM_MEASURED_SHAPES)
+          and not spec.sandwich_norms and spec.quant == "q4_1")
     ring = int(os.environ.get("DX_WRING", WRING_DEPTH if on else 0))
     # A sandwich family (Gemma 3 / 4) gets the early issue only when DX_WORDER=1 forces it, for
     # an A/B build: its two extra norm round trips sit between o and up | gate, where no weight

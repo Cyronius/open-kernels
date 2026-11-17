@@ -36,6 +36,10 @@ SCALES_F32 = int(os.environ.get("LMHEAD_SCALES_F32", 0))
 TILE_BYTES = 9216 if SCALES_F32 else 8704
 KERNEL_SYM = "lm_head_q8s32_group" if SCALES_F32 else "lm_head_q8_group"
 EXTRA_FLAGS = ["-DLMHEAD_SCALES_F32=1", "-DLMHEAD_Q8_PREFIX=lm_head_q8s32"] if SCALES_F32 else []
+# debug: LMHEAD_NULL=1 compiles the arithmetic out and keeps every DMA (lm_head_q8.h), for timing the
+# head's stream floor; the output is garbage. Not in the build key: give it its own --build-root.
+if int(os.environ.get("LMHEAD_NULL", 0)):
+    EXTRA_FLAGS = EXTRA_FLAGS + ["-DLMHEAD_NULL"]
 BAND_ROWS = 128
 ROW_SPLIT = 4           # 32-row quarters per 128-row band (lm_head_q8.h's kRowSplit)
 K = int(os.environ.get("LMHEAD_K", 2048))      # the hidden width; 2048 for the 27B, 4096 for Qwen3.5 dense

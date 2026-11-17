@@ -44,3 +44,10 @@ def test_kvjoin_leaves_eight_core_specs_alone(monkeypatch):
         monkeypatch.setenv('DENSE_KVJOIN', '1')
         assert dense.kv_join_cores(spec) == 0
         assert dense.geometry(spec) == g0
+
+
+def test_minicpm5_streams_through_the_memtile_ring(monkeypatch):
+    monkeypatch.delenv('DX_WRING', raising=False)
+    monkeypatch.delenv('DX_WORDER', raising=False)
+    assert dense.stream_knobs(load_spec(SPECS / 'minicpm5-2b.json')) == (dense.WRING_DEPTH, True)
+    assert dense.stream_knobs(load_spec(SPECS / 'llama32-1b.json')) == (0, False)
