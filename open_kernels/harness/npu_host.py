@@ -27,9 +27,10 @@ COMPLETED = pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED
 
 
 class Buf:
-    def __init__(self, npu: "Npu", name: str, nbytes: int):
+    def __init__(self, npu: "Npu", name: str, nbytes: int, bo=None):
         self.name, self.nbytes = name, nbytes
-        self.bo = pyxrt.bo(npu.dev, nbytes, pyxrt.bo.host_only, npu.group_kernel.group_id(3))
+        self.bo = bo if bo is not None else pyxrt.bo(npu.dev, nbytes, pyxrt.bo.host_only,
+                                                     npu.group_kernel.group_id(3))
         self.host = np.frombuffer(self.bo.map(), dtype=np.uint8)
         self._views = {}
 
@@ -132,3 +133,32 @@ class Npu:
 
     def buf(self, name: str, nbytes: int) -> Buf:
         return Buf(self, name, nbytes)
+
+
+class ElfNpu:
+    """One hardware context from a full ELF (compose_elf.py): every kernel set is a device of
+    it, kernels are "<set>:<stream>", and a set change is its configure-only kernel."""
+
+    def __init__(self, elf_path, cfg: dict[str, list[str]]):
+        self.dev = pyxrt.device(0)
+        self.elf = pyxrt.elf(str(elf_path))
+        self.ctx = pyxrt.hw_context(self.dev, self.elf)
+        self._kernels = {}
+        self.cfg = {s: [self.kernel(n) for n in names] for s, names in cfg.items()}
+
+    def kernel(self, name: str):
+        if name not in self._kernels:
+            self._kernels[name] = pyxrt.ext.kernel(self.ctx, name)
+        return self._kernels[name]
+
+    def buf(self, name: str, nbytes: int) -> Buf:
+        return Buf(self, name, nbytes, bo=pyxrt.ext.bo(self.dev, nbytes))
+
+    def runlist(self):
+        return pyxrt.runlist(self.ctx)
+
+    def run(self, name: str, *bos):
+        r = pyxrt.run(self.kernel(name))
+        for i, b in enumerate(bos):
+            r.set_arg(i, b)
+        return r
