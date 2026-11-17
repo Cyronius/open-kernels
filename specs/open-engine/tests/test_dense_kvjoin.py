@@ -60,3 +60,9 @@ def test_minicpm5_head_on_eight_cores(monkeypatch):
     head = dense.builds(spec)['lm_head_q8_gguf']
     assert head['env']['LMHEAD_CORES'] == '8' and head['build_dir'].endswith('_c8')
     assert dense.head_cores(load_spec(SPECS / 'llama32-1b.json')) == dense.cores_for(load_spec(SPECS / 'llama32-1b.json'))
+
+
+def test_minicpm5_attention_takes_the_fused_exponential():
+    from recipes import attnknobs
+    assert attnknobs.g5_expa(load_spec(SPECS / 'minicpm5-2b.json')) == 2
+    assert attnknobs.g5_expa(load_spec(SPECS / 'llama32-1b.json')) == 0

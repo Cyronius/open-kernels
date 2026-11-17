@@ -56,7 +56,7 @@ from ironutil import Pipeline, include_dirs, piece_tap  # noqa: E402
 import ln_split as LS  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
-from recipes.attnknobs import TREE8_STACK, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
+from recipes.attnknobs import TREE8_STACK, g5_expa, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
 from recipes.dense_precision import q8_projections, ROLES  # noqa: E402
 from recipes.dense import one_context, stream_knobs  # noqa: E402
 from recipes.qwen36moe import BAND_ROWS, ELEM, band_bytes, roundup  # noqa: E402
@@ -211,10 +211,10 @@ if T8:
 elif KVC:                                              # TREE8's companions, the G5 tree in its place
     ATTN_FLAGS.extend([f for f in tree8_flags(4) if not f.startswith("-DATTN_TREE8")] + ["-DATTN_G5=1"])
     if GRP != 5 and "ATTN_EXPA" not in os.environ:
-        # The Llama placement probe keeps its original exponential. Granite's
+        # Other G5 shapes keep vexpN unless measured (EXPA2_MEASURED: MiniCPM5-2B). Granite's
         # measured G5 default uses EXPA=2; that is a separate arithmetic change.
         ATTN_FLAGS = [f for f in ATTN_FLAGS if not f.startswith("-DATTN_EXPA=")]
-        ATTN_FLAGS.append("-DATTN_EXPA=0")
+        ATTN_FLAGS.append(f"-DATTN_EXPA={g5_expa(SPEC)}")      # EXPA2_MEASURED shapes take the fused exponential
 if KVSL:
     _mm2s = [0] * NSHIM                                # this design's own shim MM2S producers: lni, w_c, x, ain
     for _c in [0, 1, 2] + list(range(N_CORES)):

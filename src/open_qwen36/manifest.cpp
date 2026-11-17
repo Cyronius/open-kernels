@@ -222,10 +222,11 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         if (d.rb > 1 && d.patch != "attnpos")
             fail(where, "kernel " + k + ": rb " + std::to_string(d.rb) + " needs the attnpos patch table");
         d.kvslice = v.value("kvslice", 0ull);
-        // attn_stepw.cc takes blocks of 2 or 4 rows, and the padding is its own (attn_kvslice_rows), not rb's
-        if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4) || d.patch != "attnpos" || d.rb != 1))
+        // attn_stepw.cc takes blocks of 2, 4 or 8 rows (8: attn.h's block kernel at ATTN_RB 8), and the
+        // padding is its own (attn_kvslice_rows), not rb's
+        if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4 && d.kvslice != 8) || d.patch != "attnpos" || d.rb != 1))
             fail(where, "kernel " + k + ": kvslice " + std::to_string(d.kvslice) +
-                            " needs 2 or 4 rows, the attnpos patch table and rb 1");
+                            " needs 2, 4 or 8 rows, the attnpos patch table and rb 1");
         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos" && d.patch != "moebatch" &&
             d.patch != "attnrows")

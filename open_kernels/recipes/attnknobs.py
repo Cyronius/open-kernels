@@ -27,7 +27,7 @@ from .spec import ModelSpec
 # main cores: LX_NULL_DN compiles the DeltaNet arithmetic away, LX_NULL_GEMV the q4/q8 GEMV
 # tile body, both leaving every stream, fifo and DMA -- and so insts.bin -- byte-identical.
 PROBE_VARS = ("ATTN_T8_SPLIT", "ATTN_T8_SPLIT_U1", "ATTN_T8_SPLIT_U2", "ATTN_NULL", "ATTN_ABL", "ATTN_RB", "ATTN_FAST", "LX_NULL_DN", "LX_NULL_GEMV", "DXL_NULL_PREP", "DXL_NULL_LN", "ATTN_TREE8", "ATTN_REPEAT",
-              "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G4CORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT")
+              "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G4CORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT", "ATTN_INTFP")
 
 RB_SUPPORTED = (1, 2, 4, 8)   # attn_stepb.cc has bodies for 2 and 4; 1 is the unblocked path; 8 only on the windowed kernels
 
@@ -109,6 +109,19 @@ KVSLICE_MEASURED = ("granite",)
 # 256 forced decode steps after 4352- and 16320-token prefixes byte-identical to the shipped 4-core broadcast
 # kernel; paired decode 65-70 -> 45-48 ms at 1k, 278-288 -> 146-157 ms at 16k (OPEN-FAMILY-LLAMA3).
 KVCORES4_MEASURED = (("llama3", 16, 2, 128),)
+
+
+# (family, heads, kv heads, head dim) whose KVCORES (ATTN_G5) attention takes the fused degree-4 exponential (attn.h
+# ATTN_EXPA=2, Granite's measured G5 default; not bit-identical to vexpN). MiniCPM5-2B, 2026-11-17, 2 alternating rounds:
+# decode 38.2 -> 37.8 ms/token at 1k, 84.9 -> 81.0 at 8k; greedy 32 tokens identical at both; decgate vs the CPU
+# reference at P=4352 cos 0.999870 / argmax 250/256 / KL 8.2e-5 (shipped: 0.999871 / 250 / 9.4e-5) and at P=16320
+# 0.999841 / 243 / 6.0e-4 (shipped: 0.999850 / 244 / 5.5e-4).
+EXPA2_MEASURED = (("llama3", 16, 2, 128),)
+
+
+def g5_expa(spec: ModelSpec) -> int:
+    """attn.h ATTN_EXPA for a KVCORES (G5) attention core that is not Granite's: 2 for a measured shape, else 0."""
+    return 2 if (spec.family, spec.num_heads, spec.num_kv_heads, spec.head_dim) in EXPA2_MEASURED else 0
 
 
 def _kvcores4_measured(spec: ModelSpec) -> bool:
