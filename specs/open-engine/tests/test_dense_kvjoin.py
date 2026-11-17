@@ -1,4 +1,4 @@
-"""DENSE_KVJOIN: decode layer cores past the narrow-kv cap (recipes/dense.kv_join_cores).
+"""KVJOIN: decode layer cores past the narrow-kv cap (recipes/dense.kv_join_cores).
 
 MiniCPM5-2B's k / v are 256 rows each, so cores_for caps it at 4 while every other width
 divides by 8. Banded as one [k | v] run of 512 rows it splits one band per core over 8.
@@ -17,11 +17,11 @@ FLAGS = ('DENSE_GGUF_GEMM', 'DENSE_GGUF_HEAD_Q8', 'DENSE_GGUF_COMPACT', 'DENSE_G
 def test_kvjoin_lifts_minicpm5_to_eight_cores(monkeypatch):
     for flag in FLAGS:
         monkeypatch.setenv(flag, '1')
-    monkeypatch.delenv('DENSE_KVJOIN', raising=False)
+    monkeypatch.setenv('DENSE_KVJOIN', '0')
     spec = load_spec(SPECS / 'minicpm5-2b.json')
     g0, m0, k0 = dense.geometry(spec), manifest(spec), build_key(spec)
     assert (g0.N_CORES, g0.KV_PC, g0.KVJOIN) == (4, 1, 0)
-    monkeypatch.setenv('DENSE_KVJOIN', '1')
+    monkeypatch.delenv('DENSE_KVJOIN')               # measured: on by default for this shape
     g1, m1 = dense.geometry(spec), manifest(spec)
     assert (g1.N_CORES, g1.Q_PC, g1.KV_PC, g1.O_PC, g1.UP_PC, g1.DOWN_PC, g1.KVJOIN) == (8, 4, 0, 4, 12, 4, 1)
     # the same q | k | v rows per layer, one [k | v] band per core

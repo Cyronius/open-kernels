@@ -203,6 +203,12 @@ def cores_for(spec: ModelSpec) -> int:
     return 1
 
 
+# (family, hidden, heads, kv heads, head dim) measured faster on 8 joined-kv cores than on
+# cores_for's count, logits byte-identical. MiniCPM5-2B, 2026-11-16, quiet host, alternating:
+# decode 44.4 -> 41.1 ms/token at 1k, 91.2 -> 88.3 at 8k, 145.1 -> 140.6 at 16k.
+KVJOIN_MEASURED = (("llama3", 2048, 16, 2, 128),)
+
+
 def kv_join_cores(spec: ModelSpec) -> int:
     """Main cores for the decode layer when k | v are split as one 2*KVW-row projection, or 0.
 
@@ -213,9 +219,13 @@ def kv_join_cores(spec: ModelSpec) -> int:
     (cores 0-3 k, 4-7 v at 256). Every core still runs Q_PC + (one run of) kv bands, so the
     core body is unchanged; only the runtime sequence's offsets differ.
 
-    Opt-in (DENSE_KVJOIN=1, a probe variable) until measured. Plain q4 attn role only: a
-    per-tensor q8 v (tensor_quant) has its own band size and symbol."""
-    if os.environ.get("DENSE_KVJOIN") != "1" or spec.tensor_quant or qkv_bias(spec):
+    On for the shapes in KVJOIN_MEASURED; DENSE_KVJOIN=1 / 0 (a probe variable) forces it on
+    or off. Plain q4 attn role only: a per-tensor q8 v (tensor_quant) has its own band size
+    and symbol."""
+    forced = os.environ.get("DENSE_KVJOIN")
+    on = forced == "1" if forced is not None else (
+        (spec.family, spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim) in KVJOIN_MEASURED)
+    if not on or spec.tensor_quant or qkv_bias(spec):
         return 0
     base = cores_for(spec)
     widths = (spec.hidden, spec.intermediate, spec.attn_q_width, 2 * spec.attn_kv_width)
