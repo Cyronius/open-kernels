@@ -51,3 +51,12 @@ def test_minicpm5_streams_through_the_memtile_ring(monkeypatch):
     monkeypatch.delenv('DX_WORDER', raising=False)
     assert dense.stream_knobs(load_spec(SPECS / 'minicpm5-2b.json')) == (dense.WRING_DEPTH, True)
     assert dense.stream_knobs(load_spec(SPECS / 'llama32-1b.json')) == (0, False)
+
+
+def test_minicpm5_head_on_eight_cores(monkeypatch):
+    for flag in FLAGS:
+        monkeypatch.setenv(flag, '1')
+    spec = load_spec(SPECS / 'minicpm5-2b.json')
+    head = dense.builds(spec)['lm_head_q8_gguf']
+    assert head['env']['LMHEAD_CORES'] == '8' and head['build_dir'].endswith('_c8')
+    assert dense.head_cores(load_spec(SPECS / 'llama32-1b.json')) == dense.cores_for(load_spec(SPECS / 'llama32-1b.json'))

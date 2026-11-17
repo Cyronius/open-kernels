@@ -23,6 +23,8 @@ from ml_dtypes import bfloat16
 import aie.iron as iron
 from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
 from aie.iron.controlflow import range_
+from aie.iron.dataflow.objectfifo import ObjectFifoLink
+from aie.iron.device import Tile
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorAccessPattern
 from aie.utils import config
@@ -49,6 +51,12 @@ BAND_BYTES = PER_BAND * TILE_BYTES             # 278528 at K = 2048
 N = int(os.environ.get("LMHEAD_N", 248320))
 N_CORES = int(os.environ.get("LMHEAD_CORES", 8))
 PER_CALL = 2            # 2 x 8704 = 17408 B per element, x2 buffered -> 34 KB of L1
+# Probe: LMHEAD_WRING=n puts an n-deep memtile ring between the shim and each core's 2-deep L1 fifo
+# (dx.py's DX_WRING, F-0202), so the weight stream keeps going while a core computes. 0 = shim
+# straight to the core, the design every head was built with. Measured SLOWER on MiniCPM5-2B (2026-11-16, quiet
+# host, 3 rounds at 1k): head 6.6 -> 6.9 ms on 4 cores, 5.9 -> 6.3 on 8. Kept as a probe; not a default.
+WRING = int(os.environ.get("LMHEAD_WRING", 0))
+assert WRING <= 24, "lm_head_q8: a memtile ring deeper than 24 does not fit one BD pool"
 
 
 def _core_bytes(per_call: int) -> int:
@@ -111,6 +119,12 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
                             arg_types=[x_ty, tab_ty], include_dirs=_include_dirs())
 
     of_w = [ObjectFifo(elem_ty, name=f"w{c}", depth=2) for c in range(n_cores)]
+    w_src = of_w
+    if WRING:
+        of_wm = [ObjectFifo(elem_ty, name=f"wm{c}", depth=WRING) for c in range(n_cores)]
+        for c in range(n_cores):
+            ObjectFifoLink(of_wm[c].cons(channel=0), [of_w[c].prod(channel=1)], Tile(c, 1), [], [0])
+        w_src = of_wm
     of_y = [ObjectFifo(acc_ty, name=f"y{c}", depth=2) for c in range(n_cores)]
     of_x = ObjectFifo(x_ty, name="x", depth=1)
 
@@ -131,7 +145,7 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
     workers = [
         Worker(make_body(counts[c]),
                fn_args=[of_w[c].cons(), of_x.cons(), of_y[c].prod(), Buffer(tab_ty, name=f"tab{c}"), prep, kernel],
-               stack_size=0x1000)
+               stack_size=0x1000, **({"tile": Tile(c, 2)} if WRING else {}))
         for c in range(n_cores)
     ]
 
@@ -156,7 +170,8 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
         tg.finish()
 
     rt = Runtime(sequence, [w_ty, x_ty, y_ty,
-                            [f.prod() for f in of_w], of_x.prod(), [f.cons() for f in of_y]])
+                            ([f.prod(tile=Tile(c, 0)) for c, f in enumerate(w_src)] if WRING else
+                             [f.prod() for f in of_w]), of_x.prod(), [f.cons() for f in of_y]])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
@@ -164,4 +179,5 @@ DESIGN = lm_head_q8
 _src = (b"".join((HERE / f).read_bytes() for f in ("lm_head_q8.h", "lm_head_q8.cc"))
         + (GEMV / "gemv_tab.h").read_bytes() + f"K={K}".encode())
 SPECIALIZE = {"n": N, "n_cores": N_CORES, "per_call": PER_CALL,
-              "srchash": int(hashlib.sha1(_src + str(SCALES_F32).encode()).hexdigest()[:8], 16)}
+              "srchash": int(hashlib.sha1(_src + str(SCALES_F32).encode()
+                                          + (f"wring{WRING}".encode() if WRING else b"")).hexdigest()[:8], 16)}

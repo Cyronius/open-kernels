@@ -235,6 +235,19 @@ def kv_join_cores(spec: ModelSpec) -> int:
     return 0
 
 
+# (family, hidden, heads, kv heads, head dim) whose Q8_0 lm_head (lm_head_q8, bf16 scales) measured faster
+# on all 8 columns than on cores_for's count. MiniCPM5-2B, 2026-11-16, quiet host, 3 alternating rounds at 1k:
+# head 6.6 -> 5.9 ms, decode 25.4 -> 25.9 tok/s, greedy tokens identical. The head's bands split unevenly
+# (lm_head_q8.split_bands) and its pool is one contiguous run, so the pool layout does not depend on this.
+HEAD8_MEASURED = (("llama3", 2048, 16, 2, 128),)
+
+
+def head_cores(spec: ModelSpec) -> int:
+    """Cores for the Q8_0 GGUF head build: all columns for a measured shape, else cores_for."""
+    shape = (spec.family, spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim)
+    return LIMITS["n_cols"] if shape in HEAD8_MEASURED else cores_for(spec)
+
+
 def pool_quant(spec: ModelSpec) -> str:
     """The pool's q4 chunk layout; mixed q8 specs retain the ordinary q4 base layout."""
     return spec.quant if gguf_direct(spec.quant) else "q4_1"
@@ -1185,7 +1198,7 @@ def gguf_q41_view(spec: ModelSpec) -> bool:
 
 
 def gguf_q41_head_build(spec: ModelSpec) -> dict:
-    n = cores_for(spec)
+    n = head_cores(spec)
     return {"design": "lm_head_q8/lm_head_q8.py",
             "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",
             "env": {"LMHEAD_N": str(lm_rows(spec)), "LMHEAD_K": str(spec.hidden),
@@ -1402,10 +1415,11 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     if gguf_q41_view(spec):
         b["lm_head_q8_gguf"] = gguf_q41_head_build(spec)        # the q4_1-law GGUF view's Q8_0 head
     if gguf_q8_head(replace(spec, quant="q4_1_f32")) and f32_twin_fits(spec):
+        hn = head_cores(spec)
         b["lm_head_q8_gguf"] = {"design": "lm_head_q8/lm_head_q8.py",
-            "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",
+            "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{hn}",
             "env": {"LMHEAD_N": str(lm_rows(spec)), "LMHEAD_K": str(spec.hidden),
-                    "LMHEAD_CORES": str(n), "LMHEAD_SCALES_F32": "0"}}
+                    "LMHEAD_CORES": str(hn), "LMHEAD_SCALES_F32": "0"}}
     rr = rows_route(spec)
     if rr:
         b.update(rr["builds"])
