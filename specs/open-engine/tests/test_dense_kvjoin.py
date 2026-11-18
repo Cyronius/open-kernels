@@ -66,3 +66,21 @@ def test_minicpm5_attention_takes_the_fused_exponential():
     from recipes import attnknobs
     assert attnknobs.g5_expa(load_spec(SPECS / 'minicpm5-2b.json')) == 2
     assert attnknobs.g5_expa(load_spec(SPECS / 'llama32-1b.json')) == 0
+
+
+def test_minicpm5_attention_blocks_of_eight(monkeypatch):
+    """G5_RB8_MEASURED: 8 window rows a block (the manifest's kvslice), the joint-tree scorer and the block-only walk."""
+    from recipes import attnknobs
+    for flag in FLAGS:
+        monkeypatch.setenv(flag, '1')
+    for k in ('ATTN_RB', 'ATTN_KVCORES', 'ATTN_KVSLICE', 'ATTN_G5_JT', 'ATTN_G5_JT_U', 'ATTN_KVS_BLOCK_ONLY'):
+        monkeypatch.delenv(k, raising=False)
+    spec = load_spec(SPECS / 'minicpm5-2b.json')
+    assert dense.geometry(spec).RB == 8
+    assert attnknobs.g5_rb8_flags(spec) == ['-DATTN_G5_JT=1', '-DATTN_G5_JT_U=4', '-DATTN_KVS_BLOCK_ONLY=1']
+    assert manifest(spec)['kernels']['dx']['kvslice'] == 8
+    monkeypatch.setenv('ATTN_KVCORES', '0')          # off its measured attention split, the shape keeps RB 4
+    assert dense.geometry(spec).RB == 4 and attnknobs.g5_rb8_flags(spec) == []
+    monkeypatch.delenv('ATTN_KVCORES')
+    other = load_spec(SPECS / 'llama32-1b.json')
+    assert not attnknobs.g5_rb8(other) and attnknobs.g5_rb8_flags(other) == []
