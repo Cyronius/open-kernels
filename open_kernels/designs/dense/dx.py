@@ -56,7 +56,7 @@ from ironutil import Pipeline, include_dirs, piece_tap  # noqa: E402
 import ln_split as LS  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
-from recipes.attnknobs import TREE8_STACK, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
+from recipes.attnknobs import TREE8_STACK, g5_expa, g5_rb8_flags, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
 from recipes.dense_precision import q8_projections, ROLES  # noqa: E402
 from recipes.dense import one_context, stream_knobs  # noqa: E402
 from recipes.qwen36moe import BAND_ROWS, ELEM, band_bytes, roundup  # noqa: E402
@@ -136,6 +136,12 @@ def role_rs(role):
     return 4 if is_q8(role) else 2
 
 
+# q | k | v bands a main core runs. KVJOIN (recipes/dense.kv_join_cores): k | v are banded as one
+# 2*KVW-row run, so a core gets QKV_KVB bands of it (one at MiniCPM5-2B's 256-wide kv on 8 cores).
+QKV_KVB = 2 * KVW // BAND_ROWS // N_CORES if G.KVJOIN else 2 * G.KV_PC
+QKV_PC = G.Q_PC + QKV_KVB
+assert not G.KVJOIN or (QKV_KVB * BAND_ROWS * N_CORES == 2 * KVW and not SPEC.tensor_quant), "dx.py: KVJOIN geometry"
+
 NEED_Q4_GY = any(not is_q8(r) for r in ("attn_q", "ffn_down"))
 NEED_Q4_GMS = "ffn" not in Q8
 
@@ -203,12 +209,15 @@ T8 = tree8(SPEC, NHL, G.RB, G.HD)
 if T8:
     ATTN_FLAGS.extend(tree8_flags(4))
 elif KVC:                                              # TREE8's companions, the G5 tree in its place
-    ATTN_FLAGS.extend([f for f in tree8_flags(4) if not f.startswith("-DATTN_TREE8")] + ["-DATTN_G5=1"])
+    ATTN_FLAGS.extend([f for f in tree8_flags(4) if not f.startswith("-DATTN_TREE8")
+                       and not (f.startswith("-DATTN_T8_UNROLL=") and "ATTN_T8_UNROLL" in os.environ)] + ["-DATTN_G5=1"])
     if GRP != 5 and "ATTN_EXPA" not in os.environ:
-        # The Llama placement probe keeps its original exponential. Granite's
+        # Other G5 shapes keep vexpN unless measured (EXPA2_MEASURED: MiniCPM5-2B). Granite's
         # measured G5 default uses EXPA=2; that is a separate arithmetic change.
         ATTN_FLAGS = [f for f in ATTN_FLAGS if not f.startswith("-DATTN_EXPA=")]
-        ATTN_FLAGS.append("-DATTN_EXPA=0")
+        ATTN_FLAGS.append(f"-DATTN_EXPA={g5_expa(SPEC)}")      # EXPA2_MEASURED shapes take the fused exponential
+    if KVC == 4 and NHL == 2 and RB in (4, 8):
+        ATTN_FLAGS.extend(g5_rb8_flags(SPEC))                   # G5_RB8_MEASURED: joint-tree scorer, block-only walk
 if KVSL:
     _mm2s = [0] * NSHIM                                # this design's own shim MM2S producers: lni, w_c, x, ain
     for _c in [0, 1, 2] + list(range(N_CORES)):
@@ -468,7 +477,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                 for projection, count in (("attn_q", G.Q_PC), ("attn_k", G.KV_PC), ("attn_v", G.KV_PC)):
                     role_bands(win, yout, tab, K, projection, count, HID, ms)
             else:
-                role_bands(win, yout, tab, K, "attn", G.Q_PC + 2 * G.KV_PC, HID, ms)
+                role_bands(win, yout, tab, K, "attn", QKV_PC, HID, ms)
         else:
             # read after the x data landed: read at the barrier, it was the previous dispatch's word
             gemv_bands(win, yout, tab, K["gy"], mode[1], n_groups(HID), per_band(HID), 2)
@@ -852,13 +861,14 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
     BB_H, BB_Q, BB_F = (role_band_bytes("attn_q", HID), role_band_bytes("attn_output", QW),
                         role_band_bytes("ffn_down", FF))
     BB_V = role_band_bytes("attn_v", HID)
+    assert not G.KVJOIN or (BB_V == BB_H and L.POOL_V == L.POOL_K + KVW // BAND_ROWS * BB_H), "dx.py: KVJOIN needs k, v adjacent"
     BB_UG = role_band_bytes("ffn", HID)          # the FFN's up | gate bands (K = HID)
     YB = BAND_ROWS * 4
 
     def set_mode(head):
         for c in range(N_CORES + 1):
             modes[c][0] = 0 if head else 1
-            modes[c][1] = NB_HEAD if head else G.Q_PC + 2 * G.KV_PC
+            modes[c][1] = NB_HEAD if head else QKV_PC
         for c in range(N_CORES + 1):
             bars[c].set(1)
 
@@ -898,11 +908,17 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         pw, py = Pipeline(3), Pipeline(3)
         for c in range(N_CORES):
             pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_Q + c * G.Q_PC * BB_H, G.Q_PC * BB_H))
-            pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_K + c * G.KV_PC * BB_H, G.KV_PC * BB_H))
-            pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_V + c * G.KV_PC * BB_V, G.KV_PC * BB_V))
+            if G.KVJOIN:                                  # band c of [k | v]: contiguous in the pool and in act
+                pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_K + c * QKV_KVB * BB_H, QKV_KVB * BB_H))
+            else:
+                pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_K + c * G.KV_PC * BB_H, G.KV_PC * BB_H))
+                pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_V + c * G.KV_PC * BB_V, G.KV_PC * BB_V))
             py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_Q + c * G.Q_PC * YB, G.Q_PC * YB))
-            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + c * G.KV_PC * YB, G.KV_PC * YB))
-            py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + KVW * 4 + c * G.KV_PC * YB, G.KV_PC * YB))
+            if G.KVJOIN:
+                py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + c * QKV_KVB * YB, QKV_KVB * YB))
+            else:
+                py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + c * G.KV_PC * YB, G.KV_PC * YB))
+                py.drain(y_conss[c], a_act, bt(L.AD_BYTES, L.AD_KVN + KVW * 4 + c * G.KV_PC * YB, G.KV_PC * YB))
         tg_ln.finish()                                            # xn is in DDR
         tg_x = TaskGroup()
         x_prod.fill(a_act, tap=bt(L.AD_BYTES, L.AD_XN, G.XN_ELEMS * ELEM), wait=True, group=tg_x)

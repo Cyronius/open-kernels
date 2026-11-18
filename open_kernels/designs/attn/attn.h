@@ -167,6 +167,18 @@
 #if ATTN_BLOCK_WIN && (ATTN_RB < 2 || !ATTN_VEXP || ATTN_BLOCK_ONLY)
 #error "attn.h: ATTN_BLOCK_WIN needs the block kernel (ATTN_RB > 1) on the vector-softmax path, and not ATTN_BLOCK_ONLY"
 #endif
+#ifndef ATTN_KVS_BLOCK_ONLY
+// 1 (with ATTN_KVS): the KVSLICE walk's last rows go through the block kernel as well, so the
+// single-row kernel (attn_row_impl) is not built. The padded tail element (attn_tailw) is one
+// block whose slots past its real rows are masked, and the new position's row (attn_step_new) is
+// a block of its own with every slot after the first masked (ATTN_BLOCK_WIN's attn_stepb_nr form).
+// A masked slot points at a real row of the same call -- the block's first, or the new row -- so
+// whatever the cache holds past `pos` is never read. The masked scores are -1e30 like the padding
+// LANES, so they never win the max, and their weight is the exponential's value at its -87 clamp
+// (~1e-38: far below one ulp of l and o). Not bit-identical to the one-row path: a block takes its
+// max and its exponentials over the block. 0 = what every family compiles.
+#define ATTN_KVS_BLOCK_ONLY 0
+#endif
 #ifndef ATTN_NHL
 #define ATTN_NHL ATTN_NH     // heads THIS core owns; < ATTN_NH splits attention over several cores
 #endif
@@ -348,6 +360,9 @@ static inline unsigned attn_kvb(int h0) {
   return k + ATTN_KVS > kKVH ? kKVH - ATTN_KVS : k;
 #endif
 }
+#endif
+#if ATTN_KVS_BLOCK_ONLY && !ATTN_KVS
+#error "attn.h: ATTN_KVS_BLOCK_ONLY is the KVSLICE walk's (ATTN_KVS)"
 #endif
 #ifndef ATTN_G5
 #define ATTN_G5 0            // 1: the block kernel for 5 heads a core on ONE kv head (Granite at 8 cores): K and V rows shared
@@ -945,6 +960,10 @@ __attribute__((noinline)) inline void attn_row_impl(const bfloat16 *__restrict K
 #if ATTN_BLOCK_ONLY
 #define ATTN_NV_PARM , unsigned nv
 #define ATTN_NV_ARG , nv
+#elif ATTN_KVS_BLOCK_ONLY
+// slots [m_lo, kRB) of the block are padding: a tail element's rows past `pos`, or every slot after the new row
+#define ATTN_NV_PARM , unsigned m_lo
+#define ATTN_NV_ARG , m_lo
 #elif ATTN_BLOCK_WIN
 // slots [m_lo, m_hi) of the block are padding: a window block's tail past `pos` (m_hi = kRB),
 // or every slot before the new row in its own block (m_lo = 0, m_hi = kRB - 1)
@@ -1045,8 +1064,73 @@ static inline __attribute__((always_inline)) void attn_pv(float *__restrict o,
 #if ATTN_G5
 // TREE8's tree over head pairs of one K row (a missing head repeats the last): each sum pairs lanes as reduce_add does
 static constexpr unsigned attn_g5_h(unsigned i) { return i < kNHL ? i : kNHL - 1; }
+#ifndef ATTN_G5_JT
+// 1 (2 heads a core: MiniCPM5-2B on 4 cores a kv head): the block's scores as ONE tree across its rows. Each
+// row's loop iteration is only its dot products and the tree's first level (lanes i and i + 16, attn_score2m); the
+// levels after it pair two ROWS' vectors instead of a row with itself, so the block runs 2 + 1 + 1 + 1 of them
+// (RB 4) rather than 4 a row. Every (row, head) is still summed i + 16, i + 8, i + 4, i + 2, i + 1: the same
+// scores to the bit (decode logits byte-identical to the unrolled G5 scorer at P=4352). The row loop is not
+// unrolled: at RB 4 the unrolled one kept 16 accumulators live and spilled ~180 of them a block (attn_rowb_impl,
+// 2026-11-17 disassembly). ATTN_G5_JT_U unrolls it by that many rows (same scores; MiniCPM5-2B takes 4 at RB 8,
+// attnknobs G5_RB8_DEFAULTS).
+#define ATTN_G5_JT 0
+#endif
+#if ATTN_G5_JT
+static_assert(kNHL == 2 && kNL == 8 && (kRB == 4 || kRB == 8), "attn.h ATTN_G5_JT: 2 heads a core, RB 4 or 8");
+// attn_score2 with each chain STARTED by a multiply rather than a mac into zeros (0 + x is x exactly, so the
+// same sums). In a rolled row loop llvm-aie (Peano 21.0.0.2026080301) miscompiles the mac-into-zeros form: the
+// scores came out wrong (decode gate cos 0.37 at P=4352) whether or not q was hoisted, the loop was a zero-overhead
+// one or the K rows were indexed or strided; the fully unrolled loop and this form are right, byte for byte.
+static inline __attribute__((always_inline)) v32f attn_score2m(const bfloat16 *__restrict k,
+                                                                const bfloat16 *__restrict qa,
+                                                                const bfloat16 *__restrict qb) {
+  const vbN<kV> k0 = aie::load_v<kV>(k);
+  accf32 a0 = aie::mul(aie::load_v<kV>(qa), k0), a1 = aie::mul(aie::load_v<kV>(qa + kQW), k0);
+  accf32 b0 = aie::mul(aie::load_v<kV>(qb), k0), b1 = aie::mul(aie::load_v<kV>(qb + kQW), k0);
+  ATTN_UNROLL_HD
+  for (unsigned j = kV; j < kHD; j += kV) {
+    const vbN<kV> kj = aie::load_v<kV>(k + j);
+    a0 = aie::mac(a0, aie::load_v<kV>(qa + j), kj);
+    a1 = aie::mac(a1, aie::load_v<kV>(qa + kQW + j), kj);
+    b0 = aie::mac(b0, aie::load_v<kV>(qb + j), kj);
+    b1 = aie::mac(b1, aie::load_v<kV>(qb + kQW + j), kj);
+  }
+  return attn_tree2(aie::add(a0, a1).template to_vector<float>(), aie::add(b0, b1).template to_vector<float>(), 16);
+}
+// [row][head] dense, 2 * kRB lanes -> sv's [row][kNL = 8], the padding lanes -1e30 (what the select below writes)
+static inline __attribute__((always_inline)) void attn_g5_spread(const vfN<2 * kRB> &s, float *__restrict sv) {
+  constexpr unsigned N = 2 * kRB;
+  const vfN<N> pad = aie::broadcast<float, N>(-1e30f);
+  const auto [a0, a1] = aie::interleave_zip(s, pad, 2);    // 4 lanes a row
+  const auto [b0, b1] = aie::interleave_zip(a0, pad, 4);   // 8 lanes a row
+  const auto [b2, b3] = aie::interleave_zip(a1, pad, 4);
+  aie::store_v(sv, b0);
+  aie::store_v(sv + N, b1);
+  aie::store_v(sv + 2 * N, b2);
+  aie::store_v(sv + 3 * N, b3);
+}
+#endif
 static inline __attribute__((always_inline)) void attn_g5_score(const bfloat16 *const *__restrict Kb, const bfloat16 *__restrict q0,
                                                                unsigned kvl, float *__restrict sv) {
+#if ATTN_G5_JT
+  alignas(128) float z[kRB * 32];                // level 1 a row: [head 0: 16 | head 1: 16]
+#ifdef ATTN_G5_JT_U
+  ATTN_PRAGMA(clang loop unroll_count(ATTN_G5_JT_U))
+#else
+  _Pragma("clang loop unroll(disable)")
+#endif
+  for (unsigned r = 0; r < kRB; ++r)
+    aie::store_v(z + r * 32, attn_score2m(Kb[r] + kvl * kHD, q0, q0 + kHD));
+  v32f w[kRB / 2];                               // level 2: [row 2i: h0, h1 | row 2i + 1: h0, h1], 8 lanes each
+  AIE_LOOP_UNROLL_FULL
+  for (unsigned i = 0; i < kRB / 2; ++i)
+    w[i] = attn_tree2(aie::load_v<32>(z + 2 * i * 32), aie::load_v<32>(z + (2 * i + 1) * 32), 8);
+#if ATTN_RB == 4
+  attn_g5_spread(attn_tree1<16>(attn_tree1<32>(attn_tree2(w[0], w[1], 4), 2), 1), sv);
+#else
+  attn_g5_spread(attn_tree1<32>(attn_tree2(attn_tree2(w[0], w[1], 4), attn_tree2(w[2], w[3], 4), 2), 1), sv);
+#endif
+#else
   const auto pad = aie::mask<kNL>::from_uint32(0xffu & ~((1u << kNHL) - 1u));
 #if ATTN_T8_UNROLL == 2
   _Pragma("clang loop unroll_count(2)")
@@ -1072,6 +1156,7 @@ static inline __attribute__((always_inline)) void attn_g5_score(const bfloat16 *
     const vfN<kNL> s = attn_tree1<16>(attn_tree1<32>(attn_tree2(w0, w1, 4), 2), 1);
     aie::store_v(sv + r * kNL, aie::select(s, aie::broadcast<float, kNL>(-1e30f), pad));
   }
+#endif
 }
 #ifndef ATTN_G5_PVROLL
 #define ATTN_G5_PVROLL 1     // one head-dim slice at a time: five accumulators live, not ten (the unrolled pair spills)
@@ -1094,7 +1179,9 @@ static inline __attribute__((always_inline)) void attn_g5_pv(const bfloat16 *con
       }
     }
   }
-#if ATTN_G5_PVROLL
+#if ATTN_G5_PVROLL == 2
+  _Pragma("clang loop unroll_count(2)")   // two head-dim slices an iteration: 2 * kNHL chains (MiniCPM5: 4)
+#elif ATTN_G5_PVROLL
   _Pragma("clang loop unroll(disable)")
 #else
   ATTN_UNROLL_HD
@@ -1269,6 +1356,19 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
   // row. Taken only on the last call of a token, and at kRB 2 it is one compare.
   for (unsigned r = nv; r + 1 < kRB; ++r)
     aie::store_v(sv + r * kNL, aie::broadcast<float, kNL>(-1e30f));
+#elif ATTN_KVS_BLOCK_ONLY
+  // The padding slots [m_lo, kRB), -1e30 as the padding lanes are, by one select over the block's scores
+  // (ATTN_BLOCK_WIN's store loop below crashed llvm-aie in copyPhysReg on this kernel, 2026-11-17).
+  if (m_lo < kRB) {
+    const unsigned b = m_lo * kNL;
+    aie::mask<kPV> mk;
+#if ATTN_RB * (ATTN_NHL >= 8 ? ATTN_NHL : 8) <= 32      // kPV
+    mk = aie::mask<kPV>::from_uint32((uint32_t)(~((1ull << b) - 1ull)));
+#else
+    mk = aie::mask<kPV>::from_uint64(~((1ull << b) - 1ull));
+#endif
+    aie::store_v(sv, aie::select(aie::load_v<kPV>(sv), aie::broadcast<float, kPV>(-1e30f), mk));
+  }
 #elif ATTN_BLOCK_WIN
   // The padding slots, masked as above (ATTN_BLOCK_ONLY): -1e30 never wins the max and
   // exponentiates to zero. Every block that reaches here holds at least one real row (the
@@ -1284,9 +1384,22 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
   return;
 #endif
   // the block's max per head, then one update of (m, l) for the whole block
+#if ATTN_G5_JT
+  // the same maximum as a tree over the rows (max is exact, so the order does not change it)
+  vfN<kNL> mx[kRB];
+  AIE_LOOP_UNROLL_FULL
+  for (unsigned r = 0; r < kRB; ++r) mx[r] = aie::load_v<kNL>(sv + r * kNL);
+  AIE_LOOP_UNROLL_FULL
+  for (unsigned w = 1; w < kRB; w *= 2) {
+    AIE_LOOP_UNROLL_FULL
+    for (unsigned r = 0; r + w < kRB; r += 2 * w) mx[r] = aie::max(mx[r], mx[r + w]);
+  }
+  vfN<kNL> smax = mx[0];
+#else
   vfN<kNL> smax = aie::load_v<kNL>(sv);
   AIE_LOOP_UNROLL_FULL
   for (unsigned r = 1; r < kRB; ++r) smax = aie::max(smax, aie::load_v<kNL>(sv + r * kNL));
+#endif
   const vfN<kNL> m = aie::load_v<kNL>(ml);
   const vfN<kNL> mn = aie::max(m, smax);
   AIE_LOOP_UNROLL_FULL
