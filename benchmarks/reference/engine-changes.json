@@ -12,7 +12,7 @@
       "id": "llama-gguf-qk-rows",
       "origin": "phlegm:minicpm5-2b-kv2 (MiniCPM5-2B; undo llama.cpp's paired q/k rows for arch llama)",
       "files": {
-        "src/open_qwen36/pools.cpp": "7175bf76e3573431bdcfcb92c31211e50512b954a4732076f75384a4bdd053d6",
+        "src/open_qwen36/pools.cpp": "7a486346c1c32d611397654aeaa1f91bb54dde0fab83d8da7bc14c5dbf71b5ee",
         "src/open_qwen36/gguf_pack_test.cpp": "4fa0fd3c9190f2ef824b1b236cea134da2f0bdf6eb257b4fc44b35d5ed876200"
       }
     },
@@ -20,21 +20,35 @@
       "id": "gguf-lmhead-q8",
       "origin": "phlegm: the raw-GGUF branch of lmhead_q8, ported from target/npu-dev/nanbeige-runtime (OFLM reference-runtime-next lineage): Q8_0 codes kept, other types requantized to int8 + bf16 scale (MiniCPM5-2B)",
       "files": {
-        "src/open_qwen36/pools.cpp": "7175bf76e3573431bdcfcb92c31211e50512b954a4732076f75384a4bdd053d6"
+        "src/open_qwen36/pools.cpp": "7a486346c1c32d611397654aeaa1f91bb54dde0fab83d8da7bc14c5dbf71b5ee"
       }
     },
     {
       "id": "dense-layer-major-rope",
       "origin": "phlegm: dense_layer_major_ok also accepts the plain `rope` attention prep (MiniCPM5-2B: byte-identical logits, ~1.4x prefill)",
       "files": {
-        "src/open_qwen36/core.cpp": "1b5f126966d34255b4fc85b6df95f0c893843d75846dc0e6975593432d9215a0"
+        "src/open_qwen36/core.cpp": "a3e08c2149743e89f5f5b9adbb577924a3803c00b96f635f4d96c8869772d7b1"
       }
     },
     {
       "id": "rope-prep-qsplit",
       "origin": "phlegm: manifest.cpp treats attn_block prep `rope` as qsplit (core.cpp already splits Q for rope), so a dense kernel set may carry kernels_shl (DENSE_AG_SHL experiment; logits byte-identical on MiniCPM5-2B)",
       "files": {
-        "src/open_qwen36/manifest.cpp": "51c6d9854c3d6445dabcb2e4a813b1288da18039c377a960b19638b155a1736f"
+        "src/open_qwen36/manifest.cpp": "394f9df2b1456f2465a4ec5a8b805fadf8cc030090bc1700e51a7cbbf612fa8c"
+      }
+    },
+    {
+      "id": "gptoss-runtime",
+      "origin": "open-kernels: upstream-patches/gptoss-runtime.patch + gptoss-prefill-runtime.patch (GPT-OSS 20B decode route and block prefill; OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS), one hunk re-based over the kvslice 8-row message; OFLM #237's `small` -> `is_small` rename (rpcndr.h defines small on Windows)",
+      "files": {
+        "src/open_qwen36/core.cpp": "a3e08c2149743e89f5f5b9adbb577924a3803c00b96f635f4d96c8869772d7b1",
+        "src/open_qwen36/core.hpp": "2173fdf7e579c0a7855958ea5b0b2b78d030cd15706ba0cc3ef315dc3180c4b1",
+        "src/open_qwen36/engine.cpp": "e7db7144d36f21425b665c40603a5c65e7f3d2ebf022942ed5b268fda41e8d1b",
+        "src/open_qwen36/gguf_file.cpp": "45007c648b7139d714b90ff55e7feca414b097df5a2c69bda129b677213a311b",
+        "src/open_qwen36/gguf_file.hpp": "a00c49dbea319894c0cd7ac3fa01920b8f07ece18866700726ae51e07e60b108",
+        "src/open_qwen36/manifest.cpp": "394f9df2b1456f2465a4ec5a8b805fadf8cc030090bc1700e51a7cbbf612fa8c",
+        "src/open_qwen36/manifest.hpp": "a73061180fdf0969572065dcf6ce76fbe8019a485e5967659fb2300f53394a91",
+        "src/open_qwen36/pools.cpp": "7a486346c1c32d611397654aeaa1f91bb54dde0fab83d8da7bc14c5dbf71b5ee"
       }
     }
   ]

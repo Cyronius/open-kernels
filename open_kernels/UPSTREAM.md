@@ -29,6 +29,7 @@ the same paths, so a sync is a plain diff of these directories and the matching 
 | 2026-10-23 | PR #213 Qwen3.8-27B precision and reference validation (upstream draft) | `5eda57ee98556df439c91e44c334325a82ab3362` |
 | 2026-10-23 | PR #223 GGUF-direct, dense split shapes and Qwen3 size specs | `0c22864a5258019b7a885fb4be962ec62e3cc276` |
 | 2026-10-28 | PR #225 Gemma 4 12B text decoder on two dense geometries (open, not merged upstream): its five `open_kernels/`/`specs/open-engine/` commits, cherry-picked with `-x` | `beccd4699d812642b63741255322d19a0c1dd738` |
+| 2026-11-18 | PR #237 GPT-OSS 20B (draft): its Strix Point result (OPEN-PREFILL-GPTOSS) and the Windows `small` -> `is_small` rename. Its kernel side was already here; the in-tree engine takes the GPT-OSS runtime from `gptoss-runtime.patch` + `gptoss-prefill-runtime.patch` (`engine-changes.json` `gptoss-runtime`) | `ca1196cafdb98aea881931c6bd64ed7ad623bb7b` |
 
 ## Not pulled in yet
 

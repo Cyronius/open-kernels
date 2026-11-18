@@ -182,8 +182,9 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
             const bool gemm_block_on = utils::getenv_oflm("OFLM_OPEN_GEMM_BLOCK") != "0";
             // A block costs its full-width GEMMs however few real tokens it holds, so a
             // short prompt is cheaper one token at a time; the crossover is measured, not
-            // derived (Qwen3.6-35B: ~64 tokens), OFLM_OPEN_GEMM_BLOCK_MIN overrides it.
-            size_t min_prompt = 64;
+            // derived (Qwen3.6-35B: ~64 tokens; a kernel set may carry its own, GPT-OSS's
+            // ~12), OFLM_OPEN_GEMM_BLOCK_MIN overrides it.
+            size_t min_prompt = core_->block_prefill_min();
             if (const char* mp = std::getenv("OFLM_OPEN_GEMM_BLOCK_MIN")) min_prompt = static_cast<size_t>(std::strtoul(mp, nullptr, 10));
             // A prompt that has had an image is on the (t, h, w) counter, and the
             // gemm-block route writes no position records - it would place these

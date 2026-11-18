@@ -4515,6 +4515,7 @@ than ignored.
 ### OPEN-FAMILY-GPTOSS: GPT-OSS derives a spec and runs on its own recipe from the GGUF
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py`, `families.py`, `gptoss.py`,
 `gptoss_pack.py`, `designs/gptoss/`, `designs/gemv_q4/gemv_mx4.h`, `mx4_codes.h`; runtime
+`src/open_qwen36/{core,manifest,pools,gguf_file,engine}.cpp`, from the companion patches
 `upstream-patches/gptoss-runtime.patch`, `gptoss-prefill-runtime.patch`)
 **Test category:** unit (`tests/test_gptoss.py`, `tests/test_gptoss_pack.py`); manual (the
 recipe's procedure below, which needs the NPU and the GGUF)
@@ -4686,7 +4687,7 @@ stream floor).
 ### OPEN-PREFILL-GPTOSS: GPT-OSS's block prefill, the experts' GEMMs reading MXFP4 natively
 **Applies to:** openflowlm-next (`open_kernels/recipes/gptoss.py` `prefill_route`,
 `designs/gemm_bfp16/{gemm_bfp16.py,mx4_b.cc,pack.py}`, `designs/gemv_q4/mx4_codes.h`; runtime
-`upstream-patches/gptoss-prefill-runtime.patch`: `Core::step_gptoss_prompt`, the `gp_*` pack ops,
+`src/open_qwen36/core.cpp` (from `upstream-patches/gptoss-prefill-runtime.patch`): `Core::step_gptoss_prompt`, the `gp_*` pack ops,
 the `gxexpert` patch, the manifest's `gptoss_prefill`)
 **Test category:** unit (`tests/test_gptoss.py`, `tests/test_gptoss_pack.py`); manual (the
 procedure below, which needs the NPU and the GGUF)
@@ -4776,7 +4777,27 @@ kept at load average 30-55, not a clean benchmark):**
 - Load: 17-21 s (10 s without the route's ~11.4 GiB of weights: the experts' GEMM tiles 10.8
   GiB, the stacked attention weights 1.4 GiB).
 
-Not established: a clean benchmark, contexts past 4096 rows, attention products on the NPU
+**Result 2026-11-13 (Strix Point, Ryzen AI 9 HX PRO 370, Windows 11, MSVC build of OFLM #237,
+kernels exported natively with mlir-aie 1.4.2 / Peano 21.0.0.2026080301; `open_qwen36_cli
+--gemm-block`, 8 OMP threads, median of 3):**
+- The 77-token harmony chat prompt (`reasoning_effort` low): 32 greedy tokens equal llama.cpp's
+  (Vulkan build, the same GGUF).
+- Prefill on the block route: 16 tokens 0.82 s, 128 tokens 1.53 s, 663 tokens 3.76 s, 2000
+  tokens 10.2 s (176 and 195 tok/s at the two long ones). One token a step, 128 tokens took
+  15.0 s (117 ms a token).
+- Decode after that prompt (64 tokens): 127 ms a token at 16 rows of context, 129 at 128, 133
+  at 663, 144 at 2000 (7.9 to 6.9 tok/s).
+- The third repeat overlapped another process starting; its 2000-token prefill
+  was 12.1 s against 10.1 / 10.2. The medians above include it.
+
+**Result 2026-11-18 (the same machine, the in-tree engine with both companion patches applied,
+the 2026-11-13 kernel set, whose manifest this tree regenerates byte for byte):** the chat
+prompt's 32 greedy tokens equal llama.cpp's. Paired against the 2026-11-13 OFLM build on the
+663-token prompt, alternated twice: decode 148 / 148 ms a token against 152 / 152; prefill
+5.1 / 7.5 s against 6.9 / 5.4 s. Both arms ran slower than on 2026-11-13, so the machine, not
+the port, moved; the prefill spread is too wide to rank the two.
+
+Not established: contexts past 4096 rows, attention products on the NPU
 (the host's attention is 2.3 s of the 2000-token prefill at 4 threads), one shared copy of
 the experts for decode and prefill (the GEMM reads its own 10.8 GiB of tiles), and an
 expert GEMM that fills its rows across experts (a chunk still pads to 128 or 256 rows).
