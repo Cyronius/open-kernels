@@ -106,6 +106,14 @@ __attribute__((noinline)) inline void gemv_q8_tile(const uint8_t *__restrict til
                                                    unsigned kt, bool first,
                                                    float *__restrict y) {
   event0();
+#ifdef LMHEAD_NULL
+  // debug: arithmetic compiled out, every DMA kept (the gemv_q4.h GEMV_NULL twin), for
+  // timing the head's stream floor; the logits are garbage.
+  if (first)
+    aie::store_v(y, aie::zeros<float, kRows>());
+  event1();
+  return;
+#endif
   aie::set_rounding(aie::rounding_mode::conv_even);
 
 #if LMHEAD_SCALES_F32

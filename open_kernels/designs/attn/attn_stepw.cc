@@ -15,7 +15,11 @@ void attn_stepw(const bfloat16 *__restrict e, const ATTN_QT *__restrict qs, floa
 #ifdef ATTN_REPEAT
   for (int rep = 0; rep < ATTN_REPEAT; ++rep)    // PROBE ONLY: compute the block again, prices pure compute
 #endif
+#if ATTN_KVS_BLOCK_ONLY
+  attn_rowb_impl(K, V, qs, oacc, ml, kRB ATTN_H0_ARG);     // a whole block: no masked slot
+#else
   attn_rowb_impl(K, V, qs, oacc, ml ATTN_H0_ARG);
+#endif
 #else
   (void)K; (void)V; (void)qs; (void)oacc; (void)ml;
 #endif

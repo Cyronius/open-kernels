@@ -100,6 +100,7 @@ class DenseGeometry:
     QLOCAL: int = 0                                                 # attn.h ATTN_QLOCAL: a core keeps only its q heads
     AWIDE: int = 0                                                  # dx.py: attention cores on row 4, og joined in memtiles
     KVSLICE: int = 0                                                # dx.py: rows a per-core window element holds; 0 = attnknobs.kvslice
+    KVJOIN: int = 0                                                 # dx.py: k | v split as one 2*KVW projection (kv_join_cores)
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,51 @@ def cores_for(spec: ModelSpec) -> int:
         if all(w % (BAND_ROWS * n) == 0 for w in widths):
             return n
     return 1
+
+
+# (family, hidden, heads, kv heads, head dim) measured faster on 8 joined-kv cores than on
+# cores_for's count, logits byte-identical. MiniCPM5-2B, 2026-11-16, quiet host, alternating:
+# decode 44.4 -> 41.1 ms/token at 1k, 91.2 -> 88.3 at 8k, 145.1 -> 140.6 at 16k.
+KVJOIN_MEASURED = (("llama3", 2048, 16, 2, 128),)
+
+
+def kv_join_cores(spec: ModelSpec) -> int:
+    """Main cores for the decode layer when k | v are split as one 2*KVW-row projection, or 0.
+
+    cores_for caps a spec at the core count whose 64-row bands divide every width, and a
+    narrow kv width (MiniCPM5-2B: 2 kv heads x 128 = 256 rows) caps it at 4 while every other
+    width divides by 8. k and v sit next to each other in the pool and in the activation
+    buffer, so the 2*KVW rows can be banded as one run: core c streams band c of [k | v]
+    (cores 0-3 k, 4-7 v at 256). Every core still runs Q_PC + (one run of) kv bands, so the
+    core body is unchanged; only the runtime sequence's offsets differ.
+
+    On for the shapes in KVJOIN_MEASURED; DENSE_KVJOIN=1 / 0 (a probe variable) forces it on
+    or off. Plain q4 attn role only: a per-tensor q8 v (tensor_quant) has its own band size
+    and symbol."""
+    forced = os.environ.get("DENSE_KVJOIN")
+    on = forced == "1" if forced is not None else (
+        (spec.family, spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim) in KVJOIN_MEASURED)
+    if not on or spec.tensor_quant or qkv_bias(spec):
+        return 0
+    base = cores_for(spec)
+    widths = (spec.hidden, spec.intermediate, spec.attn_q_width, 2 * spec.attn_kv_width)
+    for n in range(LIMITS["n_cols"], base, -1):
+        if all(w % (BAND_ROWS * n) == 0 for w in widths):
+            return n
+    return 0
+
+
+# (family, hidden, heads, kv heads, head dim) whose Q8_0 lm_head (lm_head_q8, bf16 scales) measured faster
+# on all 8 columns than on cores_for's count. MiniCPM5-2B, 2026-11-16, quiet host, 3 alternating rounds at 1k:
+# head 6.6 -> 5.9 ms, decode 25.4 -> 25.9 tok/s, greedy tokens identical. The head's bands split unevenly
+# (lm_head_q8.split_bands) and its pool is one contiguous run, so the pool layout does not depend on this.
+HEAD8_MEASURED = (("llama3", 2048, 16, 2, 128),)
+
+
+def head_cores(spec: ModelSpec) -> int:
+    """Cores for the Q8_0 GGUF head build: all columns for a measured shape, else cores_for."""
+    shape = (spec.family, spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim)
+    return LIMITS["n_cols"] if shape in HEAD8_MEASURED else cores_for(spec)
 
 
 def pool_quant(spec: ModelSpec) -> str:
@@ -325,12 +371,19 @@ from .attnknobs import (PROBE_VARS, RB_SUPPORTED, FAST_ATTENTION, MAX_ATTN_CORES
 
 # OPEN-DECODE-STREAM: families measured on dx's memtile weight ring and early weight issue (bit-identical).
 STREAM_MEASURED: tuple[str, ...] = ("granite",)
+# ... and single shapes (family, hidden, heads, kv heads, head dim) of other families. MiniCPM5-2B,
+# 2026-11-16, ring 16 + early issue against none, alternating, logits byte-identical: decode 41.1 ->
+# 38.8 ms/token at 1k (5 of 6 pairs; layers 34.2 -> 32.0 ms), 87.9 -> 85.6 at 8k. A GEMV_NULL build
+# of the ringless layer ran at the same 34.2 ms: the layer is stream-bound, not arithmetic-bound.
+STREAM_MEASURED_SHAPES: tuple[tuple, ...] = (("llama3", 2048, 16, 2, 128),)
 WRING_DEPTH = 16
 
 
 def stream_knobs(spec: ModelSpec) -> tuple[int, bool]:
     """(memtile ring depth in weight elements, 0 = shim straight to the core; early weight issue)."""
-    on = spec.family in STREAM_MEASURED and not spec.sandwich_norms and spec.quant == "q4_1"
+    shape = (spec.family, spec.hidden, spec.num_heads, spec.num_kv_heads, spec.head_dim)
+    on = ((spec.family in STREAM_MEASURED or shape in STREAM_MEASURED_SHAPES)
+          and not spec.sandwich_norms and spec.quant == "q4_1")
     ring = int(os.environ.get("DX_WRING", WRING_DEPTH if on else 0))
     # A sandwich family (Gemma 3 / 4) gets the early issue only when DX_WORDER=1 forces it, for
     # an A/B build: its two extra norm round trips sit between o and up | gate, where no weight
@@ -358,7 +411,7 @@ from .attnknobs import probe_env as attn_knobs_probe_env
 #                    FF fits whole, so the split can be compared against the whole path
 #                    on a model that is already tested end to end.
 #   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
-DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM")
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM", "DENSE_KVJOIN")
 
 
 def probe_env() -> dict[str, str]:
@@ -374,6 +427,8 @@ def probe_env() -> dict[str, str]:
 
 def geometry(spec: ModelSpec) -> DenseGeometry:
     n = cores_for(spec)
+    kvj = kv_join_cores(spec)
+    n = kvj or n
     hid, ff, nh, kvh, hd = spec.hidden, spec.intermediate, spec.num_heads, spec.num_kv_heads, spec.head_dim
     qw, kvw = nh * hd, kvh * hd
     e_a = kvw * 2
@@ -399,7 +454,7 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
         EPS=spec.norm_eps, ACT=spec.activation, SANDWICH=spec.sandwich_norms,
         WINDOW=spec.sliding_window if spec.has_local else 0, PER_CALL=pc, CALL_BYTES=pc * ch,
         QW=qw, KVW=kvw,
-        Q_PC=qw // BAND_ROWS // n, KV_PC=kvw // BAND_ROWS // n, O_PC=hid // BAND_ROWS // n,
+        Q_PC=qw // BAND_ROWS // n, KV_PC=0 if kvj else kvw // BAND_ROWS // n, O_PC=hid // BAND_ROWS // n,
         UP_PC=ff // BAND_ROWS // n, DOWN_PC=hid // BAND_ROWS // n,
         XN_ELEMS=roundup(hid * 2, ELEM) // ELEM, XN_BLOCKS=hid // 32,
         OG_ELEMS=roundup(qw * 2, ELEM) // ELEM, OG_BLOCKS=qw // 32,
@@ -413,6 +468,7 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
         NORM_SPLIT=os.environ.get("DENSE_NORM_SPLIT") == "1" or norm_split(spec),
         NORM_Q=norm_quarter(spec),
         **({"AWIDE": 1, "QLOCAL": 1} if aw else {}),
+        **({"KVJOIN": 1} if kvj else {}),
     )
 
 
@@ -1142,7 +1198,7 @@ def gguf_q41_view(spec: ModelSpec) -> bool:
 
 
 def gguf_q41_head_build(spec: ModelSpec) -> dict:
-    n = cores_for(spec)
+    n = head_cores(spec)
     return {"design": "lm_head_q8/lm_head_q8.py",
             "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",
             "env": {"LMHEAD_N": str(lm_rows(spec)), "LMHEAD_K": str(spec.hidden),
@@ -1359,10 +1415,11 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
     if gguf_q41_view(spec):
         b["lm_head_q8_gguf"] = gguf_q41_head_build(spec)        # the q4_1-law GGUF view's Q8_0 head
     if gguf_q8_head(replace(spec, quant="q4_1_f32")) and f32_twin_fits(spec):
+        hn = head_cores(spec)
         b["lm_head_q8_gguf"] = {"design": "lm_head_q8/lm_head_q8.py",
-            "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{n}",
+            "build_dir": f"lm_head_q8/build_gguf_n{lm_rows(spec)}_k{spec.hidden}_c{hn}",
             "env": {"LMHEAD_N": str(lm_rows(spec)), "LMHEAD_K": str(spec.hidden),
-                    "LMHEAD_CORES": str(n), "LMHEAD_SCALES_F32": "0"}}
+                    "LMHEAD_CORES": str(hn), "LMHEAD_SCALES_F32": "0"}}
     rr = rows_route(spec)
     if rr:
         b.update(rr["builds"])

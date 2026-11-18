@@ -27,7 +27,8 @@ from .spec import ModelSpec
 # main cores: LX_NULL_DN compiles the DeltaNet arithmetic away, LX_NULL_GEMV the q4/q8 GEMV
 # tile body, both leaving every stream, fifo and DMA -- and so insts.bin -- byte-identical.
 PROBE_VARS = ("ATTN_T8_SPLIT", "ATTN_T8_SPLIT_U1", "ATTN_T8_SPLIT_U2", "ATTN_NULL", "ATTN_ABL", "ATTN_RB", "ATTN_FAST", "LX_NULL_DN", "LX_NULL_GEMV", "DXL_NULL_PREP", "DXL_NULL_LN", "ATTN_TREE8", "ATTN_REPEAT",
-              "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G4CORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT")
+              "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G4CORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT", "ATTN_INTFP",
+              "ATTN_G5_JT", "ATTN_G5_JT_U", "ATTN_T8_UNROLL", "ATTN_KVS_BLOCK_ONLY")
 
 RB_SUPPORTED = (1, 2, 4, 8)   # attn_stepb.cc has bodies for 2 and 4; 1 is the unblocked path; 8 only on the windowed kernels
 
@@ -111,6 +112,45 @@ KVSLICE_MEASURED = ("granite",)
 KVCORES4_MEASURED = (("llama3", 16, 2, 128),)
 
 
+# (family, heads, kv heads, head dim) whose KVCORES (ATTN_G5) attention takes the fused degree-4 exponential (attn.h
+# ATTN_EXPA=2, Granite's measured G5 default; not bit-identical to vexpN). MiniCPM5-2B, 2026-11-17, 2 alternating rounds:
+# decode 38.2 -> 37.8 ms/token at 1k, 84.9 -> 81.0 at 8k; greedy 32 tokens identical at both; decgate vs the CPU
+# reference at P=4352 cos 0.999870 / argmax 250/256 / KL 8.2e-5 (shipped: 0.999871 / 250 / 9.4e-5) and at P=16320
+# 0.999841 / 243 / 6.0e-4 (shipped: 0.999850 / 244 / 5.5e-4).
+EXPA2_MEASURED = (("llama3", 16, 2, 128),)
+
+
+def g5_expa(spec: ModelSpec) -> int:
+    """attn.h ATTN_EXPA for a KVCORES (G5) attention core that is not Granite's: 2 for a measured shape, else 0."""
+    return 2 if (spec.family, spec.num_heads, spec.num_kv_heads, spec.head_dim) in EXPA2_MEASURED else 0
+
+
+# (family, heads, kv heads, head dim) whose KVCORES-4 attention (ATTN_G5, 2 heads a core) runs 8 window rows a block
+# with the joint-tree scorer (attn.h ATTN_G5_JT, its row loop unrolled by 4) and the KVSLICE walk's tail and new row
+# as masked blocks (ATTN_KVS_BLOCK_ONLY: the single-row kernel is not built; dx attention core 12656 of 16384 B).
+# MiniCPM5-2B, 2026-11-17, 3 alternating rounds holding NPU + GPU, every round within 0.1 ms: decode 37.7 -> 35.5
+# ms/token at 1k, 80.9 -> 62.9 at 8k; greedy 32 tokens identical at both. Not bit-identical (the masked rows'
+# exp(-87) weight, 8-row blocks): decgate vs the CPU reference at P=4352 cos 0.999873 / argmax 251/256 / KL 5.2e-5
+# (previous: 0.999870 / 250 / 8.2e-5) and at P=16320 0.999848 / 243 / 6.9e-4 (previous: 0.999841 / 243 / 6.0e-4).
+# The joint tree alone at RB 4 is byte-identical to the previous scorer at both prefixes; unroll 2/4 byte-identical
+# to unroll 1. (8 rows a block was ~40% slower at 8k only while kv_cores fell back to 2 cores a kv head for RB 8.)
+G5_RB8_MEASURED = (("llama3", 16, 2, 128),)
+G5_RB8_DEFAULTS = (("ATTN_G5_JT", 1), ("ATTN_G5_JT_U", 4), ("ATTN_KVS_BLOCK_ONLY", 1))
+
+
+def g5_rb8(spec: ModelSpec) -> bool:
+    """A G5_RB8_MEASURED shape on its measured 4-cores-a-kv-head attention (ATTN_KVCORES not forced elsewhere)."""
+    return ((spec.family, spec.num_heads, spec.num_kv_heads, spec.head_dim) in G5_RB8_MEASURED
+            and os.environ.get("ATTN_KVCORES") in (None, "4") and os.environ.get("ATTN_KVSLICE") in (None, "1"))
+
+
+def g5_rb8_flags(spec: ModelSpec) -> list[str]:
+    """The attn.h flags a g5_rb8 shape's G5 core takes by default; a probe variable set in the environment wins."""
+    if not g5_rb8(spec):
+        return []
+    return [f"-D{k}={v}" for k, v in G5_RB8_DEFAULTS if k not in os.environ]
+
+
 def _kvcores4_measured(spec: ModelSpec) -> bool:
     return (spec.family, spec.num_heads, spec.num_kv_heads, spec.head_dim) in KVCORES4_MEASURED
 
@@ -146,7 +186,7 @@ def kv_cores(spec: ModelSpec, nh: int, kvh: int, hd: int, rb: int, kvsl: int) ->
     # 4 cores a kv head: each kv head's query heads split evenly over 4 cores (2 a core at 16 over 2) that read
     # that kv head's window slice. The measured shapes by default, ATTN_KVCORES=4 / 0 forces it on / off.
     if ((forced == "4" or (forced is None and _kvcores4_measured(spec))) and spec.family == "llama3" and kvsl
-            and kvh * 4 <= 16 and nh % (4 * kvh) == 0 and nh // (4 * kvh) <= 5 and rb in (2, 4)):
+            and kvh * 4 <= 16 and nh % (4 * kvh) == 0 and nh // (4 * kvh) <= 5 and rb in (2, 4, 8)):
         return 4
     return n if n in (1, 2) and kvsl and kvh == 8 and nh == 5 * kvh and hd == 64 and rb in (4, 8) else 0
 
@@ -285,6 +325,8 @@ def knobs(spec: ModelSpec, nh: int, hpo: int) -> AttnKnobs:
         cap = 4 if (spec.head_dim < 256 or block_ok or (spec.attn_gate and t2)) else (1 if (spec.attn_gate or nhl > 2) else 2)
         rb = max((r for r in (4, 2, 1) if r <= cap and (r * block_lanes(nhl)) in (8, 16, 32)), default=1)
         if spec.family in BLOCK8_MEASURED and rb == 4 and nhl == 8 and spec.head_dim == 64:
+            rb = 8
+        if rb == 4 and g5_rb8(spec):
             rb = 8
         rb = _probe_rb(rb, nhl)
         # The retirement is the block kernel's OWN cost model, so it follows rb: an
