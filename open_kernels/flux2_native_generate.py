@@ -554,11 +554,94 @@ def gguf_modulation(gguf: Path, model: Path, choice: str) -> bool:
     return found
 
 
+def seed_noise(seed: int, tokens: int, edit: bool) -> np.ndarray:
+    # An edit draws from its own stream: with the text-to-image noise of the same seed
+    # (the server's default seed is shared), editing an image generated with that seed
+    # reproduces the reference instead of applying the edit (measured 2026-11-08).
+    rng = np.random.default_rng([seed, 1] if edit else seed)
+    return rng.standard_normal((tokens, kp.LAT_CH), np.float32).astype(bfloat16).view(np.uint16)
+
+
+def serve(a) -> int:
+    """Resident worker for ``phlegm serve``: one JSON request per stdin line, one JSON reply per
+    stdout line. The Runner is kept while (size, steps, edit) stays the same."""
+    import gc
+    import os
+    from PIL import Image
+
+    replies = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8")
+    os.dup2(2, 1)  # progress output from the runner and pyxrt must not reach the reply stream
+    sys.stdout = sys.stderr
+
+    def send(value: dict) -> None:
+        replies.write(json.dumps(value) + "\n")
+
+    try:
+        geometry = check_checkpoint(a.model, gguf=a.transformer_gguf)
+        gguf = None
+        if a.transformer_gguf:
+            gguf = (str(a.transformer_gguf), gguf_modulation(a.transformer_gguf, a.model, a.gguf_modulation))
+    except (Exception, SystemExit) as e:
+        send({"ok": False, "error": f"startup: {e}"})
+        return 1
+    send({"ok": True, "protocol": 1})
+    runner, key = None, None
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            q = json.loads(line)
+            size, steps, seed = int(q["size"]), int(q["steps"]), int(q["seed"])
+            ref = Path(q["image"]) if q.get("image") else None
+            why = kp.check_resolution(size) or (kp.check_edit(size, size) if ref else None)
+            if why:
+                raise ValueError(f"unsupported size: {why}")
+            if not 1 <= steps <= 50:
+                raise ValueError("steps must be between 1 and 50")
+            reused = key == (size, steps, ref is not None)
+            if not reused:
+                runner, key = None, None
+                gc.collect()  # the old hardware context and buffers go before the new ones
+                runner = Runner(a.model, a.kernels, size, steps, ref is not None, a.pack_jobs,
+                                gguf=gguf, elf=a.dispatch == "elf")
+                key = (size, steps, ref is not None)
+            out = Path(q["out"])
+            out.mkdir(parents=True, exist_ok=True)
+            t = time.perf_counter()
+            _, n_real = runner.set_prompt(q["prompt"])
+            runner.set_noise(seed_noise(seed, kp.image_tokens(size), ref is not None))
+            if ref is not None:
+                runner.set_reference(load_reference(ref, size))
+            host_inputs = time.perf_counter() - t
+            phases = runner.run()
+            image_path = out / "image.png"
+            Image.fromarray(runner.image()).save(image_path)
+            summary = {"image": str(image_path), "prompt": q["prompt"], "size": size, "steps": steps,
+                       "seed": seed, "edit": ref is not None, "reference": str(ref) if ref else None,
+                       "tokens": n_real, "model": str(a.model), "kernels": str(a.kernels),
+                       "checkpoint": geometry, "dispatches": runner.dispatch_count,
+                       "dispatch": a.dispatch, "resident": True, "reused_runner": reused,
+                       "load_s": 0.0 if reused else round(runner.load_s, 2),
+                       "npu_phases_s": {k: round(v, 4) for k, v in phases.items()},
+                       "host_inputs_s": round(host_inputs, 4)}
+            (out / "summary.json").write_text(json.dumps(summary, indent=1))
+            send({"ok": True, "image": str(image_path), "reused_runner": reused,
+                  "load_s": summary["load_s"], "npu_s": round(phases["total"], 4)})
+        except (Exception, SystemExit) as e:
+            if not isinstance(e, (ValueError, KeyError)):
+                runner, key = None, None  # device state is unknown after a failed build or run
+                gc.collect()
+            send({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", type=Path, required=True, help="diffusers checkpoint directory")
     ap.add_argument("--kernels", type=Path, required=True)
-    ap.add_argument("--prompt", required=True)
+    ap.add_argument("--serve", action="store_true",
+                    help="resident worker: JSON requests on stdin, replies on stdout (phlegm serve)")
+    ap.add_argument("--prompt")
     ap.add_argument("--projected-conditioning", type=Path,
                     help="experimental 512x3072 artifact; bypass native text encoding/projection")
     ap.add_argument("--size", type=int, default=512)
@@ -578,8 +661,14 @@ def main() -> int:
                     help="take the DiT from this GGUF; --model still supplies the text encoder, VAE, tokenizer")
     ap.add_argument("--gguf-modulation", choices=("auto", "bfl", "diffusers"), default="auto",
                     help="the GGUF's final adaLN half order (auto: compare with a reference)")
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--out", type=Path)
     a = ap.parse_args()
+    if a.serve:
+        if a.prompt or a.out or a.image or a.noise or a.projected_conditioning or a.repeat != 1 or a.profile:
+            ap.error("--serve takes its requests on stdin; give only model, kernels and dispatch options")
+        return serve(a)
+    if not a.prompt or not a.out:
+        ap.error("--prompt and --out are required")
 
     why = kp.check_resolution(a.size) or (kp.check_edit(a.size, a.size) if a.image else None)
     if why:
@@ -606,11 +695,7 @@ def main() -> int:
             raise SystemExit(f"noise shape {noise.shape} does not fit {a.size}")
         lat = pack_noise(noise)
     else:
-        # An edit draws from its own stream: with the text-to-image noise of the same seed
-        # (the server's default seed is shared), editing an image generated with that seed
-        # reproduces the reference instead of applying the edit (measured 2026-11-08).
-        rng = np.random.default_rng([a.seed, 1] if a.image else a.seed)
-        lat = rng.standard_normal((T, kp.LAT_CH), np.float32).astype(bfloat16).view(np.uint16)
+        lat = seed_noise(a.seed, T, a.image is not None)
 
     r = Runner(a.model, a.kernels, a.size, a.steps, a.image is not None, a.pack_jobs,
                projected=conditioning is not None, gguf=gguf, elf=a.dispatch == "elf")
