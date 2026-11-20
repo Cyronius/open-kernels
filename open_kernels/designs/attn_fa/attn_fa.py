@@ -56,6 +56,8 @@ PSPLIT = os.environ.get("AF_PSPLIT") == "1"
 TAU = int(os.environ.get("AF_TAU", 16))
 KDEPTH = int(os.environ.get("AF_KDEPTH", 2))
 VDEPTH = int(os.environ.get("AF_VDEPTH", 1))
+SMU = int(os.environ.get("AF_SMU", 2))             # attn_fa.cc AF_SMU
+EXPV = int(os.environ.get("AF_EXPV", 1))           # attn_fa.cc AF_EXPV
 ABL = int(os.environ.get("AF_ABL", 0))            # attn_fa.cc AF_ABL, timing ablations only
 RTP_PASSES, RTP_CHUNKS, RTP_TBL, RTP_PQ, RTP_PKV = 0, 1, 2, 3, 4
 RTP_LEN = 8
@@ -80,18 +82,24 @@ def q_head_elems(qsplit: int = QSPLIT) -> int:
     return ELEM * (1 + Q_ELEMS * (2 if qsplit else 1))
 
 
-def check_shape(L: int, heads: int, kv_heads: int) -> str | None:
-    max_chunks = 128 if LONG_STREAM else 64
-    if L <= 0 or L % 256 or L // LKP > max_chunks or heads % N_GROUPS or heads % kv_heads:
-        return (f"attn_fa needs positive L % 256 with at most {max_chunks} key chunks, heads % {N_GROUPS}, heads % kv_heads "
-                f"(got L={L} heads={heads} kv_heads={kv_heads})")
+def check_shape(L: int, heads: int, kv_heads: int, max_rows: int | None = None) -> str | None:
+    if L <= 0 or L % 256 or (LONG_STREAM and L // LKP > 128) or heads % N_GROUPS or heads % kv_heads:
+        return (f"attn_fa needs positive L % 256 (at most 128 key chunks with AF_LONG_STREAM), heads % {N_GROUPS}, "
+                f"heads % kv_heads (got L={L} heads={heads} kv_heads={kv_heads})")
+    if max_rows is not None and L > max_rows:
+        return f"attn_fa: window L={L} is past the cache's {max_rows} rows"
     return None
+
+
+def sliced(n_chunks: int) -> bool:
+    """Past 64 key chunks (4096 rows) a pass streams its window as 64-chunk slices with a bounded number in flight."""
+    return n_chunks > 64 and not LONG_STREAM
 
 
 @iron.jit(aiecc_flags=["--dynamic-objFifos", "--alloc-scheme=basic-sequential"])
 def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: CompileTime[int],
             kv_heads: CompileTime[int], kv_ld: CompileTime[int], max_rows: CompileTime[int]):
-    why = check_shape(L, heads, kv_heads)
+    why = check_shape(L, heads, kv_heads, max_rows)
     assert why is None, why
     hpg = heads // N_GROUPS
     gqa = heads // kv_heads
@@ -108,7 +116,7 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
     o_l2_ty = np.ndarray[(N_ROWS * TQ * HD,), np.dtype[np.float32]]
     rtp_ty = np.ndarray[(RTP_LEN,), np.dtype[np.int32]]
 
-    flags = [f"-DAF_QSPLIT={QSPLIT}", f"-DAF_PSPLIT={int(PSPLIT)}", f"-DAF_TAU={TAU}", f"-DAF_ABL={ABL}", "-Wno-deprecated-declarations"]
+    flags = [f"-DAF_QSPLIT={QSPLIT}", f"-DAF_PSPLIT={int(PSPLIT)}", f"-DAF_TAU={TAU}", f"-DAF_ABL={ABL}", f"-DAF_SMU={SMU}", f"-DAF_EXPV={EXPV}", "-Wno-deprecated-declarations"]
     _ef = ExternalFunction("af_init", source_file=KERNEL_SRC, arg_types=[o_l1_ty, st_ty], compile_flags=flags)
     obj = _ef.object_file_name
     k_meta = Kernel("af_meta", obj, [elem_ty, st_ty])
@@ -252,6 +260,9 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
             buf[RTP_PKV] = 0
         for b in barriers.values():
             b.set(1)
+        if sliced(n_chunks):
+            long_sequence(q, kv, o, a_prods, b_prods, o_conses)
+            return
         inflight: list[TaskGroup] = []
         for k in range(hpg):
             tg = TaskGroup()
@@ -284,6 +295,46 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                 inflight.pop(0).finish()
         for tg in inflight:
             tg.finish()
+
+    def long_sequence(q, kv, o, a_prods, b_prods, o_conses):
+        # Each channel queues Q plus at most two 64-chunk slices (R-0001: under 4 BDs a channel); the
+        # oldest slice is awaited before the next is queued, so a window of any length fits the BD pool.
+        for k in range(hpg):
+            tq = TaskGroup()
+            for g in range(N_GROUPS):
+                base = (g * hpg + k) * qh_elems
+                a_prods[g].fill(q, offset=base, sizes=[qa_rows, HD], strides=[HD, 1], group=tq)
+                if QSPLIT:
+                    b_prods[g].fill(q, offset=base + qa_rows * HD, sizes=[qb_rows, HD], strides=[HD, 1], group=tq)
+            pending: list[TaskGroup] = []
+            for chunk0 in range(0, n_chunks, 64):
+                count = min(64, n_chunks - chunk0)
+                ts = TaskGroup()
+                for g in range(N_GROUPS):
+                    kvh = (g * hpg + k) // gqa
+                    a_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + kvh * HD, sizes=[count, LKP, HD],
+                                    strides=[LKP * kv_ld, kv_ld, 1], wait=True, group=ts)
+                    b_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + (kv_heads + kvh) * HD, sizes=[count, LKP, HD],
+                                    strides=[LKP * kv_ld, kv_ld, 1], wait=True, group=ts)
+                pending.append(ts)
+                if len(pending) == 2:
+                    pending.pop(0).finish()
+                    if tq is not None:      # Q went ahead of the first slice on both channels
+                        tq.finish()
+                        tq = None
+            td = TaskGroup()
+            for g in range(N_GROUPS):
+                h = g * hpg + k
+                for cc in range(GROUP_COLS):
+                    col = g * GROUP_COLS + cc
+                    row0 = cc * N_ROWS * TQ
+                    o_conses[col].drain(o, offset=row0 * qw + h * HD, sizes=[N_ROWS * TQ, HD],
+                                        strides=[qw, 1], wait=True, group=td)
+            for ts in pending:
+                ts.finish()
+            if tq is not None:
+                tq.finish()
+            td.finish()
 
     # prep: y is the qkv GEMM's c-tiled fp32 output (seen as bf16 pairs), tb the block's table, q gets Q hi / lo in the
     # pass layout and kv (a window of the cache that starts at the block's first row) gets K rotated and V

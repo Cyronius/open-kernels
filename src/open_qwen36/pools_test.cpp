@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "open_qwen36/bfp16.hpp"
 #include "open_qwen36/manifest.hpp"
 #include "open_qwen36/pools.hpp"
 #include "open_qwen36/q4nx_file.hpp"
@@ -863,6 +864,50 @@ int main() {
         std::printf("      bf16_gemm fnv1a q8 = 0x%016llx, q4_1 = 0x%016llx\n", static_cast<unsigned long long>(g8),
                     static_cast<unsigned long long>(g4));
         check(g8 == 0xa1e333116f424dafull && g4 == 0x7018cee99915f0b9ull, "bf16_gemm: byte-identical to the NumPy packer");
+    }
+
+    // ---- bfp16_gemm (OPEN-PREFILL-BFP16): the q4_1 chunks twice, a [128, 1536] tensor at row 256 of a 1024-row weight
+    {
+        const size_t R = 128, K = 1536, N_TOTAL = 1024;
+        std::vector<uint8_t> two(out.begin(), out.begin() + 12 * 5120);
+        two.insert(two.end(), out.begin(), out.begin() + 12 * 5120);
+        std::vector<uint8_t> dst(N_TOTAL * K / 8 * open_qwen36::BFP16_BLOCK_BYTES, 0);
+        open_qwen36::pools::bfp16_gemm_pack(two.data(), R, K, 256, N_TOTAL, dst.data());
+        const uint64_t gb = fnv1a(dst.data(), dst.size());
+        std::printf("      bfp16_gemm fnv1a = 0x%016llx\n", static_cast<unsigned long long>(gb));
+        check(gb == 0xb7aece12e88c13afull, "bfp16_gemm: byte-identical to the NumPy packer");
+        // OPEN-PREFILL-BFP16-QKV: ksplit 3 is the ksplit 1 row twice, then the encoding of the row minus its value
+        std::vector<uint8_t> d3(N_TOTAL * 3 * K / 8 * open_qwen36::BFP16_BLOCK_BYTES, 0);
+        open_qwen36::pools::bfp16_gemm_pack(two.data(), R, K, 256, N_TOTAL, d3.data(), "", 3);
+        const open_qwen36::Bfp16Tiling t;
+        bool ks = true;
+        double lo_err = 0;
+        for (size_t r = 0; r < R && ks; ++r) {
+            const uint8_t* r1 = dst.data() + open_qwen36::bfp16_b_offset(256 + r, 0, N_TOTAL, K, t);
+            const uint8_t* r3 = d3.data() + open_qwen36::bfp16_b_offset(256 + r, 0, N_TOTAL, 3 * K, t);
+            for (size_t cb = 0; cb < K / 8 && ks; ++cb) {
+                const uint8_t* hi = r1 + open_qwen36::bfp16_b_row_block(0, cb, t);
+                ks = std::memcmp(r3 + open_qwen36::bfp16_b_row_block(0, cb, t), hi, 9) == 0 &&
+                     std::memcmp(r3 + open_qwen36::bfp16_b_row_block(0, cb + K / 8, t), hi, 9) == 0;
+                float h[8], l[8];
+                open_qwen36::bfp16_decode_block(hi, h);
+                open_qwen36::bfp16_decode_block(r3 + open_qwen36::bfp16_b_row_block(0, cb + 2 * K / 8, t), l);
+                double hm = 0, lm = 0;
+                for (int i = 0; i < 8; ++i) hm = std::max(hm, static_cast<double>(std::fabs(h[i]))), lm = std::max(lm, static_cast<double>(std::fabs(l[i])));
+                if (hm > 0) lo_err = std::max(lo_err, lm / hm);
+            }
+        }
+        check(ks && lo_err < 1.0 / 64, "bfp16_gemm ksplit 3: [hi | hi | lo], hi the ksplit 1 blocks, lo under 2^-6 of hi");
+        // OPEN-PREFILL-BFP16-FFN: the same chunks four times as a [512, 1536] gate and up, halves of a 1024-row glu weight
+        std::vector<uint8_t> four;
+        for (int i = 0; i < 4; ++i) four.insert(four.end(), two.begin(), two.end());
+        std::vector<uint8_t> glu(N_TOTAL * K / 8 * open_qwen36::BFP16_BLOCK_BYTES, 0);
+        open_qwen36::pools::bfp16_gemm_pack(four.data(), 512, K, 0, N_TOTAL, glu.data(), "gate");
+        open_qwen36::pools::bfp16_gemm_pack(four.data(), 512, K, 0, N_TOTAL, glu.data(), "up");
+        const uint64_t gg = fnv1a(glu.data(), glu.size());
+        std::printf("      bfp16_gemm glu fnv1a = 0x%016llx\n", static_cast<unsigned long long>(gg));
+        // test_prefill_bfp16.py asserts the same hash of the glu halves
+        check(gg == 0xe608fa0b59e37843ull, "bfp16_gemm glu: byte-identical to the NumPy packer");
     }
 
     // ---- transpose: [32, 64] of 2-byte values

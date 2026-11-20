@@ -43,6 +43,9 @@
 #ifndef AF_ABL
 #define AF_ABL 0   // ablation (timing only): 1 skips S = QK, 2 the softmax, 4 O += PV
 #endif
+#ifndef AF_SMU
+#define AF_SMU 2   // keys an iteration of the softmax's exponential loop: 4 spilled more (19.9 against 19.1 ms at L 8192)
+#endif
 
 constexpr int TQ = 32;
 constexpr int LKP = 64;
@@ -144,6 +147,38 @@ static inline vb exp2b(vf x) {
   vi bits = p.template to_vector<float>().template cast_to<int32_t>();
   bits = aie::add(bits, aie::upshift(n, 23));
   bits = aie::select(bits, aie::zeros<int32_t, 32>(), aie::lt(n, aie::broadcast<int32_t, 32>(-125)));
+  return to_bf(bits.template cast_to<float>());
+}
+
+#ifndef AF_EXPV
+#define AF_EXPV 1   // 1: exp2c below in the softmax loop (11.9 against 14.6 ms at L 8192); 0: exp2b
+#endif
+// exp2b with fp32 magic-number rounding: float-to-int conversions rewrite the saturation-mode registers each time
+static inline vb exp2c(vf x) {
+  constexpr float kMagic = 12582912.0f;
+  x = aie::max(x, aie::broadcast<float, 32>(-126.0f));
+  af32 t;
+  t.from_vector(x);
+  t = aie::add(t, aie::broadcast<float, 32>(kMagic));
+  const vf tv = t.template to_vector<float>();
+  const vi n = aie::sub(tv.template cast_to<int32_t>(), aie::broadcast<int32_t, 32>(0x4B400000));
+  af32 nf;
+  nf.from_vector(tv);
+  nf = aie::sub(nf, aie::broadcast<float, 32>(kMagic));
+  af32 fa;
+  fa.from_vector(x);
+  fa = aie::sub(fa, nf.template to_vector<float>());
+  const vb f = fa.template to_vector<bfloat16>();
+  af32 u;
+  u.from_vector(aie::broadcast<float, 32>(AF_C2));
+  u = aie::mac(u, f, aie::broadcast<bfloat16, 32>((bfloat16)AF_C3));
+  af32 w;
+  w.from_vector(aie::broadcast<float, 32>(AF_C1));
+  w = aie::mac(w, u.template to_vector<bfloat16>(), f);
+  af32 p;
+  p.from_vector(aie::broadcast<float, 32>(1.0f));
+  p = aie::mac(p, w.template to_vector<bfloat16>(), f);
+  const vi bits = aie::add(p.template to_vector<float>().template cast_to<int32_t>(), aie::upshift(n, 23));
   return to_bf(bits.template cast_to<float>());
 }
 
@@ -400,13 +435,17 @@ void af_sm(float *s, float *__restrict st, float *__restrict o,
     l = aie::mac(l, lo, one);
   }
 #else
-  for (int j = 0; j < LKP; j += 4) {
-    vb pb[4];
+  for (int j = 0; j < LKP; j += AF_SMU) {
+    vb pb[AF_SMU];
 #pragma clang loop unroll(full)
-    for (int u = 0; u < 4; u++)
+    for (int u = 0; u < AF_SMU; u++)
+#if AF_EXPV
+      pb[u] = exp2c(fsub(aie::load_v<32>(s + (j + u) * TQ), mm));
+#else
       pb[u] = exp2b(fsub(aie::load_v<32>(s + (j + u) * TQ), mm));
+#endif
 #pragma clang loop unroll(full)
-    for (int u = 0; u < 4; u++) {
+    for (int u = 0; u < AF_SMU; u++) {
       const dup pd = dbl(pb[u]);
       aie::store_v(p + (j + u) * 2 * TQ, pd.lo);
       aie::store_v(p + (j + u) * 2 * TQ + 32, pd.hi);

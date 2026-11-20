@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from .cache import build_key
-from .families import for_spec
+from .families import family_builds, for_spec
 from .load import spec_from_model_dir
 from .spec import ModelSpec, hf_model_types
 
@@ -92,7 +92,7 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         "family": spec.family,
         "spec": spec.to_dict(),
         "spec_hash": spec.spec_hash(),
-        "build_key": key if key is not None else build_key(spec),
+        "build_key": key if key is not None else build_key(spec, max_ctx=max_ctx),
         "max_ctx_default": max_ctx,
         "hf_config_check": check,
         "hf_config_defaults": getattr(F, "hf_config_defaults", lambda s: {})(spec),
@@ -103,7 +103,7 @@ def manifest(spec: ModelSpec, max_ctx: int = 4096, key: str | None = None) -> di
         "layer_types": prog["layer_types"],
         "tail": prog["tail"],
         "globals": prog["globals"],
-        "builds": F.builds(spec),
+        "builds": family_builds(F, spec, max_ctx),
     }
     if "rows" in prog:
         m["rows"] = prog["rows"]

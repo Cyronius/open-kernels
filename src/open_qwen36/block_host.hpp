@@ -55,6 +55,9 @@ void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t
 /// OPEN-PREFILL-BFP16, gemm_bfp16's operands (bfp16.hpp). x [T, K] fp32 -> the A operand, T * K / 8 * 9
 /// bytes. T a multiple of m * rows, K of k.
 void bfp16_pack_a(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
+/// OPEN-PREFILL-BFP16-QKV: the 3 K-wide A operand [hi | lo | hi] of x, lo = x - the hi encoding's value; against a
+/// [hi | hi | lo] weight the product is hi.hi + lo.hi + hi.lo
+void bfp16_pack_a_split3(const float* x, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
 /// The kernel's c-tiled fp32 output of an M x N product -> y [n_real, M] (the q4 GEMM's own [N, T] order).
 void bfp16_untile_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* y);
 /// ... -> y [rows, n_real], token rows: the first `rows` of the M, the first n_real of the N (padding dropped).
@@ -63,6 +66,14 @@ void bfp16_rows_c(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size
 /// rows land in dst as [rows, width], as transpose_parts does from [N, T]. Every off and width a multiple of t.n.
 void bfp16_rows_parts(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t rows, const TransposePart* parts,
                       size_t n_parts);
+/// ... into token rows: out [M, n_real], every one of the M rows.
+inline void bfp16_untile_rows(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t n_real, float* out) {
+    bfp16_rows_c(c, M, N, t, M, n_real, out);
+}
+/// Token row r's columns [ct n, ct n + n) of a c-tiled M x N output: a stage reading y once needs no untiled copy
+inline const float* bfp16_c_row(const float* c, size_t M, size_t N, const Bfp16Tiling& t, size_t r, size_t ct) {
+    return c + bfp16_c_offset(r, ct * t.n, M, N, t);
+}
 /// act_tile for the bfp16 route: act (act_fp64 of the gate) and up, both c-tiled T x K outputs, give
 /// h = act * up rounded to fp32, encoded as the down projection's A operand -- bfp16_pack_a of the [T, K] h,
 /// byte for byte, without untiling either input or holding h.
@@ -141,6 +152,16 @@ inline size_t attn_first_row(const AttnGeom& g) {
 /// cache: rows of kv_row_elems bf16, [K_t | V_t] each kvh*hd wide, rows [0, pos0) valid on
 /// entry and [pos0, pos0 + t_real) written. og [T, nh*hd] out: the gated attention
 /// output (zero past t_real).
+/// AVX2/FMA host attention helpers (OPEN-PREFILL-HOST-ATTN), kept here so core.cpp keeps its compile flags.
+/// scores_f32 writes (q . K[r]) * scale for r < n and returns the maximum; exp_sum_f32 overwrites the scores with
+/// exp(s - mx) and returns their fp64 sum; axpy_f32 is out += a v over n (a multiple of 8).
+float scores_f32(const float* K, size_t stride, const float* q, size_t hd, size_t n, float scale, float* s);
+double exp_sum_f32(float* s, size_t n, float mx);
+void axpy_f32(float* out, float a, const float* v, size_t n);
+/// The app's greedy (Sampler::sample_greedy) over one row: logits rounded to bf16 (nearest even, subnormals to zero),
+/// the lowest id on a tie.
+int argmax_bf16_row(const float* p, size_t n);
+
 void attention_block(const AttnGeom& g, const float* q, const float* k, const float* v, const float* gate,
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
                      float* og);

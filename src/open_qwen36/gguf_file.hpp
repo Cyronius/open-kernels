@@ -77,6 +77,14 @@ public:
     std::string kv_str(const std::string& key) const;
     uint64_t kv_u64(const std::string& key) const;
     double kv_f64(const std::string& key) const;
+    /// A float metadata value exactly as stored (kv_f64 parses a six-decimal string).
+    double kv_float(const std::string& key) const;
+
+    /// OPEN-GGUF-GRANITE-FOLD: scale a tensor's values by `factor` wherever they are read (embed_row,
+    /// std_perm_gguf's scales). `tensor` is a GGUF name, without "blk.N." for a per-layer one.
+    /// Only a power of two is accepted, so the fold is exact.
+    void set_fold(const std::string& tensor, float factor);
+    float fold(const std::string& name) const;
 
     static const char* type_name(Type t);
 
@@ -89,6 +97,8 @@ private:
     bool sandwich_ = false;
     mutable std::map<std::string, TensorMeta> meta_cache_;  // row-major shapes, built on demand
     std::map<std::string, std::string> meta_;       // everything as strings (the derivation's view)
+    std::map<std::string, double> num_;             // float keys, exact
+    std::map<std::string, float> folds_;
 #ifdef _WIN32
     void* file_ = nullptr;
     void* mapping_ = nullptr;
@@ -96,5 +106,10 @@ private:
     int fd_ = -1;
 #endif
 };
+
+/// OPEN-GGUF-GRANITE-FOLD: Granite's four multipliers from an unfolded GGUF as set_fold's
+/// per-tensor factors (only those unequal to 1). Throws when the attention multiplier is absent
+/// or a factor is not a power of two. recipes/spec.py `granite_gguf_folds` is the same rule.
+std::map<std::string, float> granite_folds(const GgufFile& g);
 
 }  // namespace open_qwen36

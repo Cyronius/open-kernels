@@ -362,17 +362,35 @@ void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint1
     }
 }
 
-void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, size_t n_total, uint8_t* dst) {
+static size_t bfp16_dst_row(size_t r, size_t row0, size_t n_total, const std::string& glu) {
+    return glu.empty() ? row0 + r : bfp16_glu_row(r, n_total / 2, Bfp16Tiling{}) + (glu == "up" ? 8 : 0);
+}
+
+// one weight row's blocks; ksplit 3 writes K three times, [hi | hi | lo], against the A operand's [hi | lo | hi]
+static void bfp16_put_row(const float* w, size_t cols, size_t ksplit, uint8_t* row, const Bfp16Tiling& t) {
+    const size_t nb = cols / 8;
+    for (size_t cb = 0; cb < nb; ++cb) {
+        if (ksplit == 1) {
+            bfp16_encode_block(w + cb * 8, row + bfp16_b_row_block(0, cb, t));
+            continue;
+        }
+        uint8_t* hi = row + bfp16_b_row_block(0, cb, t);
+        bfp16_encode_hilo(w + cb * 8, hi, row + bfp16_b_row_block(0, cb + 2 * nb, t));
+        std::memcpy(row + bfp16_b_row_block(0, cb + nb, t), hi, BFP16_BLOCK_BYTES);
+    }
+}
+
+void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, size_t n_total, uint8_t* dst,
+                     const std::string& glu, size_t ksplit) {
     const Bfp16Tiling t;
     const size_t ncol = cols / 256;
 #pragma omp parallel for
     for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
         const size_t r = static_cast<size_t>(rr);
-        float w[8];
-        for (size_t cb = 0; cb < cols / 8; ++cb) {
-            for (size_t i = 0; i < 8; ++i) w[i] = q4_1_value(src, ncol, r, cb * 8 + i);
-            bfp16_encode_block(w, dst + bfp16_b_row_block(bfp16_b_offset(row0 + r, 0, n_total, cols, t), cb, t));
-        }
+        const size_t br = bfp16_dst_row(r, row0, n_total, glu);
+        std::vector<float> w(cols);
+        for (size_t k = 0; k < cols; ++k) w[k] = q4_1_value(src, ncol, r, k);
+        bfp16_put_row(w.data(), cols, ksplit, dst + bfp16_b_offset(br, 0, n_total, ksplit * cols, t), t);
     }
 }
 
@@ -382,16 +400,24 @@ std::vector<std::pair<size_t, size_t>> unwritten(const std::vector<PackOp>& ops,
     bool exact = !ops.empty();
     for (const PackOp& op : ops)
         exact = exact && op.op == "bfp16_gemm" && op.dst == 0 && op.n_total == ops[0].n_total && op.in_dim == ops[0].in_dim &&
+                op.ksplit == ops[0].ksplit &&
                 op.in_dim % 256 == 0 && op.in_dim % t.k == 0 && op.n_total % (t.n * t.cols) == 0 && op.row0 % t.n == 0 &&
                 (op.nch / (op.in_dim / 256) * 32) % t.n == 0;
     if (!exact) return {{0, bytes}};
     const size_t groups = ops[0].n_total / t.n, per_col = groups / t.cols;
-    const size_t group_bytes = ops[0].in_dim / t.k * t.n * (t.k / 8) * BFP16_BLOCK_BYTES;
+    const size_t group_bytes = ops[0].ksplit * ops[0].in_dim / t.k * t.n * (t.k / 8) * BFP16_BLOCK_BYTES;
     std::vector<char> hit(groups, 0);
+    bool gate = false, up = false;
     for (const PackOp& op : ops) {
         const size_t rows = op.nch / (op.in_dim / 256) * 32;
-        for (size_t g = op.row0 / t.n; g < (op.row0 + rows) / t.n && g < groups; ++g) hit[g] = 1;
+        gate = gate || op.glu == "gate";
+        up = up || op.glu == "up";
+        if (op.glu.empty())
+            for (size_t g = op.row0 / t.n; g < (op.row0 + rows) / t.n && g < groups; ++g) hit[g] = 1;
     }
+    // the two glu halves interleave through every group, so together they write all of them
+    if (gate && up) std::fill(hit.begin(), hit.end(), 1);
+    else if (gate || up) return {{0, bytes}};
     std::vector<std::pair<size_t, size_t>> out;
     for (size_t g = 0; g < groups; ++g)
         if (!hit[g]) out.push_back({((g % t.cols) * per_col + g / t.cols) * group_bytes, group_bytes});
@@ -401,7 +427,7 @@ std::vector<std::pair<size_t, size_t>> unwritten(const std::vector<PackOp>& ops,
 }
 
 uint64_t op_bytes(const PackOp& op, size_t chunk_bytes) {
-    if (op.op == "bfp16_gemm") return op.n_total * op.in_dim / 8 * BFP16_BLOCK_BYTES;
+    if (op.op == "bfp16_gemm") return op.n_total * op.ksplit * op.in_dim / 8 * BFP16_BLOCK_BYTES;
     return op.op == "bf16_gemm" ? op.nch * 2 * 8192 : op.nch * chunk_bytes;
 }
 
@@ -525,15 +551,17 @@ struct QkRows {
 
 QkRows llama_qk_rows(const GgufFile& g, const std::string& name, const GgufFile::TensorInfo& t) {
     QkRows q;
-    if (g.kv_str("general.architecture") != "llama" || t.dims.size() < 2) return q;
+    const std::string arch = g.kv_str("general.architecture");
+    if ((arch != "llama" && arch != "granite") || t.dims.size() < 2) return q;
     const auto ends = [&](const char* sfx) {
         const size_t n = std::strlen(sfx);
         return name.size() >= n && name.compare(name.size() - n, n, sfx) == 0;
     };
-    const char* key = ends("q_proj.weight") || ends("attn_q.weight")   ? "llama.attention.head_count"
-                      : ends("k_proj.weight") || ends("attn_k.weight") ? "llama.attention.head_count_kv"
+    const char* sfx = ends("q_proj.weight") || ends("attn_q.weight")   ? ".attention.head_count"
+                      : ends("k_proj.weight") || ends("attn_k.weight") ? ".attention.head_count_kv"
                                                                        : nullptr;
-    if (!key || !g.kv_has(key)) return q;
+    const std::string key = sfx ? arch + sfx : std::string();
+    if (!sfx || !g.kv_has(key)) return q;
     const size_t heads = g.kv_u64(key), rows = t.dims[1];
     if (heads && rows % (2 * heads) == 0) q = {heads, rows};
     return q;
@@ -542,6 +570,10 @@ QkRows llama_qk_rows(const GgufFile& g, const std::string& name, const GgufFile:
 }  // namespace
 
 void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t ch) {
+    if (const auto* g = dynamic_cast<const GgufFile*>(&m);
+        g && op.op != "std_perm_gguf" && op.op != "bfp16_gemm" && !op.tensor.empty() &&
+        g->fold(with_layer(op.tensor, layer)) != 1.0f)
+        fail(op.op + " " + with_layer(op.tensor, layer) + " copies the GGUF's bytes, so it cannot apply the multiplier fold");
     if (op.op == "std_perm") {
         const std::string name = with_layer(op.tensor, layer);
         if (op.nch == 0 || op.in_dim == 0) fail("std_perm " + name + " without nch / in_dim");
@@ -677,6 +709,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         bounds(op, op.nch * ch, dst_bytes);
         auto perm = std_perm(op.nch, op.in_dim);
         const size_t ncol = op.in_dim / 256;
+        const float fold = g.fold(name);                         // the requant path reads embed_row, which folds already
         std::vector<float> rd(kq ? op.in_dim : 0);
         for (size_t c = 0; c < op.nch; ++c) {
             uint8_t* d = dst + op.dst + c * ch;
@@ -726,8 +759,8 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                     }
                     std::memcpy(&ud, b, 2);
                     if (has_min) std::memcpy(&um, b + 2, 2);
-                    const float df = fp16_to_f32(ud);
-                    const float mf = has_min ? fp16_to_f32(um) : -8.f * df;
+                    const float df = fp16_to_f32(ud) * fold;
+                    const float mf = has_min ? fp16_to_f32(um) * fold : -8.f * df;
                     put_scales(d, kb * 32 + r, df, mf);
                     // codes: block nibbles (two K per byte) -> two rows per byte at one K
                     for (size_t i = 0; i < 16; ++i) {
@@ -782,6 +815,9 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             fail("bfp16_gemm " + name + ": rows [" + std::to_string(op.row0) + ", " + std::to_string(op.row0 + rows) +
                  ") of " + std::to_string(op.n_total) + " do not tile by " + std::to_string(t.n) + " rows x " +
                  std::to_string(t.cols) + " columns");
+        if (!op.glu.empty() && (op.row0 || 2 * rows != op.n_total || rows % (t.n / 2) || (2 * rows / t.n) % t.cols))
+            fail("bfp16_gemm " + name + ": a glu half is rows [0, ff) of a 2 ff-row weight, ff whole " +
+                 std::to_string(t.n / 2) + "-row chunks");
         bounds(op, op_bytes(op, ch), dst_bytes);
         uint8_t* out = dst + op.dst;
         if (const auto* g = dynamic_cast<const GgufFile*>(&m)) {
@@ -798,9 +834,9 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                 for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
                     const size_t r = static_cast<size_t>(rr);
                     g->embed_row(name, qk(src_row0 + r), op.in_dim, w.data());
-                    uint8_t* row = out + bfp16_b_offset(op.row0 + r, 0, op.n_total, op.in_dim, t);
-                    for (size_t cb = 0; cb < op.in_dim / 8; ++cb)
-                        bfp16_encode_block(w.data() + cb * 8, row + bfp16_b_row_block(0, cb, t));
+                    bfp16_put_row(w.data(), op.in_dim, op.ksplit,
+                                  out + bfp16_b_offset(bfp16_dst_row(r, op.row0, op.n_total, op.glu), 0, op.n_total,
+                                                       op.ksplit * op.in_dim, t), t);
                 }
             }
         } else {
@@ -809,7 +845,8 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             if (q4->chunk_bytes(name) == Q8_CHUNK)
                 fail("bfp16_gemm " + name + ": the container stores this tensor at q8; only q4_1 sources are packed to bfp16");
             std::vector<uint8_t> tmp;
-            bfp16_gemm_pack(q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp), rows, op.in_dim, op.row0, op.n_total, out);
+            bfp16_gemm_pack(q4_source(m, name, op.chunk0, op.nch, Q4_CHUNK, tmp), rows, op.in_dim, op.row0, op.n_total, out,
+                            op.glu, op.ksplit);
         }
     } else if (op.op == "q8_perm") {
         // The projection stays at q8: `nch` counts POOL half-tiles (5120 B each, twice the

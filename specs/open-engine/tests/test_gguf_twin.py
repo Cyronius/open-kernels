@@ -116,7 +116,14 @@ def test_gguf_section_is_the_f32_program(spec_path: Path):
                     walk(v)
 
         walk(section.get("pack", {}))
-        from recipes.dense import DENSE_FAMILIES
+        from recipes.dense import DENSE_FAMILIES, GGUF_BASE_VIEW_FAMILIES
+        if m["family"] in GGUF_BASE_VIEW_FAMILIES:
+            # OPEN-GGUF-BASE-VIEW: the q4nx manifest itself, its q4_1 packs reading the GGUF
+            base = json.loads(json.dumps({k: v for k, v in m.items() if k != "gguf"}).replace('"std_perm"', '"std_perm_gguf"'))
+            if "rows" in base:
+                base["rows"] = {k: v for k, v in base["rows"].items() if not k.startswith("lora_")}
+            assert section == base and "std_perm" not in ops
+            return
         if m["family"] in DENSE_FAMILIES:
             # A split-FF Llama (OPEN-FAMILY-NANBEIGE, recipes/dense.py gguf_q41_view): the q4_1 program
             # with std_perm_gguf writing the q4_1 law's chunks and the Q8_0 head kept as codes.

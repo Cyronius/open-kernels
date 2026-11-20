@@ -2,6 +2,7 @@
 /// \brief GGUF parsing and the per-token embedding dequant (see gguf_file.hpp).
 #include "open_qwen36/gguf_file.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -46,7 +47,12 @@ std::string rd_str(const uint8_t*& p, const uint8_t* end) {
 
 // One metadata value, recorded as its string form (the config derivation's
 // view); arrays and other composite values are skipped wholesale.
-void rd_value(uint32_t t, const uint8_t*& p, const uint8_t* end, std::string& out) {
+void rd_value(uint32_t t, const uint8_t*& p, const uint8_t* end, std::string& out, double* num = nullptr) {
+    if (num && (t == 6 || t == 12)) {
+        // std::to_string keeps six decimals, so a float's exact value is kept beside its string
+        if (t == 6) { float v; std::memcpy(&v, p, 4); *num = v; }
+        else std::memcpy(num, p, 8);
+    }
     switch (t) {
         case 0: out = std::to_string(rd_u8(p)); break;
         case 1: out = std::to_string(static_cast<int8_t>(rd_u8(p))); break;
@@ -168,8 +174,10 @@ GgufFile::GgufFile(const std::string& path) : path_(path) {
             const std::string key = rd_str(q, end);
             const uint32_t t = rd_u32(q);
             std::string v;
-            rd_value(t, q, end, v);
+            double num = 0.0;
+            rd_value(t, q, end, v, &num);
             meta_[key] = v;
+            if (t == 6 || t == 12) num_[key] = num;
         }
         for (uint64_t i = 0; i < ntensors; ++i) {
             const std::string name = rd_str(q, end);
@@ -476,6 +484,63 @@ void GgufFile::embed_row(const std::string& name, size_t row, size_t dim, float*
                  "; this reader dequantizes F32/F16/BF16/Q4_0/Q4_1/Q8_0/Q4_K/Q6_K rows "
                  "(convert the model with q4nx-build, or quantize the embedding to a supported type)");
     }
+    const float f = fold(name);
+    if (f != 1.0f)
+        for (size_t i = 0; i < dim; ++i) out[i] *= f;
+}
+
+double GgufFile::kv_float(const std::string& key) const {
+    auto it = num_.find(key);
+    if (it == num_.end()) fail("no float metadata key " + key + " in " + path_);
+    return it->second;
+}
+
+void GgufFile::set_fold(const std::string& tensor, float factor) {
+    int e = 0;
+    if (!(factor > 0.0f) || std::frexp(factor, &e) != 0.5f)
+        fail("a fold of " + std::to_string(factor) + " into " + tensor + " is not a power of two, so it would not be exact");
+    if (factor == 1.0f) folds_.erase(tensor);
+    else folds_[tensor] = factor;
+}
+
+float GgufFile::fold(const std::string& name) const {
+    if (folds_.empty()) return 1.0f;
+    std::string n = gguf_name(name, sandwich_);
+    if (n.rfind("blk.", 0) == 0) {
+        const auto dot = n.find('.', 4);
+        if (dot != std::string::npos) n = n.substr(dot + 1);
+    }
+    auto it = folds_.find(n);
+    return it == folds_.end() ? 1.0f : it->second;
+}
+
+std::map<std::string, float> granite_folds(const GgufFile& g) {
+    const std::string a = g.kv_str("general.architecture");
+    const std::string scale = a + ".attention.scale";
+    if (!g.kv_has(scale))
+        fail("granite: the GGUF does not state the attention multiplier (" + scale + "), and it is not optional");
+    const double hd = g.kv_has(a + ".attention.key_length")
+                          ? static_cast<double>(g.kv_u64(a + ".attention.key_length"))
+                          : static_cast<double>(g.kv_u64(a + ".embedding_length") / g.kv_u64(a + ".attention.head_count"));
+    auto opt = [&](const std::string& k) { return g.kv_has(a + "." + k) ? g.kv_float(a + "." + k) : 1.0; };
+    // attn.h scales by 1/sqrt(hd); the GGUF's multiplier replaces it, so q_proj carries the ratio.
+    const double q = g.kv_float(scale) * std::sqrt(hd), res = opt("residual_scale");
+    const std::map<std::string, double> want = {
+        {"attn_q.weight", q},
+        {"attn_output.weight", res},
+        {"ffn_down.weight", res},
+        {"token_embd.weight", opt("embedding_scale")},
+        {"output.weight", 1.0 / opt("logit_scale")},
+    };
+    std::map<std::string, float> out;
+    for (const auto& [t, f] : want) {
+        int e = 0;
+        if (!(f > 0.0) || std::frexp(f, &e) != 0.5)
+            fail("granite: folding the GGUF's multipliers needs a power-of-two factor, and " + t + " would take " +
+                 std::to_string(f) + "; convert the model with q4nx-build");
+        if (f != 1.0) out[t] = static_cast<float>(f);
+    }
+    return out;
 }
 
 }  // namespace open_qwen36

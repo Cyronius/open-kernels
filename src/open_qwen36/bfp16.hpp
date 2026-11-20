@@ -60,6 +60,28 @@ inline void bfp16_encode_block(const float* x, uint8_t* out) {
     }
 }
 
+/// bfp16_encode_block's inverse: q * 2^(e - 133)
+inline void bfp16_decode_block(const uint8_t* b, float* x) {
+    const int e = static_cast<int>(b[0]) - 6;      // 2^(b0 - 133) as a float's biased exponent
+    if (e >= 1) {
+        const uint32_t sb = static_cast<uint32_t>(e) << 23;
+        float s;
+        std::memcpy(&s, &sb, 4);
+        for (int i = 0; i < 8; i++) x[i] = static_cast<float>(static_cast<int8_t>(b[1 + i])) * s;
+        return;
+    }
+    for (int i = 0; i < 8; i++) x[i] = std::ldexp(static_cast<float>(static_cast<int8_t>(b[1 + i])), static_cast<int>(b[0]) - 133);
+}
+
+/// Eight floats as two blocks, hi and the rest x - hi (OPEN-PREFILL-BFP16-QKV's split terms)
+inline void bfp16_encode_hilo(const float* x, uint8_t* hi, uint8_t* lo) {
+    float d[8];
+    bfp16_encode_block(x, hi);
+    bfp16_decode_block(hi, d);
+    for (int i = 0; i < 8; i++) d[i] = x[i] - d[i];
+    bfp16_encode_block(d, lo);
+}
+
 namespace bfp16_detail {
 /// inside a tile: row pairs (16 rows) by block column, then the pair's 16 rows
 inline size_t in_tile(size_t rr, size_t cb, const Bfp16Tiling& t) {
@@ -88,6 +110,20 @@ inline size_t bfp16_b_offset(size_t r, size_t cb, size_t N, size_t K, const Bfp1
 inline size_t bfp16_b_row_block(size_t row0, size_t cb, const Bfp16Tiling& t) {
     const size_t tkb = t.k / 8;
     return row0 + ((cb / tkb) * t.n * tkb + (cb % tkb) * 16) * BFP16_BLOCK_BYTES;
+}
+
+/// pack.py glu_row's twin (up row f is 8 further): ff chunk kc in n-tile (kc % per_col) * cols + kc / per_col keeps a
+/// column's H slots one run (OPEN-PREFILL-BFP16-FFN)
+inline size_t bfp16_glu_row(size_t f, size_t ff, const Bfp16Tiling& t) {
+    const size_t per_col = 2 * ff / t.n / t.cols, half = t.n / 2, kc = f / half;
+    const size_t ct = (kc % per_col) * t.cols + kc / per_col;
+    return ct * t.n + 16 * ((f % half) / 8) + f % 8;
+}
+
+/// 9 x 911 words: a core tile's 8192 padded so every H slot (kc * rows + row) starts on a whole bfp16 block
+constexpr size_t BFP16_H_SLOT_WORDS = 8199;
+inline size_t bfp16_h_bytes(size_t T, size_t ff, const Bfp16Tiling& t) {
+    return (T / t.m) * (2 * ff / t.n) * BFP16_H_SLOT_WORDS * 4;
 }
 
 /// Float offset of output (row r, column n) in the kernel's c-tiled fp32 C of an M x N product: each array

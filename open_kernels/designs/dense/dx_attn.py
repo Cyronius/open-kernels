@@ -65,9 +65,9 @@ SPEC = current_spec()
 QR = for_spec(SPEC)      # dense, or gemma4 for the layer type its G4_KIND names (as dx.py)
 R = QR.recipe(SPEC)
 L, G = R.layout, R.geo
-from recipes.attnknobs import g5_rb8  # noqa: E402
-if G.RB == 8 and g5_rb8(SPEC):
-    # G5_RB8_MEASURED's 8-row blocks belong to dx.py's KVSLICE decode walk (4 cores a kv head). This broadcast
+
+if G.RB == 8:
+    # G5_RB8_MEASURED's and BLOCK8_MEASURED's 8-row blocks belong to dx.py's decode walk. This broadcast
     # dispatch keeps the 4-row block kernel it was built and gated with (attn_stepb.cc has bodies for 2 and 4).
     from dataclasses import replace
     G = replace(G, RB=4)

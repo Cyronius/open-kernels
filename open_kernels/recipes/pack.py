@@ -180,6 +180,16 @@ def pack_bfp16_gemm(w: np.ndarray, row0: int, n_total: int, dst: np.ndarray) -> 
         out[g % bp.COLS, g // bp.COLS] = bp.pack_b_group(w[gl * n:(gl + 1) * n], bp.TILE_K).reshape(nk, tile)
 
 
+def bfp16_split3(w: np.ndarray) -> np.ndarray:
+    """float32 [rows, K] -> [rows, 3 K] = [w | w | lo], lo = w - its bfp16 value: encoded, the hi | hi | lo weight of
+    OPEN-PREFILL-BFP16-QKV (w, not its value, twice: re-encoding a value with mantissa -128 changes its exponent)."""
+    bp = _gemm_bfp16_pack()
+    rows, k = w.shape
+    w = np.asarray(w, np.float32)
+    hi = bp.decode_blocks(bp.encode_blocks(w.reshape(rows, k // 8, 8))).reshape(rows, k)
+    return np.concatenate([w, w, (w - hi).astype(np.float32)], axis=1)
+
+
 def pack_bfp16_gemm_glu(w: np.ndarray, half: str, n_total: int, dst: np.ndarray) -> None:
     """float32 [ff, K] gate or up rows into their glu_row rows of the gate|up operand in `dst` (OPEN-PREFILL-BFP16-FFN)."""
     bp = _gemm_bfp16_pack()
@@ -745,10 +755,13 @@ def apply_op(op: dict, m, layer: int, dst: np.ndarray) -> None:
         sel = q4_chunks_of(m, name, _raw(m, name), c0, op["nch"])
         if sel.shape[0] != op["nch"]:
             raise ValueError(f"{op['tensor']}: too few chunks, need {c0 + op['nch']}")
-        n_bytes = op["n_total"] * op["in_dim"] // 8 * 9
+        n_bytes = op["n_total"] * op.get("ksplit", 1) * op["in_dim"] // 8 * 9
         if op["dst"] + n_bytes > len(dst):
             raise ValueError(f"{kind} {name}: {n_bytes} B at dst {op['dst']} runs past the {len(dst)} B buffer")
-        if op.get("glu"):
+        if op.get("ksplit", 1) == 3:
+            pack_bfp16_gemm(bfp16_split3(f32_of_q4_1(sel, rows, op["in_dim"])), op.get("row0", 0), op["n_total"],
+                            dst[op["dst"]:op["dst"] + n_bytes])
+        elif op.get("glu"):
             pack_bfp16_gemm_glu(f32_of_q4_1(sel, rows, op["in_dim"]), op["glu"], op["n_total"],
                                 dst[op["dst"]:op["dst"] + n_bytes])
         else:

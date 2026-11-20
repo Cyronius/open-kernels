@@ -62,6 +62,12 @@ PackOp parse_op(const json& j, const std::string& where) {
     p.via = j.value("via", "");
     p.row0 = j.value("row0", 0ull);
     p.n_total = j.value("n_total", 0ull);
+    p.glu = j.value("glu", "");
+    if (!p.glu.empty() && (p.op != "bfp16_gemm" || (p.glu != "gate" && p.glu != "up")))
+        fail(where, p.op + " " + p.tensor + ": glu must be gate or up, on a bfp16_gemm");
+    p.ksplit = j.value("ksplit", 1ull);
+    if (p.ksplit != 1 && (p.op != "bfp16_gemm" || p.ksplit != 3 || !p.glu.empty()))
+        fail(where, p.op + " " + p.tensor + ": ksplit must be 3, on a bfp16_gemm that is not a glu half");
     p.div_running = j.value("div_running", "");
     if (!p.div_running.empty() && (p.op != "put" || p.div_running.find("{j}") == std::string::npos))
         fail(where, p.op + " " + p.tensor + ": div_running names a per-layer {j} tensor, on a put");
@@ -111,9 +117,14 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
             st.split = s.value("split", false);
             st.fmt = s.value("fmt", "");
             st.n_pad = s.value("n_pad", 0ull);
+            st.epi = s.value("epi", "");
+            st.a_from = s.value("a", "");
             if (!st.fmt.empty() && st.fmt != "bfp16") fail(where, "run " + st.kernel + ": fmt '" + st.fmt + "' (bfp16 or nothing)");
             if (st.fmt == "bfp16" && (st.n_pad == 0 || st.split))
                 fail(where, "run " + st.kernel + ": a bfp16 step needs n_pad and cannot be split");
+            if ((!st.epi.empty() && st.epi != "glu") || (!st.a_from.empty() && st.a_from != "h" && st.a_from != "split3") ||
+                ((!st.epi.empty() || !st.a_from.empty()) && st.fmt != "bfp16"))
+                fail(where, "run " + st.kernel + ": epi glu / a h / a split3 are bfp16 step options");
         } else if (st.op == "moeroute2") {
             st.act_off = get<uint64_t>(s, "act_off", where);
         } else {
@@ -158,8 +169,11 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     // a step is split, and an older engine refuses the set by name instead of misreading it.
     // 3 adds the bf16_gemm pack op, which an engine that reads 2 cannot pack.
     // 4 adds the bfp16_gemm pack op and the `bfp16` step format (OPEN-PREFILL-BFP16).
-    if (m.version < 1 || m.version > 4)
-        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 4)");
+    // 5 adds the glu epilogue, steps reading its H operand and the glu pack halves (OPEN-PREFILL-BFP16-FFN).
+    // 6 adds attn_fa's prep stream and the fourth buffer of every attn_fa stream (OPEN-PREFILL-GLUE-PREP).
+    // 7 (bfp16_dit, OPEN-PREFILL-GEMM8) is not implemented here.
+    if (m.version < 1 || m.version > 6)
+        fail(where, "manifest_version " + std::to_string(m.version) + " (this engine reads 1 to 6)");
     m.family = get<std::string>(j, "family", where);
     m.spec_hash = j.value("spec_hash", "");
     m.build_key = j.value("build_key", "");
@@ -224,9 +238,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         d.kvslice = v.value("kvslice", 0ull);
         // attn_stepw.cc takes blocks of 2, 4 or 8 rows (8: attn.h's block kernel at ATTN_RB 8), and the
         // padding is its own (attn_kvslice_rows), not rb's
-        if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4 && d.kvslice != 8) || d.patch != "attnpos" || d.rb != 1))
+        if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4 && d.kvslice != 8) ||
+                          (d.patch != "attnpos" && d.patch != "attnrows") || d.rb != 1))
             fail(where, "kernel " + k + ": kvslice " + std::to_string(d.kvslice) +
-                            " needs 2, 4 or 8 rows, the attnpos patch table and rb 1");
+                            " needs 2, 4 or 8 rows, the attnpos or attnrows patch table and rb 1");
         if (!m.contexts.count(d.context)) fail(where, "kernel " + k + " names unknown context " + d.context);
         if (!d.patch.empty() && d.patch != "moeroute2" && d.patch != "attnpos" && d.patch != "moebatch" &&
             d.patch != "attnrows")
@@ -245,6 +260,11 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         m.rows.head_act_bytes = get<uint64_t>(r, "head_act_bytes", rw);
         m.rows.head_cores = get<uint64_t>(r, "head_cores", rw);
         m.rows.head_out_floats = get<uint64_t>(r, "head_out_floats", rw);
+        m.rows.head_fold = r.value("head_fold", false);
+        m.rows.mode_off = r.value("mode_off", 0ull);
+        m.rows.mode_elem = r.value("mode_elem", 0ull);
+        if (m.rows.mode_elem && (m.rows.mode_elem < 4 || m.rows.mode_off + 3 * m.rows.mode_elem > m.rows.act_bytes))
+            fail(rw, "the three mode elements at " + std::to_string(m.rows.mode_off) + " are not inside act_bytes");
         if (m.rows.l == 0 || m.rows.l % 4) fail(rw, "l " + std::to_string(m.rows.l) + " is not a multiple of 4");
         auto rk = m.kernels.find(m.rows.kernel);
         if (rk == m.kernels.end() || rk->second.patch != "attnrows")
@@ -381,9 +401,56 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                                                           "and the windows of kernels_s");
                 }
             }
+            if (g.kind == "dense" && gj.contains("attn_fa")) {
+                const json& fj = gj["attn_fa"];
+                const std::string fw = gw + ".attn_fa";
+                AttnFa& f = g.attn_fa;
+                f.hd = get<uint64_t>(fj, "hd", fw);
+                f.l_max = get<uint64_t>(fj, "l_max", fw);
+                f.q_head = get<uint64_t>(fj, "q_head", fw);
+                f.qsplit = fj.value("qsplit", true);
+                // the design: 64-dim heads, a 256-token block on 32 cores, 64-key chunks
+                if (f.hd != 64 || g.t != 256 || f.l_max == 0 || f.l_max % 256)
+                    fail(fw, "wants hd 64, t 256 and l_max a positive multiple of 256");
+                if (f.q_head != 4096 * (f.qsplit ? 9u : 5u))
+                    fail(fw, "q_head " + std::to_string(f.q_head) + " is not the record plus Q hi" +
+                                 (f.qsplit ? " and lo" : "") + " for 256 tokens of head dim 64");
+                // tiers may be sparse: a block takes the narrowest one that covers its window, the rest masked
+                for (const auto& [rows_s, kname] : need(fj, "kernels", fw).items()) {
+                    const size_t rows = static_cast<size_t>(std::stoull(rows_s));
+                    if (rows == 0 || rows % 256 || rows > f.l_max)
+                        fail(fw, "kernels: window " + rows_s + " is not a positive multiple of 256 within l_max");
+                    auto it = m.kernels.find(kname.get<std::string>());
+                    if (it == m.kernels.end()) fail(fw, "kernels names unknown kernel " + kname.get<std::string>());
+                    f.kernels[rows] = it->first;
+                }
+                if (!f.kernels.count(f.l_max)) fail(fw, "kernels has no stream for l_max " + std::to_string(f.l_max));
+                if (fj.contains("prep")) {
+                    const json& pj = fj["prep"];
+                    f.prep_kernel = get<std::string>(pj, "kernel", fw + ".prep");
+                    f.prep_npad = get<uint64_t>(pj, "n_pad", fw + ".prep");
+                    if (m.version < 6) fail(fw, "prep needs manifest_version 6; an engine that reads 5 would pass the streams three buffers");
+                    if (!f.qsplit || f.prep_npad == 0 || f.prep_npad % 1024)
+                        fail(fw, "prep needs Q hi / lo and an n_pad that is a whole number of 1024 columns");
+                    if (!m.kernels.count(f.prep_kernel)) fail(fw, "prep names unknown kernel " + f.prep_kernel);
+                }
+            }
             if (g.kind == "dense") {
-                if (g.program.size() != 5)
-                    fail(gw, "a dense route has exactly 5 steps (qkv3, o, gate, up, down), has " + std::to_string(g.program.size()));
+                // 4 steps: gate|up through the glu epilogue, down reading its H operand (OPEN-PREFILL-BFP16-FFN)
+                const bool glu = g.program.size() == 4 && g.program[2].epi == "glu" && g.program[3].a_from == "h" &&
+                                 g.program[3].args[1] == g.program[2].args[2];
+                if (g.program.size() != 5 && !glu)
+                    fail(gw, "a dense route has 5 steps (qkv3, o, gate, up, down), or 4 with gate|up's glu H as down's x; has " +
+                                 std::to_string(g.program.size()));
+                for (size_t i = 0; i < g.program.size(); ++i) {
+                    const bool split3 = g.program[i].a_from == "split3";
+                    if ((!g.program[i].epi.empty() && !(glu && i == 2)) ||
+                        (!g.program[i].a_from.empty() && !(glu && i == 3) && !(split3 && i == 0)))
+                        fail(gw, "step " + g.program[i].kernel + ": epi / a h only on a 4-step route's gate|up and down, "
+                                 "a split3 only on qkv");
+                }
+                if (g.program.size() == 4 && m.version < 5)
+                    fail(gw, "a glu route needs manifest_version 5; an engine that reads 4 would run it as five steps");
                 g.qw = get<uint64_t>(gj, "qw", gw);
                 g.kvw = get<uint64_t>(gj, "kvw", gw);
                 g.ff = get<uint64_t>(gj, "ff", gw);
@@ -596,10 +663,14 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                     if (s.fmt == "bfp16" && g.kind != "dense")
                         fail(gw, std::string(what) + " step " + s.kernel + ": only the dense route runs bfp16 steps");
                     if (packed)
-                        for (const auto& o : w.pack)
+                        for (const auto& o : w.pack) {
                             if (o.n_total != s.n_pad)
                                 fail(gw, std::string(what) + " step " + s.kernel + ": n_pad " + std::to_string(s.n_pad) +
                                              ", but " + o.tensor + " packs into a " + std::to_string(o.n_total) + "-row weight");
+                            if ((o.ksplit == 3) != (s.a_from == "split3"))
+                                fail(gw, std::string(what) + " step " + s.kernel + ": a split3 step reads a ksplit 3 weight, "
+                                             "and only it; " + o.tensor + " has ksplit " + std::to_string(o.ksplit));
+                        }
                 }
             };
             check_bfp16(g.program, g.weights, "program");
@@ -629,7 +700,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
             for (const auto& [name, w] : *ws) {
                 if (w.from == "pack") {
                     for (const auto& o : w.pack)
-                        if (o.op == "bfp16_gemm" && m.version < 4)
+                        if (!o.glu.empty() && m.version < 5)
+                            fail(tw, "gemm_block weight " + name + " packs a glu half in a manifest_version " +
+                                         std::to_string(m.version) + " manifest; it needs version 5");
+                        else if (o.op == "bfp16_gemm" && m.version < 4)
                             fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
                                          std::to_string(m.version) + " manifest; an engine that reads 3 cannot pack it, so it needs version 4");
                         else if (o.op == "bf16_gemm" && m.version < 3)
@@ -780,9 +854,11 @@ std::vector<std::string> Manifest::files() const {
 }
 
 std::string Manifest::host_attention_refusal() const {
-    if (family != "k2")
+    // Granite joins because recipes/spec.py requires its attention_multiplier to equal head_dim**-0.5, the host's scale
+    if (family != "k2" && family != "granite")
         return "host attention implements K2's attention (no q/k norm, no bias, no gate, no window, "
-               "full rotation) and nothing else; this kernel set is family '" + family + "'";
+               "full rotation; Granite with attention_multiplier == head_dim**-0.5) and nothing else; this kernel set "
+               "is family '" + family + "'";
     auto num = [&](const char* key) -> size_t {
         return hf_config_check.contains(key) ? hf_config_check[key].get<size_t>() : 0;
     };
