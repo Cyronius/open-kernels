@@ -4262,11 +4262,11 @@ Plan and handoff: `.plans/minicpm5-2b.md`.
 | unit | PASS |
 | pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
 | tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
-| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | NOT RUN: only the fp32 forward has been compared |
-| NPU vs independent forward, whole model and long context | measured (tables above) |
-| greedy vs llama.cpp | PASS (2026-11-11 set; later sets are token-identical to it) |
+| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | FAIL (measured, installed o7d6, b11393): on 508 tokens Vulkan agreed with CPU at 498/508 (median top-20 partial KL 0.000328), NPU fast at 495/508 (0.001424), and accurate at 494/508 (0.000873). All three agreed at 18/18 on the short prompt. |
+| NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Long-context results above. |
+| greedy vs llama.cpp | Earlier prompts passed on the 2026-11-11 set. Installed set, measured matching prefixes out of 48: short fast/accurate 48/37, long 13/13. First-divergence margins pending. |
 | `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
-| `phlegm serve` | NOT RUN |
+| `phlegm serve` | NOT RUN: stopped at the teacher-forced failure |
 | decode-attention changes gated | PASS (`decgate.py` on each non-identical step) |
 
 The attention tuple `(128, 16, 2, 128, False, False, False)` entered the catalogue on the two-request llama.cpp match and the unit
