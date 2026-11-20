@@ -99,7 +99,7 @@ def test_the_mx4_nibble_decodes_by_the_kernels_straight_lines():
     assert sorted(set(P.MX4_CODE.tolist())) == sorted(set(P.KVALUES.tolist()))
 
 
-def test_mx4_half_tiles_hold_exactly_what_the_q8_tiles_hold_in_less_than_half_the_bytes():
+def test_mx4_half_tiles_hold_exactly_what_the_q8_tiles_hold_in_half_the_bytes():
     rng = np.random.default_rng(3)
     rows, cols = 100, 2880                    # GPT-OSS's expert width: neither whole bands nor k-tiles
     raw = _mxfp4(rows, cols, rng)
@@ -109,7 +109,8 @@ def test_mx4_half_tiles_hold_exactly_what_the_q8_tiles_hold_in_less_than_half_th
     wm, bm = P.dequant_mx4_tiles(t, 128, 3072)
     assert np.array_equal(wm, wq) and np.array_equal(bm, bq)
     assert np.array_equal(wm[:rows, :cols], _decode_mxfp4(raw, rows, cols))
-    assert t.shape == (2, 48, P.MX_CH) and P.MX_CH / P.CH < 0.5
+    assert t.shape == (2, 48, P.MX_CH) and P.MX_CH / P.CH == 0.5     # 2368 B of tile padded to 2560: 4 make a 10240 B w element
+    assert not t[..., P.MX_PAD_BIAS + 64:].any()                     # the pad is zero
 
 
 def test_the_mx4_byte_law_is_the_one_gemv_mx4_h_documents():

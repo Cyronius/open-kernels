@@ -366,6 +366,13 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             for (const GptossGemm* g : {&w_->gptoss.qkv, &w_->gptoss.o, &w_->gptoss.glu, &w_->gptoss.down,
                                         &w_->gptoss.glu_small, &w_->gptoss.down_small})
                 if (!g->kernel.empty()) wanted[g->kernel] = true;
+        if (gp_on_ && w_->gptoss.fa.present()) {
+            const char* fe = std::getenv("OFLM_OPEN_GPTOSS_ATTN");
+            gp_fa_on_ = !(fe && std::string(fe) == "host");
+            gp_fa_mode_ = fe && std::string(fe) == "full" ? 1 : fe && std::string(fe) == "window" ? 2 : 0;
+            if (gp_fa_on_)
+                for (const auto& [rows, k] : w_->gptoss.fa.kernels) wanted[k] = true;
+        }
     }
     if (rows_l()) {
         wanted[man_.rows.kernel] = true;
@@ -399,7 +406,8 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
         if (const char* env = std::getenv("OFLM_OPEN_GPTOSS_HILO_EXPERTS")) gp_hilo_x_ = std::string(env) != "0";
         log(std::string("gpt-oss block prefill: ") +
             (gp_on_ ? std::string(gp_hilo_ ? "attention hi + lo, " : "") + (gp_hilo_x_ ? "experts hi + lo, " : "") : "") +
-            (gp_on_ ? "T = " + std::to_string(w_->gptoss.t) + " (q|k|v, o on gemm_bfp16; experts on their MXFP4 GEMM)"
+            (gp_on_ ? "T = " + std::to_string(w_->gptoss.t) + " (q|k|v, o on gemm_bfp16; experts on their MXFP4 GEMM; attention on " +
+                          (gp_fa_on_ ? "the NPU, windows to " + std::to_string(w_->gptoss.fa.l_max) + " rows" : "the host") + ")"
                     : "off (OFLM_OPEN_GPTOSS_PREFILL=0)"));
     }
     // the token-batched expert kernel: every stream's slot count must be what the manifest says
@@ -836,6 +844,11 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
         // a per-core window is padded to whole elements, up to kvslice - 1 rows past the last cached one
         for (const auto& [kn, kd] : w_->kernels)
             if (kd.kvslice > 1) kv_slack = std::max<uint64_t>(kv_slack, kd.kvslice - 1);
+        // gpt-oss NPU prefill attention reads a whole compiled window, so the cache must hold the smallest one past the capacity
+        if (gp_on_ && gp_fa_on_ && w_->gptoss.fa.present()) {
+            const auto it = w_->gptoss.fa.kernels.lower_bound((cfg_.max_ctx + 255 + 255) / 256 * 256);
+            if (it != w_->gptoss.fa.kernels.end()) kv_slack = std::max<uint64_t>(kv_slack, it->first - cfg_.max_ctx);
+        }
         state_.push_back(alloc(lt.state_kind == "kv" ? (cfg_.max_ctx + kv_slack) * lt.state_row : lt.state_bytes));
         if (gp_on_) gp_load_layer(l);
         if (progress) progress(l + 1, nl_ + 1);
@@ -5253,15 +5266,38 @@ void Core::gp_layer(int l, std::vector<float>& x, size_t N, size_t pos0) {
     const size_t row_bytes = types_[l]->state_row, re = row_bytes / 2;
     if (row_bytes < 4 * KVW) throw std::runtime_error("open_qwen36: gpt-oss prefill: the KV row is narrower than [K | V]");
     const size_t first = window && pos0 + 1 > window ? pos0 + 1 - window : 0;   // the first row any query reads
+    // NPU attention (attn_fa_gx): a 256-token block a dispatch, K and V read in place from the layer's cache. A sliding
+    // layer's window starts at the 64-row boundary at or below its first query's first row, and the record's p0 is
+    // relative to it; every window is one of the compiled streams, else this layer attends on the host.
+    const GptossAttnFa& fa = G.fa;
+    constexpr size_t FT = 256;
+    const size_t BF = (N + FT - 1) / FT, cache_rows = st.size() / row_bytes;
+    struct FaPlan { size_t w0 = 0, p0 = 0, L = 0; const std::string* kernel = nullptr; };
+    auto fa_plan = [&](size_t fb) {
+        FaPlan p;
+        const size_t pb = pos0 + fb * FT;
+        if (window) p.w0 = (pb + 1 > window ? pb + 1 - window : 0) / 64 * 64;
+        p.p0 = pb - p.w0;
+        p.L = (p.p0 + FT + 255) / 256 * 256;
+        auto it = fa.kernels.lower_bound(p.L);                // the smallest stream that holds the window
+        if (it != fa.kernels.end() && p.w0 + it->first <= cache_rows) {
+            p.L = it->first;
+            p.kernel = &it->second;
+        }
+        return p;
+    };
+    bool npu = gp_fa_on_ && fa.present() && hd == fa.hd && nh * fa.q_head * 2 <= buffer("af_q0", 0).size() &&
+               (gp_fa_mode_ == 0 || (gp_fa_mode_ == 1) == (window == 0));
+    for (size_t fb = 0; npu && fb < BF; ++fb) npu = fa_plan(fb).kernel != nullptr;
     {
         const auto ts = now();
-        if (pos0 > first) read_back(st, (pos0 - first) * row_bytes, first * row_bytes);
+        if (!npu && pos0 > first) read_back(st, (pos0 - first) * row_bytes, first * row_bytes);
         timing_.state_ms += ms_since(ts);
     }
     uint16_t* kvc = st.map<uint16_t*>();
     const size_t L = pos0 + N - first;
     std::vector<float> xn(N * H), q(N * QW), k(N * KVW), v(N * KVW), og(N * QW), res(N * H), xm(N * H);
-    std::vector<float> KT(kvh * hd * L), Vf(L * KVW);      // the cache rows as f32, K transposed per kv head: [g][d][row]
+    std::vector<float> KT(npu ? 0 : kvh * hd * L), Vf(npu ? 0 : L * KVW);   // the cache rows as f32, K transposed per kv head: [g][d][row]
     auto rows_to_f32 = [&](size_t j0, size_t j1) {
 #pragma omp parallel for
         for (long long jj = static_cast<long long>(j0); jj < static_cast<long long>(j1); ++jj) {
@@ -5275,7 +5311,7 @@ void Core::gp_layer(int l, std::vector<float>& x, size_t N, size_t pos0) {
     {
         const auto ts = now();
         gp_rms(x.data(), N, H, hw.ln.data(), G.eps, xn.data());
-        rows_to_f32(0, pos0 - first);
+        if (!npu) rows_to_f32(0, pos0 - first);
         timing_.prenorm_ms += ms_since(ts);
     }
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
@@ -5309,8 +5345,9 @@ void Core::gp_layer(int l, std::vector<float>& x, size_t N, size_t pos0) {
                 row[KVW + j] = f32_to_bf16(v[t * KVW + j]);
             }
         }
-        rows_to_f32(pos0 + r0 - first, pos0 + r0 + nb - first);
+        if (!npu) rows_to_f32(pos0 + r0 - first, pos0 + r0 + nb - first);
         timing_.mid_ms += ms_since(ts);
+        if (npu) return;                                   // the NPU attends after every block's rows are in the cache
         const auto ta = now();
         // one task per (kv head, query): its group's grp query heads together, so each K / V row is read once for all
 #pragma omp parallel
@@ -5349,18 +5386,17 @@ void Core::gp_layer(int l, std::vector<float>& x, size_t N, size_t pos0) {
             qkv_at[blk] = static_cast<long>(jobs.size());
             jobs.push_back(job(G.qkv, blk, -1, "qkv"));
             aj.push_back({blk, true});
-            if (blk > 0) o_job(blk - 1);
+            if (!npu && blk > 0) o_job(blk - 1);
         }
-        o_job(B - 1);
-        pipeline(l, jobs,
-                 [&](size_t j) {
+        if (!npu) o_job(B - 1);
+        auto stage_fn = [&](size_t j) {
                      const size_t blk = aj[j].b;
                      if (aj[j].qkv)
                          stage_a(jobs[j].args[1], rows_of(blk), H, [&](size_t r) { return xn.data() + (blk * Tt + r) * H; });
                      else
                          stage_a(jobs[j].args[1], rows_of(blk), QW, [&](size_t r) { return og.data() + (blk * Tt + r) * QW; });
-                 },
-                 [&](size_t j) {
+                 };
+        auto post_fn = [&](size_t j) {
                      const size_t blk = aj[j].b, r0 = blk * Tt, n = rows_of(blk);
                      const float* y = buffer(jobs[j].out, 0).map<const float*>();
                      const auto tp = now();
@@ -5397,13 +5433,69 @@ void Core::gp_layer(int l, std::vector<float>& x, size_t N, size_t pos0) {
                      }
                      gp_rms(res.data() + r0 * H, n, H, hw.post.data(), G.eps, xm.data() + r0 * H);
                      timing_.tail_ms += ms_since(tt);
-                 },
-                 wait_ms);
-        const auto ts = now();
-        st.sync(XCL_BO_SYNC_BO_TO_DEVICE, N * row_bytes, pos0 * row_bytes);
-        timing_.state_ms += ms_since(ts);
+                 };
+        pipeline(l, jobs, stage_fn, post_fn, wait_ms);
+        {
+            const auto ts = now();
+            st.sync(XCL_BO_SYNC_BO_TO_DEVICE, N * row_bytes, pos0 * row_bytes);
+            timing_.state_ms += ms_since(ts);
+        }
+        if (npu) {
+            // every block's K / V rows are in the cache: one visit to the attention context, a 256-token block a dispatch
+            const auto tb = now();
+            const float qs = scale * 1.4426950408889634f;            // log2(e) / sqrt(hd): the scores come out in log2 units
+            constexpr size_t QE = 4096;                              // bf16 in a Q element (a head's record is one)
+            for (size_t fb = 0; fb < BF; ++fb) {
+                const FaPlan pl = fa_plan(fb);
+                const std::string qn = "af_q" + std::to_string(fb & 1), on = "af_o" + std::to_string(fb & 1);
+                xrt::bo& qb = buffer(qn, 0);
+                uint16_t* qa = qb.map<uint16_t*>();
+                const size_t t0r = fb * FT, nbk = std::min(FT, N - t0r), hq = fa.q_head;
+                const int32_t p0 = static_cast<int32_t>(pl.p0), wn = static_cast<int32_t>(window);
+#pragma omp parallel for
+                for (long long hh = 0; hh < static_cast<long long>(nh); ++hh) {
+                    uint16_t* ph = qa + static_cast<size_t>(hh) * hq;
+                    std::memset(ph, 0, hq * 2);
+                    const float sk = hw.sinks[static_cast<size_t>(hh)];
+                    std::memcpy(ph, &p0, 4);                         // record word 0: the block's first position
+                    std::memcpy(ph + 2, &sk, 4);                     // word 1: the head's sink logit
+                    std::memcpy(ph + 4, &wn, 4);                     // word 2: the sliding window (0 = none)
+                    for (size_t c = 0; c < FT / 32; ++c)             // core c: tokens 32c .. 32c + 31, Q^T [dim][token]
+                        for (size_t t = 0; t < 32 && c * 32 + t < nbk; ++t) {
+                            const float* qrow = q.data() + (t0r + c * 32 + t) * QW + static_cast<size_t>(hh) * hd;
+                            for (size_t d = 0; d < hd; ++d) {
+                                const float xq = qrow[d] * qs;
+                                const uint16_t hi = f32_to_bf16(xq);
+                                const uint16_t lo = f32_to_bf16(xq - bf16_to_f32(hi));
+                                ph[QE + c * 2048 + d * 32 + t] = hi;
+                                ph[QE * 5 + c * 2048 + d * 32 + t] = lo;
+                            }
+                        }
+                }
+                qb.sync(XCL_BO_SYNC_BO_TO_DEVICE, nh * hq * 2, 0);
+                globals_.erase("af_kv");
+                globals_.emplace("af_kv", xrt::bo(st, pl.L * row_bytes, pl.w0 * row_bytes));
+                run(kerns_.at(*pl.kernel), {qn, "af_kv", on}, l);
+                xrt::bo& ob = buffer(on, 0);
+                read_back(ob, FT * QW * 4, 0);
+                std::memcpy(og.data() + t0r * QW, ob.map<const float*>(), nbk * QW * 4);
+            }
+            timing_.attn_ms += ms_since(tb);
+            jobs.clear();
+            aj.clear();
+            qkv_at.assign(B, -1);
+            for (size_t blk = 0; blk < B; ++blk) o_job(blk);
+            pipeline(l, jobs, stage_fn, post_fn, wait_ms);
+        }
     }
 
+    if (const char* dp = std::getenv("GX_DUMP_OG")) {            // bring-up: the attention output of every layer
+        const std::string fn = std::string(dp) + "_L" + std::to_string(l) + ".bin";
+        if (FILE* f = std::fopen(fn.c_str(), "wb")) {
+            std::fwrite(og.data(), 4, N * QW, f);
+            std::fclose(f);
+        }
+    }
     // ---- 5. the router over every token: the top-k of W xm + b (the lower expert on a tie), softmax over them
     std::vector<int32_t> idx(N * TK);
     std::vector<float> wt(N * TK);

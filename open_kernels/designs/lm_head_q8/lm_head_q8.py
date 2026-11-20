@@ -48,6 +48,8 @@ K = int(os.environ.get("LMHEAD_K", 2048))      # the hidden width; 2048 for the 
 PER_BAND = ROW_SPLIT * (K // 256)              # chunks per band: K/256 k-tiles x 4 row quarters (32 at K=2048)
 BAND_BYTES = PER_BAND * TILE_BYTES             # 278528 at K = 2048
 
+RW = int(os.environ.get("LMHEAD_ROWS", 1))    # token rows a dispatch takes (1 | 2; gptoss/gx_rows.h's shared tile)
+assert RW in (1, 2)
 N = int(os.environ.get("LMHEAD_N", 248320))
 N_CORES = int(os.environ.get("LMHEAD_CORES", 8))
 PER_CALL = 2            # 2 x 8704 = 17408 B per element, x2 buffered -> 34 KB of L1
@@ -61,7 +63,7 @@ assert WRING <= 24, "lm_head_q8: a memtile ring deeper than 24 does not fit one 
 
 def _core_bytes(per_call: int) -> int:
     """A core's L1: the 4 KB stack, two weight elements, the activation table, the whole x, two results."""
-    return 0x1000 + 2 * per_call * TILE_BYTES + (2 * K + K // 4) + 2 * K + 2 * BAND_ROWS * 4
+    return 0x1000 + 2 * per_call * TILE_BYTES + (2 * RW * K + K // 4) + 2 * K + 2 * RW * BAND_ROWS * 4
 
 
 # One chunk per element where two do not fit beside a wide x (Nanbeige4.3, K = 7168: 70 400 B at two,
@@ -97,17 +99,20 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
 
     elem_ty = np.ndarray[(call_bytes,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(K,), np.dtype[bfloat16]]
-    tab_ty = np.ndarray[(2 * K + K // 4,), np.dtype[np.uint8]]      # gemv_q4_tab_bytes(2048)
+    tab_ty = np.ndarray[(2 * K + K // 4 if RW == 1 else 4 * K + K // 4,), np.dtype[np.uint8]]   # table, 2 tokens
     acc_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
     w_ty = np.ndarray[(bands * BAND_BYTES,), np.dtype[np.uint8]]
-    y_ty = np.ndarray[(n,), np.dtype[np.float32]]
+    y_ty = np.ndarray[(RW * n,), np.dtype[np.float32]]
+    xs_ty = np.ndarray[(RW * K,), np.dtype[bfloat16]]
 
+    kflags = ([f"-DLMHEAD_PER_CALL={per_call}", f"-DLMHEAD_K={K}"] + EXTRA_FLAGS
+              + ([f"-DLMHEAD_ROWS={RW}"] if RW > 1 else []))
     kernel = ExternalFunction(
-        KERNEL_SYM,
+        KERNEL_SYM if RW == 1 else KERNEL_SYM + "2",
         source_file=str(HERE / "lm_head_q8.cc"),
-        arg_types=[elem_ty, tab_ty, acc_ty, np.int32],
+        arg_types=[elem_ty, tab_ty, acc_ty, np.int32] if RW == 1 else [elem_ty, tab_ty, acc_ty, acc_ty, np.int32],
         include_dirs=_include_dirs(),
-        compile_flags=[f"-DLMHEAD_PER_CALL={per_call}", f"-DLMHEAD_K={K}"] + EXTRA_FLAGS,
+        compile_flags=kflags,
     )
     # the prep TU is generated on demand (gemv_q4.ensure_prep_entry rewrites it only when the
     # text differs, so the K values already checked in stay byte-identical)
@@ -115,8 +120,10 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
     _spec = importlib.util.spec_from_file_location("_gemv_q4_gen", GEMV / "gemv_q4.py")
     _gemv = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_gemv)
-    prep = ExternalFunction(f"gemv_q4_prep_k{K}", source_file=str(_gemv.ensure_prep_entry(K)),
-                            arg_types=[x_ty, tab_ty], include_dirs=_include_dirs())
+    prep = (ExternalFunction(f"gemv_q4_prep_k{K}", source_file=str(_gemv.ensure_prep_entry(K)),
+                             arg_types=[x_ty, tab_ty], include_dirs=_include_dirs()) if RW == 1 else
+            ExternalFunction("lm_head_prep2", source_file=str(HERE / "lm_head_prep2.cc"),
+                             arg_types=[x_ty, tab_ty, np.int32], include_dirs=_include_dirs(), compile_flags=kflags))
 
     of_w = [ObjectFifo(elem_ty, name=f"w{c}", depth=2) for c in range(n_cores)]
     w_src = of_w
@@ -140,7 +147,19 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
                     win.release(1)
                 yout.release(1)
             xin.release(1)
-        return core_body
+        def core_body2(win, xin, yout, tab, fprep, fn):
+            for t in range(2):
+                xe = xin.acquire(1)
+                fprep(xe, tab, t)                # token t's block-quantised x into the 2-token table
+                xin.release(1)
+            for _ in range_(nb):
+                ye = yout.acquire(2)
+                for g in range_(n_groups):
+                    we = win.acquire(1)
+                    fn(we, tab, ye[0], ye[1], g)
+                    win.release(1)
+                yout.release(2)
+        return core_body if RW == 1 else core_body2
 
     workers = [
         Worker(make_body(counts[c]),
@@ -157,8 +176,10 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
         nb = counts[c]
         w_taps.append(TensorAccessPattern((1, bands * BAND_BYTES), off * BAND_BYTES,
                                           [1, 1, 1, nb * BAND_BYTES], [0, 0, 0, 1]))
-        y_taps.append(TensorAccessPattern((1, n), off * BAND_ROWS,
-                                          [1, 1, 1, nb * BAND_ROWS], [0, 0, 0, 1]))
+        y_taps.append(TensorAccessPattern((1, n), off * BAND_ROWS, [1, 1, 1, nb * BAND_ROWS], [0, 0, 0, 1])
+                      if RW == 1 else
+                      TensorAccessPattern((1, RW * n), off * BAND_ROWS, [1, nb, RW, BAND_ROWS],
+                                          [0, BAND_ROWS, n, 1]))
         off += nb
 
     def sequence(a_w, a_x, c_y, w_prods, x_prod, y_conss):
@@ -169,7 +190,7 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
             y_conss[c].drain(c_y, tap=y_taps[c], wait=True, group=tg)
         tg.finish()
 
-    rt = Runtime(sequence, [w_ty, x_ty, y_ty,
+    rt = Runtime(sequence, [w_ty, x_ty if RW == 1 else xs_ty, y_ty,
                             ([f.prod(tile=Tile(c, 0)) for c, f in enumerate(w_src)] if WRING else
                              [f.prod() for f in of_w]), of_x.prod(), [f.cons() for f in of_y]])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
@@ -177,7 +198,8 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
 
 DESIGN = lm_head_q8
 _src = (b"".join((HERE / f).read_bytes() for f in ("lm_head_q8.h", "lm_head_q8.cc"))
-        + (GEMV / "gemv_tab.h").read_bytes() + f"K={K}".encode())
+        + (GEMV / "gemv_tab.h").read_bytes() + f"K={K}".encode()
+        + ((HERE.parent / "gptoss" / "gx_rows.h").read_bytes() + f"rows{RW}".encode() if RW > 1 else b""))
 SPECIALIZE = {"n": N, "n_cores": N_CORES, "per_call": PER_CALL,
               "srchash": int(hashlib.sha1(_src + str(SCALES_F32).encode()
                                           + (f"wring{WRING}".encode() if WRING else b"")).hexdigest()[:8], 16)}

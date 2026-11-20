@@ -10,7 +10,7 @@
 // scale 2^(e-128) is the same exact bf16. Only the bytes change: 2368 a half-tile instead of
 // 5120, the codes as the GGUF's own nibbles, decoded on the core.
 //
-//   half-tile, 2368 B: four 64-K groups g of 576 B, then the bias
+//   half-tile, 2560 B (2368 B used): four 64-K groups g of 576 B, then the bias
 //     [576 g       : +64 )  bf16 scale[kb' * 16 + r]  for blocks 2g + kb' (kb' = 0, 1), rows r = 0..15
 //     [576 g + 64  : +256)  block 2g's nibbles: four 8-K octets of 64 B
 //     [576 g + 320 : +256)  block 2g + 1's
@@ -37,7 +37,7 @@ static constexpr unsigned kMx4KBlocks = 8;
 static constexpr unsigned kMx4KInBlock = 32;
 static constexpr unsigned kMx4TileK = 256;
 static constexpr unsigned kMx4GroupBytes = 576;      // 64 B of scales + two blocks of 256 B of nibbles
-static constexpr unsigned kMx4TileBytes = 2368;
+static constexpr unsigned kMx4TileBytes = 2560;     // 2368 of data and bias, 192 B of zero: 4 tiles = a 10240 B w element, gx_att's
 static constexpr unsigned kMx4PadBias = 2304;
 static constexpr unsigned kMx4RowSplit = 4;
 

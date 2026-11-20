@@ -279,6 +279,15 @@ struct GptossGemm {
     /// all, and the host sums column c with column c + n / 2 -- Q8_0's codes to ~2^-16 instead of bfp16's 2^-8
     bool split = false;
 };
+/// GPT-OSS's prefill attention on the NPU (open_kernels/designs/attn_fa_gx, OPEN-PREFILL-ATTN-FA-GPTOSS): one
+/// 256-token block of one layer a dispatch, against a window of cached rows; one instruction stream per 256 rows
+/// of window up to l_max, all on one context. The window of a sliding layer rides the record (a word), so every
+/// layer type uses the same streams.
+struct GptossAttnFa {
+    uint64_t hd = 0, l_max = 0, q_head = 0;              ///< head dim, widest window, bf16 per head in the Q buffer
+    std::map<uint64_t, std::string> kernels;             ///< window rows -> instruction stream, args (q, kv, o)
+    bool present() const { return !kernels.empty(); }
+};
 struct GptossPrefill {
     uint64_t t = 0;                                       ///< tokens a dispatch takes (its M); 0 = no route
     uint64_t min_prompt = 0;                              ///< the shortest prompt the route beats one token a step on
@@ -295,6 +304,7 @@ struct GptossPrefill {
     double eps = 1e-5, rope_scale = 1.0;                  ///< RMSNorm eps; YaRN's attention factor on cos / sin
     double alpha = 1.702, limit = 7.0;                    ///< the clamped SwiGLU's
     std::vector<double> inv_freq;                         ///< per rotary pair (YaRN's, both layer types)
+    GptossAttnFa fa;                                      ///< the NPU attention, when the set carries it
     bool present() const { return t != 0; }
 };
 

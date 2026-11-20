@@ -49,15 +49,18 @@ from .spec import DENSE, DENSE_LOCAL, ModelSpec
 CH = 5120                 # a q8 half-tile: 16 rows x 256 K (gemv_q8.h)
 PAD_BIAS = 4352           # f32[16] bias in a k-tile-0 half-tile's pad (GEMV_Q8_PAD_BIAS)
 PER_CALL = 2              # half-tiles per w element
-MX_CH = 2368              # an mx4 half-tile: the same 16 rows x 256 K at MXFP4 (gemv_mx4.h)
-MX_PER_CALL = 4           # mx4 half-tiles per gx_moe w element (9472 B)
+MX_CH = 2560              # an mx4 half-tile: the same 16 rows x 256 K at MXFP4 (gemv_mx4.h), 2368 B and 192 B of pad
+MX_PER_CALL = 4           # mx4 half-tiles per gx_moe w element (10240 B: the size of gx_att's, so one image serves both)
 N_CORES = 8
 TOPK_MAX = 8
 LM_TILE = 9216            # lm_head_q8.h's f32-scale chunk: 32 rows x 256 K
 LM_BAND_ROWS = 128
 LM_CORES = 8
-ATTN_CORES = 4            # attnknobs.attn_cores(64): the largest divisor of 64 heads <= 6
+ATTN_CORES = 16           # 4 query heads a core, two cores a kv head; gx.py joins the og drains in memory tiles
 STACK = 0x1800
+AF_LMAX = int(os.environ.get("AF_LMAX", "131072"))   # the widest window the NPU attention takes; longer prompts attend on the host
+ATTN_RB = int(os.environ.get("GX_RB", "8"))   # decode attention rows a block: 8 is 14% faster a step at 131071 rows than 4, as accurate
+ROWS = int(os.environ.get("GX_ROWS", "1"))   # rows-pass probe: the experts' half runs this many token rows (1 or 2)
 
 
 def padded(w: int) -> int:
@@ -93,7 +96,7 @@ class Geometry:
     XN_ELEMS: int; XM_ELEMS: int; OG_ELEMS: int; H_ELEMS: int
     TAB_BYTES: int; MS_U: int; MS_G: int; MS_FLOATS: int
     EPS: float; WINDOW: int; TOPK: int; EXPERTS: int
-    ACORES: int; NHL: int; VEXP: int; MLS: int; RB: int
+    ACORES: int; NHL: int; VEXP: int; MLS: int; RB: int; KVSLICE: int
     PTAB_ELEMS: int; PTAB_CS_ELEM: int
 
 
@@ -163,11 +166,9 @@ def geometry(spec: ModelSpec) -> Geometry:
         XN_ELEMS=roundup(hid * 2, ELEM) // ELEM, XM_ELEMS=roundup(hid * 2 + 4 * TOPK_MAX, ELEM) // ELEM,
         OG_ELEMS=roundup(qw * 2, ELEM) // ELEM, H_ELEMS=roundup(ff * 4, ELEM) // ELEM,
         TAB_BYTES=tab_bytes(max(hid, qw, ff)), MS_U=0, MS_G=BAND_ROWS, MS_FLOATS=2 * BAND_ROWS,
-        EPS=spec.norm_eps, WINDOW=spec.sliding_window, TOPK=spec.experts_per_tok, EXPERTS=spec.num_experts,
-        # RB 4: Peano 2026-10 (llvm-aie in target/npu-dev/env) hits an UNREACHABLE in RegBankSelect
-        # compiling attn_row_impl at head dim 64 with 16 heads a core under ATTN_VEXP and RB 1; the
-        # blocked walk compiles, and is the faster one besides (granite runs it).
-        ACORES=acores, NHL=nhl, VEXP=1, MLS=roundup(nhl, 32), RB=4,
+        EPS=spec.norm_eps, WINDOW=spec.sliding_window, TOPK=int(os.environ.get("GX_TOPK", spec.experts_per_tok)), EXPERTS=spec.num_experts,
+        # blocked walk (RB > 1): Peano 2026-10 crashed on attn_row_impl at RB 1 with 16 heads a core under ATTN_VEXP
+        ACORES=acores, NHL=nhl, VEXP=1, MLS=roundup(nhl, 32), RB=ATTN_RB, KVSLICE=ATTN_RB if acores > 1 else 0,
         PTAB_ELEMS=ptab_row // e_a, PTAB_CS_ELEM=512 // e_a,
     )
 
@@ -183,9 +184,11 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
     cd_bytes = roundup(2 * eln + G.E_A, ELEM)
     a: dict[str, int] = {}
     off = 0
-    for name, size in (("xn", G.XN_ELEMS * ELEM), ("q", G.QW * 4), ("kvn", 2 * G.KVW * 4), ("og", G.OG_ELEMS * ELEM),
-                       ("out", G.HID * 4), ("res", G.HID * 4), ("xm", G.XM_ELEMS * ELEM),
-                       ("h", G.TOPK * G.FF * 4), ("out2", G.HID * 4), ("bsum", G.HID * 4), ("junk", eln)):
+    for name, size in (("xn", ROWS * G.XN_ELEMS * ELEM), ("q", ROWS * G.QW * 4), ("kvn", ROWS * 2 * G.KVW * 4),
+                       ("og", ROWS * G.OG_ELEMS * ELEM), ("out", ROWS * G.HID * 4), ("res", ROWS * G.HID * 4),
+                       ("xm", ROWS * G.XM_ELEMS * ELEM),
+                       ("h", ROWS * G.TOPK * G.FF * 4), ("out2", ROWS * G.HID * 4), ("bsum", ROWS * G.HID * 4),
+                       ("junk", eln)):
         a[name] = off
         off += size
     ad_bytes = roundup(off, ELEM)
@@ -270,6 +273,36 @@ def prefill_builds(spec: ModelSpec) -> dict[str, dict]:
     return out
 
 
+AF_Q_HEAD = 4096 * 9      # bf16 a head in attn_fa_gx's Q buffer: the record, then Q hi and Q lo (8 cores x 2048 each)
+
+
+def af_on() -> bool:
+    return os.environ.get("GX_AF", "1") != "0"
+
+
+def af_psplit() -> bool:
+    """GX_AF_PSPLIT=1: the probabilities as a bf16 hi / lo pair in the product and the denominator."""
+    return os.environ.get("GX_AF_PSPLIT") == "1"
+
+
+def af_tiers() -> list[int]:
+    """The window sizes the NPU attention has a stream for: 256 rows up to AF_LMAX (none when it is off)."""
+    if not af_on() or AF_LMAX < 256:
+        return []
+    tiers = list(range(256, 4097, 256)) + list(range(5120, 32769, 1024)) + list(range(36864, 131073, 4096))
+    return [w for w in tiers if w <= AF_LMAX]
+
+
+def af_builds(spec: ModelSpec) -> dict[str, dict]:
+    G, L = geometry(spec), layout(spec)
+    return {f"af{w}": {"design": "attn_fa_gx/attn_fa_gx.py",
+                       "build_dir": f"attn_fa_gx/build_l{w}_h{G.NH}_kv{G.KVH}_sink" + ("_ps" if af_psplit() else ""),
+                       "env": {"AF_L": str(w), "AF_HEADS": str(G.NH), "AF_KV_HEADS": str(G.KVH),
+                               "AF_KV_LD": str(L.KV_ROW // 2), "AF_MAX_ROWS": "131072", "AF_SINK": "1",
+                               **({"AF_PSPLIT": "1"} if af_psplit() else {})}}
+            for w in af_tiers()}
+
+
 def prefill_route(spec: ModelSpec) -> dict:
     """The manifest's `gptoss_prefill` and the contexts / kernels / globals it runs on. One context per
     core program: q|k|v and o share gemm_bfp16's (it depends on neither N nor K), gate|up and down the
@@ -319,8 +352,17 @@ def prefill_route(spec: ModelSpec) -> dict:
         "rope_scale": spec.rope_scale(), "inv_freq": spec.rope_inv_freq(), "alpha": 1.702, "limit": 7.0,
     }
     kmax, nmax = max(k for _, k in S.values()), max(n for n, _ in S.values())
+    fa = af_tiers()
+    ctx_af, ker_af, glob_af = {}, {}, {}
+    if fa:
+        # OPEN-PREFILL-ATTN-FA-GPTOSS: one xclbin, an instruction stream a 256-row window (designs/attn_fa_gx); a Q and an O
+        # buffer twice over (the host packs block b + 1 while the array runs b)
+        ctx_af = {"af": "af256/final.xclbin"}
+        ker_af = {f"af{w}": {"context": "af", "insts": f"af{w}/insts.bin", "build": f"af{w}"} for w in fa}
+        glob_af = {f"af_q{i}": G.NH * AF_Q_HEAD * 2 for i in range(2)} | {f"af_o{i}": PREFILL_T * G.QW * 4 for i in range(2)}
+        section["attn_fa"] = {"hd": G.HD, "l_max": fa[-1], "q_head": AF_Q_HEAD, "kernels": {str(w): f"af{w}" for w in fa}}
     return {
-        "contexts": {"gpgemm": "gp_qkv/final.xclbin", "gpmx4": "gp_glu/final.xclbin", "gpmx4s": "gp_glu_s/final.xclbin"},
+        "contexts": {"gpgemm": "gp_qkv/final.xclbin", "gpmx4": "gp_glu/final.xclbin", "gpmx4s": "gp_glu_s/final.xclbin"} | ctx_af,
         "kernels": {"gpq_qkv": {"context": "gpgemm", "insts": "gp_qkv/insts.bin", "build": "gp_qkv"},
                     "gpq_o": {"context": "gpgemm", "insts": "gp_o/insts.bin", "build": "gp_o"},
                     "gpx_glu": {"context": "gpmx4", "insts": "gp_glu/insts.bin", "patch": "gxexpert", "build": "gp_glu"},
@@ -329,8 +371,8 @@ def prefill_route(spec: ModelSpec) -> dict:
                     "gpx_glu_s": {"context": "gpmx4s", "insts": "gp_glu_s/insts.bin", "patch": "gxexpert",
                                   "build": "gp_glu_s"},
                     "gpx_down_s": {"context": "gpmx4s", "insts": "gp_down_s/insts.bin", "patch": "gxexpert",
-                                   "build": "gp_down_s"}},
-        "globals": {"gp_x": PREFILL_T * kmax // 8 * 9, "gp_y": PREFILL_T * nmax * 4},
+                                   "build": "gp_down_s"}} | ker_af,
+        "globals": {"gp_x": PREFILL_T * kmax // 8 * 9, "gp_y": PREFILL_T * nmax * 4} | glob_af,
         "section": section,
     }
 
@@ -340,7 +382,7 @@ def recipe(spec: ModelSpec, max_ctx: int = 4096) -> GptOssRecipe:
 
 
 def attn_flags(G: Geometry, probe_env=()) -> list[str]:
-    """attn.h for GPT-OSS: no q/k norm, no gate, the sink, the vector softmax over 4 cores."""
+    """attn.h for GPT-OSS: no q/k norm, no gate, the sink, the vector softmax over ATTN_CORES cores."""
     flags = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0",
              "-DATTN_QKNORM=0", "-DATTN_QKNORM_POST=0", f"-DATTN_EPS={G.EPS:g}f", f"-DATTN_VEXP={G.VEXP}",
              f"-DATTN_NHL={G.NHL}", "-DATTN_SINK=1"]
@@ -357,7 +399,7 @@ def ln_flags(G: Geometry) -> list[str]:
     return [f"-DLN_N={G.HID}", f"-DLN_EPS={G.EPS:g}f", f"-DLN_DIV={G.HR}"]
 
 
-PROBE_VARS = ("ATTN_NULL", "GX_NULL")
+PROBE_VARS = ("ATTN_NULL", "GX_NULL", "ATTN_TREE", "ATTN_G5", "ATTN_G5_PVROLL")
 
 
 def probe_env() -> dict[str, str]:
@@ -418,18 +460,19 @@ def route_step(spec: ModelSpec) -> dict:
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L, G = layout(spec, max_ctx), geometry(spec)
     out = {
-        "contexts": {"gx_att": "gx_att/final.xclbin", "gx_moe": "gx_moe/final.xclbin",
-                     "ln": "ln/final.xclbin", "lm": "lm_head_q8/final.xclbin"},
+        # one image for both streams: the layer's two dispatches then never switch hardware contexts (R-0003).
+        # gx_moe/final.xclbin is built and unused: the cores are gx_att's, only the instruction stream differs.
+        "contexts": {"gx": "gx_att/final.xclbin", "ln": "ln/final.xclbin", "lm": "lm_head_q8/final.xclbin"},
         "kernels": {
-            "gx_moe": {"context": "gx_moe", "insts": "gx_moe/insts.bin", "patch": "moeroute2", "build": "gx_moe"},
+            "gx_moe": {"context": "gx", "insts": "gx_moe/insts.bin", "patch": "moeroute2", "build": "gx_moe"},
             "ln": {"context": "ln", "insts": "ln/insts.bin", "build": "ln"},
             "lm": {"context": "lm", "insts": "lm_head_q8/insts.bin", "build": "lm_head_q8"},
         },
         "layer_types": {},
         "tail": [{"op": "run", "kernel": "ln", "args": ["xres", "zero", "normw", "xresf", "hn"]},
                  {"op": "run", "kernel": "lm", "args": ["lmpool", "hn", "logits"]}],
-        "globals": {"xres": G.HID * 4, "zero": G.HID * 4, "normw": G.HID * 2, "xresf": G.HID * 4, "hn": G.HID * 2,
-                    "logits": L.LM_ROWS * 4, "lmpool": L.LMHEAD_POOL_BYTES},
+        "globals": {"xres": ROWS * G.HID * 4, "zero": G.HID * 4, "normw": G.HID * 2, "xresf": G.HID * 4, "hn": ROWS * G.HID * 2,
+                    "logits": ROWS * L.LM_ROWS * 4, "lmpool": L.LMHEAD_POOL_BYTES},
     }
     if spec.quant != gguf_quant(spec):
         out["gguf"] = True
@@ -445,8 +488,10 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         window = spec.sliding_window if local else 0
         args = ["pool", "xres", "consts", "state", "act", tab]
         check_buffer_args(kn, args)
-        out["kernels"][kn] = {"context": "gx_att", "insts": "gx_att/insts.bin", "patch": "attnpos", "build": "gx_att",
+        out["kernels"][kn] = {"context": "gx", "insts": "gx_att/insts.bin", "patch": "attnpos", "build": "gx_att",
                               "window": window}
+        if G.KVSLICE:                                    # per-core window fills of whole blocks (OPEN-ATTN-KVSLICE)
+            out["kernels"][kn]["kvslice"] = G.KVSLICE
         # one rotation for both layer types: GPT-OSS's sliding layers turn at the full layers' YaRN
         # frequencies, where `rope_inv_freq(local=True)` is Gemma's separate unscaled local table
         out["globals"][tab] = {"per_row": L.PTAB_ROW, "inv_freq": spec.rope_inv_freq(), "window": window}
@@ -462,7 +507,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
 
 def builds(spec: ModelSpec) -> dict[str, dict]:
     G, L = geometry(spec), layout(spec)
-    return (prefill_builds(spec) if prefill_on() else {}) | {
+    return (prefill_builds(spec) | af_builds(spec) if prefill_on() else {}) | {
         # gx_att reads the attention past the experts in the same pool, so it follows the experts' form too
         "gx_att": {"design": "gptoss/gx.py", "build_dir": f"gptoss/build_att_h{G.HID}{'_mx4' if mx4_on() else ''}",
                    "env": {"GX_PART": "att", "GX_MX4": "1" if mx4_on() else "0"}},
@@ -471,9 +516,10 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         "ln": {"design": "ln/ln.py", "build_dir": f"ln/build_{G.HID}_{G.EPS:g}_d{G.HR}",
                "env": {"LN_N": str(G.HID), "LN_EPS": f"{G.EPS:g}", "LN_DIV": str(G.HR)}},
         "lm_head_q8": {"design": "lm_head_q8/lm_head_q8.py",
-                       "build_dir": f"lm_head_q8/build_gguf_n{L.LM_ROWS}_k{G.HID}_c{LM_CORES}",
+                       "build_dir": f"lm_head_q8/build_gguf_n{L.LM_ROWS}_k{G.HID}_c{LM_CORES}"
+                                    + (f"_r{ROWS}" if ROWS > 1 else ""),
                        "env": {"LMHEAD_N": str(L.LM_ROWS), "LMHEAD_K": str(G.HID), "LMHEAD_CORES": str(LM_CORES),
-                               "LMHEAD_SCALES_F32": "1"}},
+                               "LMHEAD_SCALES_F32": "1", **({"LMHEAD_ROWS": str(ROWS)} if ROWS > 1 else {})}},
     }
 
 
@@ -512,5 +558,6 @@ KERNEL_SOURCES = [
     "designs/gemm_bfp16/*.py", "designs/gemm_bfp16/*.cc", "designs/gemv_q4/gemv_q4.h", "designs/gemv_q4/gemv_tab.h",
     "designs/attn/*.cc", "designs/attn/*.h", "designs/ln/ln.h", "designs/ln/*.cc", "designs/ln/ln.py",
     "designs/lin_layer/ln_nr.cc", "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.h", "designs/lm_head_q8/*.cc",
+    "designs/attn_fa_gx/attn_fa_gx.py", "designs/attn_fa_gx/attn_fa_gx.cc",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]

@@ -420,6 +420,8 @@ private:
     std::map<std::string, std::vector<xrt::bo>> gemm_w_;
     // ---- OPEN-PREFILL-GPTOSS (the route's weights live in gemm_w_ by their manifest names)
     bool gp_on_ = false;
+    int gp_fa_mode_ = 0;                  ///< OFLM_OPEN_GPTOSS_ATTN=full | window: the NPU attention on one layer type only (a bisect)
+    bool gp_fa_on_ = false;               ///< OFLM_OPEN_GPTOSS_ATTN=host turns the NPU attention off
     bool gp_hilo_ = true;                 ///< OFLM_OPEN_GPTOSS_HILO: activations as [hi ; lo] rows, T / 2 tokens a dispatch
     bool gp_hilo_x_ = true;               ///< OFLM_OPEN_GPTOSS_HILO_EXPERTS: the same for the experts' GEMMs alone
     struct GpHost {                       ///< one layer's small tensors, f32 from the GGUF

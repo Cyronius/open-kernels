@@ -472,7 +472,7 @@ void gx_tiles(const uint8_t* src, bool mxfp4, size_t rows, size_t cols, size_t r
 // j of a half -- byte j / 2, low nibble first -- being k = j / 8, row = j % 8), then f32 bias[16]
 // at 2304 on k-tile 0. A nibble is the e2m1 code re-signed for the kernel's decode
 // (GX_MX4_NIB: p, -p for a negative, -8 for -12); the scale is MXFP4's 2^(e-128) as in gx_tiles.
-constexpr size_t GX_MX4_TILE = 2368;
+constexpr size_t GX_MX4_TILE = 2560;      // 2368 B of tile and 192 B of zero: four make gx_att's 10240 B w element
 constexpr size_t GX_MX4_BIAS = 2304;
 constexpr uint8_t GX_MX4_NIB[16] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 15, 14, 13, 12, 11, 10, 8};
 

@@ -70,6 +70,9 @@ static constexpr unsigned kPerCall = LMHEAD_PER_CALL;
 #ifndef LMHEAD_K
 #define LMHEAD_K 2048
 #endif
+#ifndef LMHEAD_ROWS
+#define LMHEAD_ROWS 1
+#endif
 
 // Phase 2 item 5 (2026-09-02): the inner product on the integer matrix unit,
 // like gemv_q4.h. vegah's form (int8 -> bf16 through the accumulator, bf16 x
@@ -170,3 +173,84 @@ __attribute__((noinline)) inline void gemv_q8_tile(const uint8_t *__restrict til
   aie::store_v(y, acc.template to_vector<float>());
   event1();
 }
+
+#if LMHEAD_ROWS == 2
+// Two token rows through one chunk: one unzip and one mmul for both (A rows 0 and 1 hold the tokens, 2 and 3 are
+// zero), the epilogue per token as gemv_q8_tile's. 2-token table: gptoss/gx_rows.h's layout.
+__attribute__((noinline)) inline void gemv_q8_tile2(const uint8_t *__restrict tile, const uint8_t *__restrict tab,
+                                                    unsigned kt, bool first, float *__restrict y0,
+                                                    float *__restrict y1) {
+  event0();
+#ifdef LMHEAD_NULL
+  if (first) {
+    aie::store_v(y0, aie::zeros<float, kRows>());
+    aie::store_v(y1, aie::zeros<float, kRows>());
+  }
+  event1();
+  return;
+#endif
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const float *__restrict s = (const float *)tile;
+  const uint8_t *__restrict c0 = tile + kScaleBytes;
+  const uint8_t *__restrict c1 = c0 + kRowBlockStride;
+  const int16_t *__restrict xg = (const int16_t *)tab + kt * kTileK * 2;
+  const int32_t *__restrict sh[2];
+  sh[0] = (const int32_t *)(tab + 4 * kK) + kt * kKBlocks;
+  sh[1] = sh[0] + kK / 32;
+
+  aie::accum<accfloat, kRows> acc[2];
+  if (first) {
+    acc[0] = aie::zeros<accfloat, kRows>();
+    acc[1] = aie::zeros<accfloat, kRows>();
+  } else {
+    acc[0].from_vector(aie::load_v<kRows>(y0));
+    acc[1].from_vector(aie::load_v<kRows>(y1));
+  }
+
+#pragma clang loop unroll(disable)
+  for (unsigned kb = 0; kb < kKBlocks; ++kb) {
+    aie::vector<int32_t, 8> v[2][4];
+#pragma clang loop unroll(full)
+    for (unsigned rb = 0; rb < 2; ++rb) {
+      const uint8_t *__restrict src = (rb == 0 ? c0 : c1) + kb * kKInBlock * 16;
+      aie::mmul<4, 8, 8, int16_t, int8_t> Clo, Chi;
+#pragma clang loop unroll(full)
+      for (unsigned oc = 0; oc < 4; ++oc) {
+        const aie::vector<int16_t, 32> A =
+            aie::concat(aie::load_v<16>(xg + (kb * 4 + oc) * 16), aie::zeros<int16_t, 16>());
+        const aie::vector<int8_t, 64> q0 = aie::load_v<64>((const int8_t *)src + oc * 128);
+        const aie::vector<int8_t, 64> q1 = aie::load_v<64>((const int8_t *)src + oc * 128 + 64);
+        auto [lo, hi] = aie::interleave_unzip(q0, q1, 8);
+        if (oc == 0) {
+          Clo.mul(A, lo);
+          Chi.mul(A, hi);
+        } else {
+          Clo.mac(A, lo);
+          Chi.mac(A, hi);
+        }
+      }
+      const aie::vector<int32_t, 32> Clov = Clo.template to_vector<int32_t>();
+      const aie::vector<int32_t, 32> Chiv = Chi.template to_vector<int32_t>();
+#pragma clang loop unroll(full)
+      for (unsigned t = 0; t < 2; ++t) {
+        v[t][2 * rb] = Clov.template extract<8>(t);
+        v[t][2 * rb + 1] = Chiv.template extract<8>(t);
+      }
+    }
+    const aie::vector<bfloat16, kRows> sv = load_scale(s + kb * kRows);
+#pragma clang loop unroll(full)
+    for (unsigned t = 0; t < 2; ++t) {
+      const aie::vector<int32_t, kRows> vi = aie::concat(v[t][0], v[t][1], v[t][2], v[t][3]);
+      aie::accum<accfloat, kRows> part;
+      part.from_vector(aie::to_float<float>(vi, sh[t][kb]));
+      const aie::vector<bfloat16, kRows> hi = part.template to_vector<bfloat16>();
+      const aie::vector<bfloat16, kRows> lo = aie::sub(part, hi).template to_vector<bfloat16>();
+      acc[t] = aie::mac(acc[t], hi, sv);
+      acc[t] = aie::mac(acc[t], lo, sv);
+    }
+  }
+  aie::store_v(y0, acc[0].template to_vector<float>());
+  aie::store_v(y1, acc[1].template to_vector<float>());
+  event1();
+}
+#endif

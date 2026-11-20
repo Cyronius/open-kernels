@@ -19,6 +19,7 @@
 // npu-engine/src/decode.rs (moe2_patch_table / attn_patch_table).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -106,6 +107,7 @@ struct AttnPatch {
     uint32_t flags;
     uint64_t base = 0;        ///< kind 3 with kvslice: the fill's compiled offset inside a row
     uint64_t row_words = 0;   ///< kind 0 with kvslice: words the fill moves per row
+    uint32_t row = 0;         ///< a stream that walks several query rows one after another: the row this patch is for
 };
 
 /// `moeroute`'s table: the moe_experts design's weight fills, built against a
@@ -187,21 +189,45 @@ inline std::vector<AttnPatch> attn_table(const std::vector<uint32_t>& w, const s
                                          " words is not " + std::to_string(g.kvslice) + " whole rows");
             t.push_back({bd_write + 4, 0, 0, 0, g.kvslice ? len / g.kvslice : 0});
             t.push_back({i + 10, 3, flags, off});
-        } else if (arg == 3 && off == g.kv_row) {
-            t.push_back({i + 10, 1, flags});
+        } else if (arg == 3 && off >= g.kv_row && off % g.kv_row == 0) {
+            // a stream of several query rows compiles row r's drain at placeholder row r + 1
+            AttnPatch p{i + 10, 1, flags};
+            p.row = static_cast<uint32_t>(off / g.kv_row - 1);
+            t.push_back(p);
         } else if (arg == 3) {
             throw std::runtime_error("attnpos: " + kn + ": unexpected kv transfer at offset " + std::to_string(off));
         } else if (arg == 5) {
-            t.push_back({i + 10, 2, flags});
+            AttnPatch p{i + 10, 2, flags};
+            p.row = (g.ptab_row && off >= g.ptab_row) ? static_cast<uint32_t>(off / g.ptab_row - 1) : 0;
+            t.push_back(p);
         }
+    }
+    // query rows walked one after another: one drain and one record fill each, and the window fills of row r come
+    // after those of row r - 1 in the stream
+    uint32_t rows = 1;
+    for (const auto& p : t)
+        if (p.kind == 1 || p.kind == 2) rows = std::max(rows, p.row + 1);
+    if (rows > 1) {
+        size_t n0 = 0;
+        for (const auto& p : t) n0 += (p.kind == 0);
+        if (!n0 || n0 % rows)
+            throw std::runtime_error("attnpos: " + kn + ": " + std::to_string(n0) + " window fills over " +
+                                     std::to_string(rows) + " query rows");
+        const size_t per_row = n0 / rows;
+        size_t k = 0;
+        for (size_t j = 0; j < t.size(); ++j)
+            if (t[j].kind == 0) {
+                t[j].row = t[j + 1].row = static_cast<uint32_t>(k++ / per_row);   // the offset patch follows its length
+            }
     }
     for (uint8_t kind = 0; kind < 4; ++kind) {
         size_t n = 0;
         for (const auto& p : t) n += (p.kind == kind);
         // with kvslice each attention core has its own window fill: one length and one offset patch apiece
-        if (g.kvslice && (kind == 0 || kind == 3) ? n == 0 : n != 1)
+        const size_t want = rows;
+        if (g.kvslice && (kind == 0 || kind == 3) ? n == 0 : n != want)
             throw std::runtime_error("attnpos: " + kn + ": " + std::to_string(n) + " patches of kind " +
-                                     std::to_string(kind) + ", expected " + (g.kvslice && (kind == 0 || kind == 3) ? "1 or more" : "1") +
+                                     std::to_string(kind) + ", expected " + (g.kvslice && (kind == 0 || kind == 3) ? "1 or more" : std::to_string(want)) +
                                      " (window length, row drain, record fill, window offset)");
     }
     return t;
@@ -280,8 +306,7 @@ inline void moe2_apply(uint32_t* iw, const std::vector<MoePatch>& table, const u
 /// Set the cache position: the window fill reads rows [start, start + nf) (attn_window: every
 /// cached row, or the sliding window's), the new row lands at row pos, the RoPE record is ptab
 /// row pos (whose [valid | nf] counts match the same window).
-inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64_t pos,
-                       const AttnGeometry& g = AttnGeometry{}) {
+inline void attn_walk_rows(uint64_t pos, const AttnGeometry& g, uint64_t* start_out, uint64_t* nf_out) {
     uint64_t start, nf;
     attn_window(pos, g.window, &start, &nf);
     if (g.rb_win > 1) {
@@ -307,11 +332,20 @@ inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64
         const uint64_t valid = pos - start;
         nf = g.rb * (valid / g.rb + 1) - 1;
     }
+    *start_out = start;
+    *nf_out = nf;
+}
+
+inline void attn_apply(uint32_t* iw, const std::vector<AttnPatch>& table, uint64_t pos,
+                       const AttnGeometry& g = AttnGeometry{}) {
     for (const auto& p : table) {
+        const uint64_t ps = pos + p.row;    // a stream of several query rows: row r is position pos + r
+        uint64_t start, nf;
+        attn_walk_rows(ps, g, &start, &nf);
         uint64_t v = p.kind == 0   ? (g.kvslice ? attn_kvslice_rows(nf, g.kvslice) * p.row_words
                                                 : nf * g.kv_row / 4)  // a BD length is in words
-                     : p.kind == 1 ? pos * g.kv_row
-                     : p.kind == 2 ? pos * g.ptab_row
+                     : p.kind == 1 ? ps * g.kv_row
+                     : p.kind == 2 ? ps * g.ptab_row
                                    : p.base + start * g.kv_row;
         iw[p.word] = static_cast<uint32_t>(v) | p.flags;
     }

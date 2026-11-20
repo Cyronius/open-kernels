@@ -308,6 +308,23 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
             p.glu_small = gemm("glu_small", true);
             p.down_small = gemm("down_small", true);
         }
+        if (g.contains("attn_fa")) {
+            const json& f = g["attn_fa"];
+            const std::string fw = gw + ".attn_fa";
+            p.fa.hd = get<uint64_t>(f, "hd", fw);
+            p.fa.l_max = get<uint64_t>(f, "l_max", fw);
+            p.fa.q_head = get<uint64_t>(f, "q_head", fw);
+            if (p.fa.hd != 64) fail(fw, "head dim " + std::to_string(p.fa.hd) + " is not the design's 64");
+            if (p.fa.q_head != 4096 * 9) fail(fw, "q_head " + std::to_string(p.fa.q_head) + " is not the design's record + Q hi / lo");
+            for (const auto& [len, name] : need(f, "kernels", fw).items()) {
+                const uint64_t rows = std::stoull(len);
+                if (rows == 0 || rows % 256 || rows > p.fa.l_max) fail(fw, "window " + len + " is not a multiple of 256 up to l_max");
+                const std::string kn = name.get<std::string>();
+                if (!m.kernels.count(kn)) fail(fw, "kernel " + kn + " is not declared");
+                p.fa.kernels[rows] = kn;
+            }
+            if (p.fa.kernels.empty()) fail(fw, "no kernels");
+        }
         for (const auto& [role, name] : need(g, "tensors", gw).items()) p.tensors[role] = name.get<std::string>();
         for (const char* role : {"attn_norm", "post_norm", "q_bias", "k_bias", "v_bias", "o_bias", "sinks", "router",
                                  "router_bias", "gate_bias", "up_bias", "down_bias"})

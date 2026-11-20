@@ -36,7 +36,7 @@ import numpy as np
 CH = 5120
 PAD_BIAS = 4352
 LM_TILE = 9216
-MX_CH = 2368
+MX_CH = 2560              # 2368 B of tile (data to 2304, bias to 2368) and 192 B of zero
 MX_PAD_BIAS = 2304
 KVALUES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.int8)
 LEVELS = KVALUES[:8]
@@ -89,7 +89,7 @@ def mxfp4_nibbles(raw: np.ndarray, rows: int, cols: int) -> tuple[np.ndarray, np
 def mx4_tiles(v: np.ndarray, scales: np.ndarray, rows_pad: int, cols_pad: int,
               bias: np.ndarray | None = None) -> np.ndarray:
     """re-signed nibbles / block scales (+ per-row bias) -> mx4 half-tiles in band order,
-    uint8 [bands, K/64, 2368] (the q8 tiles' order)."""
+    uint8 [bands, K/64, MX_CH] (the q8 tiles' order)."""
     q, s = _pad(v, scales, rows_pad, cols_pad)
     nb, nkt = rows_pad // 64, cols_pad // 256
     t = np.zeros((nb, nkt, 4, MX_CH), np.uint8)
@@ -105,7 +105,7 @@ def mx4_tiles(v: np.ndarray, scales: np.ndarray, rows_pad: int, cols_pad: int,
     if bias is not None:
         bp = np.zeros(rows_pad, np.float32)
         bp[:len(bias)] = bias
-        t[:, 0, :, MX_PAD_BIAS:] = bp.reshape(nb, 4, 16).view(np.uint8).reshape(nb, 4, 64)
+        t[:, 0, :, MX_PAD_BIAS:MX_PAD_BIAS + 64] = bp.reshape(nb, 4, 16).view(np.uint8).reshape(nb, 4, 64)
     return t.reshape(nb, nkt * 4, MX_CH)
 
 
@@ -121,7 +121,7 @@ def dequant_mx4_tiles(t: np.ndarray, rows_pad: int, cols_pad: int) -> tuple[np.n
     w = code * s.reshape(nb, nkt, 4, 4, 2, 1, 2, 1, 8)                        # row r = 8 h + rr
     # [b, kt, part, g, kb', oc, h, kk, rr] -> [b, part, h, rr, kt, g, kb', oc, kk]
     w = w.transpose(0, 2, 6, 8, 1, 3, 4, 5, 7).reshape(rows_pad, cols_pad)
-    bias = np.ascontiguousarray(t[:, 0, :, MX_PAD_BIAS:]).view(np.float32).reshape(rows_pad)
+    bias = np.ascontiguousarray(t[:, 0, :, MX_PAD_BIAS:MX_PAD_BIAS + 64]).view(np.float32).reshape(rows_pad)
     return w, bias
 
 

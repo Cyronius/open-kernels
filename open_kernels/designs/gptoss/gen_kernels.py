@@ -21,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))          # open_kernels/
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
+from recipes.gptoss import ROWS  # noqa: E402
 
 
 def files(R) -> dict[str, str]:
@@ -40,7 +41,58 @@ def files(R) -> dict[str, str]:
     acc = "gemv_mx4_pool_group_acc" if mx4 else "gemv_q8_pool_group_acc"
     w_off = L.AD_W - L.AD_XM - 4096 * (G.XM_ELEMS - 1)       # the weights' byte offset in xm's last element
     assert 0 <= w_off and w_off + 4 * 8 <= 4096
-    return {
+    rows = {}
+    if mx4 and ROWS == 2:
+        rows = {
+            "gx_gy2.cc": q8 + '''#include "gx_rows_q8.h"
+// Two rows of a q8 band into two y elements (runtime band law: per_band half-tiles, rs = 4); bias from the pad.
+extern "C" {
+void gx_gy2(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y0,
+            float *__restrict y1, int32_t group, int32_t per_band, int32_t rs) {
+  gx_q8_walk2(t, tab, (unsigned)group, y0, y1, (unsigned)per_band, (unsigned)rs);
+}
+}
+''',
+            "gx_gms2.cc": ex + '''#include "gx_rows.h"
+// Two rows of an mx4 64-row band into the act scratches ms0 / ms1 at + dst; bias from the pad.
+extern "C" {
+void gx_gms2(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict ms0,
+             float *__restrict ms1, int32_t group, int32_t per_band, int32_t dst) {
+  gx_mx4_walk2(t, tab, (unsigned)group, ms0 + dst, ms1 + dst, (unsigned)per_band, true);
+}
+}
+''',
+            "gx_gacc2.cc": ex + '''#include "gx_rows.h"
+// Two rows of an mx4 down band onto the cores' accumulators, fresh for expert 0.
+extern "C" {
+void gx_gacc2(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict acc0,
+              float *__restrict acc1, int32_t group, int32_t per_band, int32_t band, int32_t e) {
+  gx_mx4_walk2(t, tab, (unsigned)group, acc0 + band * 64, acc1 + band * 64, (unsigned)per_band, e == 0);
+}
+}
+''',
+            "gx_prep2.cc": ex + '''#include "gx_rows.h"
+// Element i of token `tok`'s bf16 activation into the 2-token table (gx_prep's block range).
+extern "C" {
+void gx_prep2(const bfloat16 *__restrict e, uint8_t *__restrict tab, int32_t K, int32_t tok, int32_t i) {
+  const unsigned total = (unsigned)K / 32, b0 = 64u * (unsigned)i;
+  const unsigned nb = (b0 + 64u <= total) ? 64u : total - b0;
+  gx_prep2_tok<false>(e, tab, (unsigned)K, (unsigned)tok, b0, nb);
+}
+}
+''',
+            "gx_prepf2.cc": ex + '''#include "gx_rows.h"
+// Element i of token `tok`'s fp32 activation into the 2-token table (gx_prepf's block range).
+extern "C" {
+void gx_prepf2(const bfloat16 *__restrict e, uint8_t *__restrict tab, int32_t K, int32_t tok, int32_t i) {
+  const unsigned total = (unsigned)K / 32, b0 = 32u * (unsigned)i;
+  const unsigned nb = (b0 + 32u <= total) ? 32u : total - b0;
+  gx_prep2_tok<true>((const float *)e, tab, (unsigned)K, (unsigned)tok, b0, nb);
+}
+}
+''',
+        }
+    return rows | {
         "gx_gy.cc": q8 + '''// A q8 band into its y element (runtime band law: per_band half-tiles, rs = 4); bias from the pad.
 extern "C" {
 void gx_gy(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y,
