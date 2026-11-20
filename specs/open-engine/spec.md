@@ -4255,13 +4255,13 @@ Plan and handoff: `.plans/minicpm5-2b.md`.
 - llama.cpp b11393 Vulkan on the same GGUF, measured on the same host: decode about 128 tok/s. Prefill with flash attention is
   4406 / 3512 / 2810 / 1965 tok/s at 1k / 4k / 8k / 16k, against about 610 tok/s for the NPU at 1k.
 
-**Status 2026-11-18: not accepted.**
+**Status 2026-11-20: not accepted.**
 
 | criterion | status |
 | --- | --- |
 | unit | PASS |
-| pack check | NOT RUN |
-| tokenizer | NOT RUN: runs pass ids to `open_qwen36_cli`, and `chat.py` does not know the template |
+| pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
+| tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
 | llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | NOT RUN: only the fp32 forward has been compared |
 | NPU vs independent forward, whole model and long context | measured (tables above) |
 | greedy vs llama.cpp | PASS (2026-11-11 set; later sets are token-identical to it) |
