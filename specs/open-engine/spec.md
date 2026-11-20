@@ -4618,8 +4618,16 @@ ordered work.
 
 **The recipe (2026-10-31), from the GGUF.** The source is ggml-org's `gpt-oss-20b-MXFP4.gguf`
 (Q8_0 attention / embedding / head, MXFP4 experts, every norm, bias, sink and router weight
-F32 and bf16-exact); the q4nx container is not read. A layer is two dispatches with the
-router on the host between them:
+F32 and bf16-exact); the q4nx container is not read.
+
+Why this GGUF and not Unsloth's (the production bar prefers Unsloth): the experts, about 90% of
+the weights, are MXFP4 in every published source, OpenAI's release included, so the
+experts' quantization is the model's own and the same everywhere. Unsloth's files differ
+only in the attention, embedding and head tensors, which they store as Q5_0 / Q4_K / Q6_K
+mixes; `gx` reads Q8_0 there (`gemv_q8.h`) and has no Q5_0 / K-quant path, and
+requantizing them would be a lossy step against a file that already ships at the
+model's native precision. ggml-org's MXFP4 file is also llama.cpp's reference for the
+comparisons below. A layer is two dispatches with the router on the host between them:
 
 - `gx_att` (`designs/gptoss/gx.py`, `GX_PART=att`; `attnpos`): the entry norm, q | k | v,
   YaRN RoPE, attention with the learned sink over 4 cores of 16 heads (`ATTN_SINK`, `RB` 4:
@@ -4797,7 +4805,294 @@ prompt's 32 greedy tokens equal llama.cpp's. Paired against the 2026-11-13 OFLM 
 5.1 / 7.5 s against 6.9 / 5.4 s. Both arms ran slower than on 2026-11-13, so the machine, not
 the port, moved; the prefill spread is too wide to rank the two.
 
-Not established: contexts past 4096 rows, attention products on the NPU
+**Result 2026-11-19 (the same machine and kernel set, the in-tree engine, `dibs run --measure`
+CLEAN, one sitting, context capacity 16384 and 131072):**
+- Prefill and decode against prompt length through phlegm's bridge (random token ids; decode is
+  the mean of 16 steps after the prompt): 512 tokens 2.23 s (229 tok/s), 129.7 ms; 1024 3.73 s
+  (274), 129.9 ms; 2048 7.04 s (291), 145.8 ms; 4096 15.09 s (272), 163.1 ms; 8192 43.2 s (190),
+  198.3 ms. The prefill rate falls at 8192 because the host's attention grows with the square of
+  the prompt.
+- The decode step against depth (`--bench-step --at-position P`: the window is P rows of zeroed
+  KV, so it times the dispatches and checks no values). A step's dispatches: 124.9 ms at 1024
+  rows, 191.6 at 8193, 271.2 at 16384, 425.9 at 32768, 717.4 at 65536, 1311.5 at 131072. Every
+  dispatch completes at a 131072-row window; nothing below that capacity stops it. Correctness
+  at depth is not checked.
+- Where a step goes at 8193 rows: `gx_att` 7.8 ms x 12 full layers = 93.7 ms; `gx_att_local`
+  1.80 ms x 12 = 21.6; `gx_moe` 2.26 ms x 24 = 54.2; the head `lm` 15.1 ms (663 MB at 43 GB/s,
+  near the stream floor); norm 0.24. Only `gx_att` grows: 2.5 ms a call at 1024 rows, 13.9 at
+  16384, 26.1 at 32768, 50.3 at 65536, 98.8 at 131072, a slope of 0.74 us a row a layer. That
+  is 2.9 GB/s of KV at 131072 rows (2 KB a row), against 43 GB/s for the head: the kernel is
+  bound by its arithmetic, not by memory. At 131072 rows the 12 full layers cost 1.19 s of the
+  1.31 s step; their KV (3.1 GB) would stream in about 60 ms at 52 GB/s.
+- `phlegm serve` on this engine (`reasoning_effort`, tools): effort low gave 19 tokens and the
+  reasoning "Compute 17*23 = 391."; effort high gave 79 tokens with a worked check; both
+  answered 391. A `tools` request returned `finish_reason` tool_calls with `get_weather` and
+  `{"city":"Paris"}`; a tool message then produced the final answer.
+
+- Decode at depth against the block prefill (random token ids, context capacity 9000): the
+  block route and the sequential route (one decode step a token, 531 s and 1245 s for 4096 and
+  8192 tokens) gave the same argmax at the prompt end and for 16 greedy steps after it (17 of 17
+  argmaxes and 16 of 16 tokens at both lengths); the prompt-end KL was 1.4e-5 at 4096 and 2.5e-5
+  at 8192 (median over the 17 rows 2.1e-5 and 3.1e-5, worst 1.2e-3). This shows the block KV
+  rows and the decode path agree at depth; it is not a check against llama.cpp or the fp32
+  reference.
+- Experiment, not shipped (branch `gptoss-att8`, `gx.py` with 8 attention cores of 8 heads, the
+  og drains joined in two memory tiles; a memory tile takes at most 6 input channels, so one
+  8-way join fails to place): 600- and 2048-token prefill plus 16 decode steps are byte
+  identical to the 4-core kernels. `gx_att` a call: 98.9 -> 65.9 ms at 131071 rows, 26.1 ->
+  18.1 at 32768, 7.8 -> 6.1 at 8192; a step 1314 -> 917 ms at 131071. At 16 rows it is 1.70 ->
+  2.03 ms a call (+4 ms a step), equal at 1024 rows. 8 cores gives 1.5x, not 2x: the one
+  broadcast KV stream (2 KB a row, about 4 GB/s) is now the limit.
+- Experiment, not shipped (the same branch, plus per-core KV windows, OPEN-ATTN-KVSLICE: four
+  window streams of two kv heads, each read by two cores, on the free shim channels; manifest
+  `kvslice` 4; `gx_att` 148 KB, 11 KB of 16 KB program memory in the fullest core): the same
+  600- and 2048-token prefill and 16 decode steps are byte identical to the 4-core kernels.
+  `gx_att` a call: 5.0 ms at 8192 rows, 13.8 at 32768, 48.6 at 131071 (4 cores: 7.8, 26.1,
+  98.9); a step at 131071 rows is 702 ms (4 cores 1314). The growth is 0.36 us a row a layer
+  (4 cores 0.74, Granite's kvslice got 0.134). At 16 rows a call costs 2.10 ms against 1.70, so
+  a short-context step is about 5 ms slower; equal at 1024 rows.
+- Experiment, not shipped (`GX_ACORES=16`: 16 cores of 4 heads, two a kv head, on rows 4 and 5,
+  four og joins, the same four window streams, each read by four cores): byte identical to the
+  4-core kernels on the same 600- and 2048-token checks. `gx_att` a call: 4.6 ms at 8192 rows,
+  10.3 at 32768, 33.2 at 131071; growth 0.23 us a row a layer. Step time (`--bench-step`,
+  ms; zeroed KV; the dispatch sum of one step), 4 cores / 8 cores / 8 cores + windows / 16 cores
+  + windows:
+
+  | rows | 4 cores | 8 | 8 + windows | 16 + windows |
+  |---|---|---|---|---|
+  | 16 | 117.1 | 120.4 | 142.2 | 141.6 |
+  | 1024 | 125.9 | 133.2 | 128.5 | 141.9 |
+  | 8192 | 199.2 | 173.9 | 161.3 | 165.2 |
+  | 32768 | 422.8 | 332.6 | 284.2 | 233.1 |
+  | 131071 | 1313.7 | 917.1 | 701.9 | 534.4 |
+
+  Byte identity at depth (real KV from the block prefill, 4096 and 8192 random-id tokens plus
+  16 decode steps, 17 rows each): the 8 + windows and 16 + windows kernels equal the 4-core
+  kernels built the same day, row for row. (They differ from the 2026-11-13 kernel set by KL
+  1.9e-5 median at 4096 and 5.3e-6 at 8192, the same 16 tokens: a rebuild effect, not this
+  change.) The 16-core kernel with no windows costs the same at short context (a call 2.6 ms),
+  so the extra cores, not the windows, cost the 0.9 ms a call.
+
+  8 cores + windows against 4 cores, three alternating rounds, `--bench-step` wall minimum,
+  ms (4 cores; 8 + windows): 16 rows 114.3 / 114.6 / 114.5 against 122.3 / 125.5 / 128.4;
+  1024 rows 126.1 / 131.1 / 128.2 against 130.1 / 128.3 / 126.9; 4096 rows 154.4 / 152.6 /
+  162.9 against 142.7 / 142.4 / 145.8; 8192 rows 189.5 / 208.7 / 195.4 against 159.7 / 173.0 /
+  166.8. That is about +9% at 16 rows, equal at 1024, -8% at 4096, -15% at 8192, -47% at 131071.
+  8 cores + windows is the recipe default in branch `gptoss-att8` (the recipe tests pass: 82
+  passed, 3 skipped). `phlegm run` (greedy, 200 tokens, a 100-token prompt) gave the same 506
+  bytes on both kernel sets, in 48.6 s and 48.6 s.
+
+  Null probes of the 8 + windows `gx_att` (`GX_NULL=1` skips the GEMV arithmetic, `ATTN_NULL=1`
+  skips the attention arithmetic; three alternating rounds, minimum time of a call, ms; the
+  probes' results are meaningless, only their time counts): at 16 rows `gx_att` 2.07-2.09 with
+  both on, 2.07-2.12 with the GEMV off, 2.08-2.11 with the attention off, 2.04-2.10 with both
+  off; `gx_att_local` the same, 2.07-2.12; at 2048 rows `gx_att` 2.83-2.86, 2.81-2.85,
+  2.18-2.21, 2.16-2.18. So a short-context call spends none of its 2.1 ms on arithmetic: it
+  streams 33.9 MB (16 GB/s; the head streams at 43 GB/s, a 0.8 ms floor for these bytes) and
+  waits on the chain norm -> q|k|v -> prep -> attention -> o -> norm, each link a trip through
+  DDR and a DMA task wait. About 1.3 ms a call is that fixed chain, 31 ms a token over the 24
+  calls (plus about 10 ms from the extra cores). The attention arithmetic starts to show at
+  2048 rows (0.65 ms). `gx_moe` (62.6 MB, 2.26 ms, 28 GB/s) was not probed; mx4 tiles are
+  core-bound (xdna2-notes F-0313).
+
+  The cost is the context switch (xdna2-notes R-0003, R-0008: a switch restarts the cores, and an
+  image with more core programs costs more to enter). `open_qwen36_cli --bench-kernel` runs one
+  kernel repeated, with no switch: `gx_att_local` 0.85 ms (0.81 with 8 cores + windows), `gx_moe`
+  1.63 ms; in the walk they take 1.7-2.1 and 2.26 ms. The walk switches between the `gx_att` and
+  `gx_moe` contexts 47 times a token, about 40 ms. That also explains the +0.08 ms a call for each
+  extra attention core. Repeated, the kernels stream at 40 GB/s and 38 GB/s, near the head's 43.
+
+  Merged image (branch `gptoss-att8`): `gx.py` builds one core image for both streams (`_image()`),
+  every core reads a per-dispatch mode (an RTP word and a barrier, as `dx.py`'s one-context head
+  does) and runs the attention body or the expert body; the two streams are two instruction streams
+  on one `xclbin`, context `gx`. The experts' half-tile is padded from 2368 to 2560 B (zero pad;
+  the kernel, `gptoss_pack.py`, `pools.cpp`) so four make the attention's 10240 B w element: +8.1%
+  expert bytes (about +2.7 ms a token at 45 GB/s). It builds first time: fullest core 12144 of
+  16384 B. First hardware run (`open_qwen36_cli`, 8 prompt ids, 24 greedy tokens, same flags):
+  the 24 tokens equal the two-context baseline's, and decode goes from 123 to 84 ms a token
+  (8.1 to 11.95 tok/s); `part0` (the attention half) 43.5 -> 20.9 ms and `part1` (the experts)
+  55 -> 40 ms. Against the same baseline after a block prefill of random ids (`--gemm-block`,
+  `--dump-logits`, 17 logit dumps a run, the new CLI with the merged set against the old CLI
+  with the baseline set): at 600 tokens 0 of 18 files differ, decode 138 -> 89 ms a token
+  (7.25 -> 11.2 tok/s); at 4096 tokens 0 of 18 differ, 175 -> 106 ms (5.7 -> 9.4 tok/s).
+
+  In the merged image the extra attention cores no longer cost short-context time (the cost was
+  the switch into a bigger image). 16 cores of 4 heads (`ATTN_CORES` 16, the recipe default in
+  branch `gptoss-att8`) against 8, two alternating rounds, `--bench-step` wall minimum, ms
+  (8 cores; 16 cores): 16 rows 82.0 / 84.0 against 84.7 / 83.2; 1024 rows 89.1 / 87.7 against
+  88.2 / 87.0; 4096 rows 102.6 / 101.5 against 97.0 / 95.8; 8192 rows 119.7 / 119.4 against
+  108.7 / 108.7; 32768 rows 230.2 / 230.4 against 178.3 / 178.3; 131071 rows 652.8 / 679.8
+  against 453.8 / 486.8. The 16-core merged set is byte identical to the baseline at 600 and
+  4096 tokens (0 of 18 logit files differ at each), and decodes the 4096-token case at 97 ms a
+  token. Against the first measurements of the day (4 cores, two contexts: 117 ms at 16 rows, 199
+  at 8192, 1314 at 131071) the step is now 82-84, 109 and 454-487 ms. The recipe tests pass
+  (106 passed, 11 skipped).
+
+  Where the 16-row step goes in the merged 16-core image (`open_qwen36_cli --bench-kernel` repeated
+  and `--bench-step`, two alternating rounds, `GX_NULL=1` switches the GEMV arithmetic off in both
+  halves): `gx_att` 0.82-0.86 ms and `gx_att_local` 0.81-0.84 ms (33.9 MB, 39.5 GB/s), unchanged
+  with the arithmetic off; `gx_moe` 1.62-1.66 ms (67.7 MB, 40 GB/s), 1.44-1.47 ms with the
+  arithmetic off (45 GB/s); the head 14.1 ms (663.5 MB, 46 GB/s). The step wall is 82.4-83.7 ms
+  and 77.3-77.7 ms with the arithmetic off. What is left, in order: the attention half's phases
+  stream at 39.5 GB/s against the 45-46 GB/s of the experts and the head (12 + 12 calls, about
+  0.1 ms each: 3 ms a token); the mx4 arithmetic, 0.2 ms a `gx_moe` call (5 ms a token); the
+  host router between the halves (about 3 ms) and the embed; the padding's extra 8% of expert
+  bytes (2.7 ms). At the rate the head and the null experts reach (45-46 GB/s) the step's 3.2 GB
+  (padding included) takes about 70 ms; the step is 82-84 ms, 19% above that. The
+  52 GB/s stream rate of xdna2-notes F-0201 is a different machine's figure and is not used here.
+
+  Depth check past 4096 tokens (2026-11-19, `open_qwen36_cli --gemm-block --max-tokens 9
+  --dump-logits`, random ids, real KV, the new CLI with the merged 16-core set against the old CLI
+  with the two-context baseline): at 16384 tokens 0 of 10 logit files differ, and at 32768 tokens
+  0 of 10 differ. Decode a token after the prefill: 137 ms merged against 308 ms baseline at
+  16384, and 188 ms against 465 ms at 32768. Block prefill: 16384 tokens in 240 s (15 ms a
+  token), 32768 tokens in 1456 s (44 ms a token); the baseline needs 258 s and 1562 s. The prefill
+  time grows faster than linear because the host runs the attention in fp32 (quadratic in length).
+  Prefill attention on the NPU stays open. Nothing past 32768 tokens was run with real KV.
+
+  Expert reuse across consecutive tokens (2026-11-19, input to a rows pass; `gptoss_route` printed each
+  layer's chosen experts under a temporary trace, not kept; 256 greedy decode tokens a prompt, merged
+  16-core set): distinct experts a layer over windows of L = 2 / 4 / 8 / 16 tokens are 6.4 / 9.7 / 13.4 /
+  17.5 for the chat prompt and 5.6 / 7.9 / 9.9 / 12.1 for the 663-token raw prompt; independent routing would
+  give 7.5 / 13.2 / 21.0 / 28.2. A pass that streams each chosen expert once, bytes-bound at 45 GB/s (1.58 GB
+  fixed, 16.9 MB an expert-layer; router and per-row arithmetic not counted), costs 1.30 / 1.72 / 2.19 / 2.71
+  decode steps (chat) and 1.21 / 1.49 / 1.75 / 2.02 (raw). Only a measured rows pass can confirm these.
+
+  Rows-pass probe (2026-11-19, branch `gptoss-att8`, `GX_ROWS=2`, not kept as a feature): `gx_moe` with each w element
+  read once and run against two rows' tables (the same four experts, so the same bytes). `--bench-kernel
+  gx_moe:50:0 --at-position 16`, minimum ms over two alternating rounds: 1.653 / 1.676 for one row, 3.157 /
+  3.176 for two rows (program memory 14976 of 16384 B). The second row costs the whole compute time again, so the
+  bandwidth bound above does not hold for repeated half-tile calls: the experts' arithmetic (about 1.6 ms a call) is
+  hidden under the stream for one row and not for two. A rows pass needs one nibble decode and one mmul for several
+  rows (the GEMV's `mmul<4, 8, 8>` leaves three of its four A rows idle).
+
+  The same probe with one decode and one mmul for both rows (`designs/gptoss/gx_rows.h`, A rows 0 and 1 the tokens,
+  the epilogue per token): minimum ms over two alternating rounds, one row 1.613 / 1.635, two rows 2.220 / 2.210. The
+  second row costs +0.58 ms a `gx_moe` call (+14 ms a token over 24 layers), against +1.5 ms for repeated calls.
+  Program memory 14528 of 16384 B. Bit identity on hardware (2026-11-19; the 77-token chat prompt and 9 greedy
+  tokens through the two-row expert half; the engine copied row 0's `xm` and routing weights into row 1 under a
+  temporary check, not kept): row 0's 10 logit files are byte-identical to the merged one-row set's, and row 1's `out2`
+  equals row 0's in all 2016 non-zero layer checks. Decode with that image is 101 ms a token against 83. Both rows
+  had the same activations; two different rows are not yet shown.
+
+  The attention GEMVs for two rows (`designs/gptoss/gx_rows_q8.h`, q | k | v and o sharing each q8 half-tile; the
+  attention cores still run one row), `--bench-kernel --at-position 16`, 50 repeats, minimum ms over two alternating
+  rounds, one row against two rows: `gx_att` 0.839 / 0.839 against 0.840 / 0.832, `gx_att_local` 0.834 / 0.836 against
+  0.844 / 0.839, `gx_moe` 1.623 / 1.626 against 2.221 / 2.218. The attention GEMVs hide the second row completely;
+  program memory 15136 of 16384 B. Their bit identity is not yet checked.
+
+  Two attention walks in one dispatch (the cores loop their attention body twice; row 1's window is read after row 0's
+  new K and V are in DDR; `attn_table` / `attn_apply` take a stream of several query rows, rows by placeholder offset
+  and by window-fill order): the patch accepts the stream and the dispatch completes. `--bench-kernel --at-position 16`,
+  minimum ms over two alternating rounds, one row against two walks: `gx_att` 0.833 / 0.875 against 0.866 / 0.862,
+  `gx_att_local` 0.837 / 0.837 against 0.874 / 0.866. The second walk costs about +0.03 ms a call at 16 rows. Depth,
+  bit identity and the norm core's second row are not yet measured.
+
+  The whole two-row image (`GX_ROWS=2`: two norm rows, two attention walks, two-row GEMVs and experts, `xres` as two
+  rows, row 1 given zero input), the 77-token chat prompt plus 9 greedy tokens: row 0's 10 logit files are byte-identical
+  to the one-row merged set. Decode with it takes 99 ms a token against 85 (one real row, one idle row, no head rows,
+  one router): 1.17 decode steps for the layer pairs of a two-row pass. The expert stream needs one task group a row
+  (the shim tile holds 16 buffer descriptors). Row 1's result is not yet checked.
+
+  The q8 head for two rows (`designs/lm_head_q8`, `gemv_q8_tile2`, `LMHEAD_ROWS=2`; the second row shares each chunk's
+  unzip and mmul): `--bench-kernel lm`, minimum ms over two rounds, one row 13.940 / 14.619, two rows 14.752 / 14.719;
+  program memory 3424 of 16384 B. With it, row 0 of the whole two-row image (norm rows, two attention walks, two-row
+  GEMVs, experts and head) is byte-identical to the one-row set (0 of 10 logit files differ) and plain decode takes 103 ms
+  a token against 82. The tail norm of row 1 and the engine path are not built.
+
+  Two rows with different routes need as many expert slots as the union: `gx_moe` with two rows, `--bench-kernel`, 50
+  repeats, minimum ms over two rounds, timing only: one row and 4 experts 1.611 / 1.644; two rows and 6 slots 3.228 /
+  3.253; two rows and 8 slots 4.301 / 4.282. Real two-token unions are 5.6-6.4 experts a layer (256 greedy tokens of two
+  prompts), so a two-row pass costs about 133 ms, 1.6 decode steps, for at most two tokens; a simulated width-2 prompt
+  lookup gains +11% to +14% at that cost on two repetitive samples and +5% at 1.8 steps. Speculative decoding by a rows pass
+  is rejected for GPT-OSS 20B on this measurement (decision 2026-11-19, see `.plans/gptoss-rows-pass.md` in open-kernels).
+
+  DFlash (2026-11-20, `z-lab/gpt-oss-20b-DFlash`, 0.8B, block 8, measured offline): the drafter in torch from its own
+  `dflash.py` (non-causal attention over the target's hidden states at layers 1 / 6 / 11 / 16 / 21 plus the block), the
+  target's hidden states from the fp32 GGUF reference over the engine's greedy sequences (RB 8 set), the target's own
+  embedding and head. Mean tokens a cycle (accepted + the target's own) on three prompts: chat (reasoning low, 93 tokens)
+  2.42, code (320) 2.91, explanation (302) 2.53; all 267 cycles 2.67, histogram of 1..8 tokens [89, 73, 40, 25, 12, 11, 4,
+  13]. The published 4.2-5.1 (H200, documented) is not reproduced here. Capped at the pass width: 1.67 tokens at 2 rows, 2.30 at
+  4, 2.67 at 8. The measured two-row pass is 1.6 decode steps, before a drafter that reads 1.6 GB of bf16 weights a cycle;
+  the bytes-bound estimates at 4 and 8 rows (1.49-1.72 and 1.75-2.19 steps, which the two-row measurement exceeded) leave at
+  most 1.05-1.35x at 4 rows once the drafter is counted. **DFlash is rejected for GPT-OSS 20B on this NPU** with that
+  measurement; it would pay only with a rows pass near its byte floor and the drafter off the NPU's decode budget. EAGLE3
+  was not tried; it would face the same verify cost. Scripts:
+  `dflash/accept.py`, `dflash/run.sh` (scratch).
+
+  Prefill attention on the NPU (2026-11-19, branch `gptoss-att8`: `designs/attn_fa_gx`, a fork of `attn_fa` at 64 heads with the
+  learned sink in record word 1 and the sliding window in word 2; the engine's `gp_layer` runs q|k|v for every block, then one
+  visit to the attention context with a 256-token block a dispatch, then o for every block). Kernel against fp64, 64 heads, 8 kv
+  heads: rel_fro 1.1e-3 without a window and 1.6e-3 with the 128-row window, at 1024 and 4096 rows. In the engine, random ids,
+  NPU against host attention, the last prefill position and 4 to 9 decode steps: 600, 2048 and 4000 tokens corr >= 0.9988 and the
+  argmax equal in 18 of 18; 16384 tokens the argmax equal in 10 of 10 and corr >= 0.9998 in 8 of 10, 0.972 and 0.986 in two decode
+  steps (logit differences 3.3 and 1.8); 32768 tokens corr >= 0.99982, argmax equal in 10 of 10. Prefill (merged one-row set, the
+  host baselines of the same day): 16384 tokens 257.9 s -> 66.3 s, 32768 tokens 1561.8 s -> 183.9 s. 68 streams (`af256` ..
+  `af131072`) share one context; a block takes the smallest stream that holds its window. Short context is unchanged (600
+  tokens: 2603 -> 2600 ms).
+
+  YaRN bounds (2026-11-20): the gap to llama.cpp grew with context (host attention, perplexity on real text: 512 tokens +1.1%,
+  2048 +4.4%, 4096 +12.3%). llama.cpp floors the lower ramp bound and ceils the upper (8.10 -> 8, 17.41 -> 18); the config's
+  `truncate: false` and the OpenAI reference do not. The engine follows the measurement (`ModelSpec` `truncate_bounds: true`,
+  `recipes/spec.py`): perplexity at 4096 tokens, eight chunks of `code_docs.txt`, the second half of each scored (16376
+  positions), llama.cpp on the MXFP4 GGUF 12.737: host attention 14.301 -> 13.354 (+4.8%), NPU attention 14.226 -> 13.493
+  (+5.9%). The 77-token chat prompt still matches llama.cpp's 32 greedy tokens.
+
+  The remaining +4.8% is one chunk (2026-11-20). Per chunk the engine and llama.cpp agree within llama.cpp's own spread except
+  chunk 5 (llama.cpp 6.16, the engine 8.19); without it the host attention is +1.3% (14.320 against 14.130). Chunk 5 is C++
+  code whose first ~500 tokens (markdown, starting mid-sentence) put the model in an unstable state: the fp32 GGUF reference
+  (`model/gptoss_gguf_reference.py`) gives 8.51 and the sequential decode route 8.87, so the engine agrees with the reference;
+  llama.cpp's own variants stay near 6 (bf16 KV 5.94, CPU 6.03) but `--yarn-orig-ctx 8192` alone moves it to 4.77. With the
+  first 500 tokens cut, the engine is the lower (6.61 against 7.08). At position 2851 ("std::mem" -> "cpy") the engine gives
+  0.98 and llama.cpp 0.22. Per-position KL(llama.cpp || engine), NPU attention, on chunks 0 / 2 / 4: 0.032 / 0.030 / 0.034
+  (top-1 agreement 89-92%); llama.cpp against itself (bf16 KV or the CPU against f16 KV on Vulkan) 0.022-0.032 (94-96%).
+  The KV type is ruled out (llama.cpp f16 / bf16 / f32 KV: 12.737 / 12.595 / 12.809), as are tokenization (identical ids)
+  and the block prefill (the sequential route is further off on chunk 5).
+
+  Real-text quality, NPU against host attention on the corrected table: +1.0% perplexity at 4096 tokens (mean KL about 0.01
+  nats, 4% argmax flips, 73% of them at a top-2 margin under 0.2; not within the Granite gate, which allows flips only under
+  0.2). Bisect: full layers only and sliding layers only each give KL 0.011; hi / lo probabilities (`AF_PSPLIT`) 0.010. At
+  16384 tokens, per-token NLL difference NPU - host by position: 0..2048 +0.049, 2048..4096 +0.065, 4096..8192 +0.030,
+  8192..16383 +0.006 (each +/- 0.003 to 0.005): the cost does not grow with depth.
+
+  Long context (2026-11-20, `exp-runyt2`, `--gemm-block`, a needle "The magic number is 48213" at a quarter of the depth in
+  corpus filler, the chat template, greedy):
+
+  | prompt tokens | prefill | attention in it | decode at that depth | the needle |
+  |---|---|---|---|---|
+  | 32768 | 177.0 s (5.4 ms/token) | 105.4 s | 188 ms/token | quoted in the analysis channel |
+  | 65534 | 548.2 s (8.4 ms/token) | 404.1 s | 314 ms/token | quoted in the analysis channel |
+  | 130500 | 1866.2 s (14.3 ms/token) | 1566.5 s (84%) | 552 ms/token (559 tokens, context 131072) | quoted, then a greedy repetition loop over the code around it |
+
+  The first 130500 run fell back to host attention in every full layer: the cache held `max_ctx` rows and the last block
+  needs the 131072-row stream. The cache is now padded to the smallest compiled window past the capacity. Named costs at
+  depth: the full layers' prefill attention (quadratic in the window) and the decode attention walk, which grows about 4
+  ms/token per 1000 rows (12 full layers x 2 KB a row; about 6.5 GB/s of KV read).
+
+  Decode attention at depth (2026-11-20, `--bench-decode 3 --bench-step 3 --at-position`, `dibs run --measure`): at 131071
+  rows the attention arithmetic is 288 of the 479 ms step. An `ATTN_NULL=1` build (the window streamed, nothing computed)
+  takes a full-layer `gx_att` call from 31.4 to 7.4 ms, so the window streams at 35-40 GB/s and the walk is compute-bound.
+  8-row blocks (recipe `GX_RB`, now 8; KVSLICE 8) cut the step at 131071 rows from 473.9 to 408.8 ms (-14%), at 32768 from
+  173.6 to 167.0, and leave 16 rows unchanged (79.2 / 78.6). Accuracy: against the fp32 GGUF reference over 300
+  teacher-forced positions KL 0.00029 (RB 4: 0.00046), argmax 296 / 300 (298); on 2047 positions at 2048-4095 rows of a
+  real-text chunk KL(RB 4 || RB 8) 0.017 and perplexity +0.5%; the chat prompt's 32 greedy tokens equal llama.cpp's on both
+  routes. The 130500-token needle on the RB 8 set: the analysis channel finds 48213, the final channel answers "48213";
+  decode 457 ms a token at that depth (RB 4: 552). Rejected at this shape: `ATTN_G5` (the step 340 ms at 131071, but logits
+  differ from position 0, argmax 246 / 300 teacher-forced) and `ATTN_TREE` (does not compile at head dim 64).
+
+  Against llama.cpp (the 2026-11-13 run on the same GGUF, Vulkan, `llama-ref.json`: the 77-token
+  harmony chat prompt, `reasoning_effort` low, 32 greedy tokens): the merged 16-core set gives
+  all 32 equal on the block prefill and on the sequential one (`open_qwen36_cli --ids-file
+  chat.ids`), and decodes at 84 and 82 ms a token (11.9 and 12.2 tok/s). llama.cpp's own
+  timing in that file is 60.9 ms a token (16.4 tok/s) on the iGPU; it was not rerun today.
+
+  The 16-core kernel costs about 24 ms a step at short context (both layer types run the one
+  stream; a sliding layer's window is 128 rows, so it only pays) and wins from about 3k rows.
+  The two layer types cannot take separate kernels cheaply: each xclbin is a hardware context,
+  and the layers alternate with `gx_moe`. The 8 + windows row at 16 rows came from the first
+  run of a sitting and is likely noisy (its 1024-row step is lower).
+
+Not established: the correctness of decode past 2000 rows, attention products on the NPU
 (the host's attention is 2.3 s of the 2000-token prefill at 4 threads), one shared copy of
 the experts for decode and prefill (the GEMM reads its own 10.8 GiB of tiles), and an
 expert GEMM that fills its rows across experts (a chunk still pads to 128 or 256 rows).
