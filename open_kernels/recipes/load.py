@@ -124,8 +124,28 @@ def quant_for(spec: ModelSpec, model_dir: Path):
     return m or "q4_1"
 
 
+def granite_gguf_config(cfg: dict) -> dict:
+    """OPEN-GGUF-GRANITE-FOLD for a GGUF model dir's HF config.json: the engine folds the GGUF's
+    multipliers at load, so the spec is the folded model's. Same rule as spec.granite_gguf_folds."""
+    import math
+    from .spec import SpecError
+    hd = cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
+    want = {"attention_multiplier": float(cfg.get("attention_multiplier", 1.0)) * math.sqrt(hd),
+            "embedding_multiplier": float(cfg.get("embedding_multiplier", 1.0)),
+            "residual_multiplier": float(cfg.get("residual_multiplier", 1.0)),
+            "logits_scaling": 1.0 / float(cfg.get("logits_scaling", 1.0))}
+    for k, f in want.items():
+        if not (f > 0 and math.frexp(f)[0] == 0.5):
+            raise SpecError(f"granite: folding {k} needs a power-of-two factor, and it would take {f}")
+    return dict(cfg, attention_multiplier=hd ** -0.5, embedding_multiplier=1.0, residual_multiplier=1.0,
+                logits_scaling=1.0)
+
+
 def spec_from_model_dir(model_dir: Path) -> ModelSpec:
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    if (cfg.get("model_type") == "granite" and (model_dir / "model.gguf").is_file()
+            and not (model_dir / "model.q4nx").is_file()):
+        cfg = granite_gguf_config(cfg)
     rv = tokenizer_vocab(model_dir / "tokenizer.json")
     spec = ModelSpec.from_hf_config(cfg, real_vocab=rv)
     spec = dataclasses.replace(spec, quant=quant_for(spec, Path(model_dir)))

@@ -97,6 +97,11 @@ Engine::Engine(const LM_Config& config, oflm_rt::device* dev, int MAX_L) : dev_(
         std::string spec = utils::getenv_oflm("OFLM_SPECULATIVE");
         cfg_.draft = spec == "1" || spec == "true" || spec == "on";
     }
+    if (const char* sm = std::getenv("OFLM_SPEC_MODE")) {
+        const std::string s = sm;
+        using M = SpecPolicy::Mode;
+        spec_.mode = s == "lookup" ? M::lookup : s == "plain" ? M::plain : M::adaptive;
+    }
     // Say which set won. Three rules can pick one, and every one of them yields
     // valid output -- so a set chosen against the user's intent looks exactly
     // like the right one. An A/B that silently ran identical kernels twice, and
@@ -361,6 +366,42 @@ int Engine::uno_cycle(int seed, std::vector<int>& out) {
         out.push_back(av[k]);
         core_->seek(p + 2 + static_cast<int>(k));
         return p;
+    });
+}
+
+bool Engine::spec_ok() const { return core_ && cfg_.draft && core_->rows_l(); }
+
+void Engine::spec_begin() {
+    spec_.reset_estimates();
+    spec_plain_ = false;
+}
+
+bool Engine::spec_cycle(int seed, const std::vector<int>& history, std::vector<int>& out, int& p) {
+    return guarded([&] {
+        const size_t L = core_->rows_l(), cap = core_->max_ctx();
+        if (spec_plain_) spec_.record(SpecMethod::plain, 0, 0, core_->last_timing().total_ms, 0, 0);
+        spec_plain_ = false;
+        if (history.empty() || history.back() != seed)
+            throw std::runtime_error("open_qwen36: spec_cycle's history must end with the seed");
+        p = core_->position();
+        std::vector<int> drafts;
+        const int matched = spec_.uses_lookup() ? lookup_drafts(history.data(), history.size(), L - 1, 4, 1, drafts) : 0;
+        // strict: the cycle's last seek lands on its next position, which must itself be inside the capacity; never Uno
+        const SpecMethod m = spec_.choose(matched, static_cast<size_t>(p) + L < cap, false);
+        if (m != SpecMethod::lookup) {
+            spec_plain_ = true;
+            return false;
+        }
+        std::vector<int> vr(L), av(L);
+        vr[0] = seed;
+        for (size_t j = 1; j < L; ++j) vr[j] = j - 1 < drafts.size() ? drafts[j - 1] : vr[j - 1];
+        core_->step_rows(vr.data(), av.data(), false, false);
+        size_t k = 0;
+        while (k + 1 < L && vr[k + 1] == av[k]) ++k;    // draft k+1 checked by verify row k
+        for (size_t j = 0; j <= k; ++j) out.push_back(av[j]);
+        core_->seek(p + 1 + static_cast<int>(k));
+        spec_.record(m, matched, static_cast<int>(k), 0, core_->rows_ms(), 0);
+        return true;
     });
 }
 

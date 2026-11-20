@@ -33,6 +33,7 @@ open_kernels/designs/*/out*.bin
 open_kernels/designs/*/in.bin
 open_kernels/designs/*/run*.cfg
 open_kernels/designs/*/big.bin
+/src/open_qwen36/out/
 open_kernels/designs/*/*.log
 # Generated kernel TUs: written per spec by the exports, never source
 # (specs/open-engine/tests/test_generated_tus_untracked.py)

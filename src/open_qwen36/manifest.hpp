@@ -46,6 +46,9 @@ struct PackOp {
     std::string via;                                                    ///< bf16_gemm: "q4_1" reads a q8 source as the q4 ops do
     uint64_t row0 = 0, n_total = 0;                                     ///< bfp16_gemm: this tensor's first row in the stacked
                                                                         ///< weight, and the weight's padded row count
+    std::string glu;                                                    ///< bfp16_gemm: "gate" | "up" half of OPEN-PREFILL-BFP16-FFN's gate|up
+    uint64_t ksplit = 1;                                                ///< bfp16_gemm: 3 packs K three times as [hi | hi | lo]
+                                                                        ///< (OPEN-PREFILL-BFP16-QKV)
     std::string div_running;                                            ///< put: divide the values by the product,
                                                                         ///< over the layers BEFORE this one, of this
                                                                         ///< one-value tensor ("{j}" = that layer) --
@@ -65,6 +68,9 @@ struct Step {
     std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
                                              ///< (x packed bfp16, y c-tiled with `n_pad` rows; OPEN-PREFILL-BFP16)
     uint64_t n_pad = 0;                      ///< fmt bfp16: the weight's rows padded to a whole number of tile groups
+    std::string epi;                         ///< fmt bfp16: "glu" = y is the H operand, silu(gate) * up as the next step's A
+    std::string a_from;                      ///< fmt bfp16: "h" = x is the previous glu step's y, already on the device;
+                                             ///< "split3" = x packs as [hi | lo | hi] against a ksplit 3 weight
     bool split = false;                      ///< run, block route: the weight is a q8 projection's exact q4_1
                                              ///< split, [hi | lo]; the GEMM runs twice the rows and the halves add
 };
@@ -135,6 +141,28 @@ struct AttnBlock {
     bool present() const { return !kernels_s.empty(); }
 };
 
+/// A dense layer's block attention as one causal flash-attention dispatch a 256-token block (OPEN-PREFILL-ATTN-FA,
+/// open_kernels/designs/attn_fa): scores, mask, softmax and both products on the array. One stream per window tier up
+/// to l_max on one xclbin; tiers are multiples of 256 and need not be every one. Its buffers are the engine's: the
+/// block's Q (per head the record with p0, Q hi, Q lo, q_head bf16 a head), the layer's KV cache (`state`) and the
+/// block's fp32 [t, qw] output.
+struct AttnFa {
+    std::map<size_t, std::string> kernels;   ///< window rows -> the stream for that width
+    size_t hd = 0, l_max = 0, q_head = 0;
+    bool qsplit = true;                      ///< Q as a bf16 hi / lo pair
+    /// OPEN-PREFILL-GLUE-PREP: one more stream of the same context that rotates the bfp16 qkv GEMM's c-tiled output,
+    /// packs Q and writes the cache rows. With it every stream takes a fourth buffer, the block's cos / sin table.
+    std::string prep_kernel;
+    size_t prep_npad = 0;                    ///< the qkv GEMM's padded width the prep stream was built for
+    bool present() const { return !kernels.empty(); }
+    bool has_prep() const { return !prep_kernel.empty(); }
+    /// The narrowest stream that covers `rows` window rows, or null when none does.
+    const std::string* tier(size_t rows) const {
+        auto it = kernels.lower_bound(rows);
+        return it == kernels.end() ? nullptr : &it->second;
+    }
+};
+
 struct GemmBlockProgram {
     uint64_t t = 0;               ///< 0 = no route for this layer type
     std::string kind;             ///< dense | linear | full
@@ -191,6 +219,8 @@ struct GemmBlockProgram {
     bool has_dense_ffn() const { return !ffn_program.empty(); }
     // full: the attention products on the NPU (absent: attention on the host)
     AttnBlock attn_block;
+    // dense: the whole block attention on the NPU (absent: host attention or dxB)
+    AttnFa attn_fa;
 };
 
 struct LayerType {
@@ -217,7 +247,7 @@ struct KernelDesc {
     /// layer types have different attention geometry (Gemma 4: head dim 256 and 512) builds a
     /// kernel per type, each patched with its own; absent in the manifest = the layout's.
     uint64_t kv_row = 0, ptab_row = 0;
-    /// attnpos: rows of one per-core window element (OPEN-ATTN-KVSLICE: each attention core reads its own
+    /// attnpos / attnrows: rows of one per-core window element (OPEN-ATTN-KVSLICE: each attention core reads its own
     /// kv heads of the window on a fill of its own); 0 = the one window fill of every other kernel.
     uint64_t kvslice = 0;
 };
@@ -230,6 +260,9 @@ struct RowsDesc {
     uint64_t head_act_bytes = 0;     ///< the head's normed rows (bf16 [L][hidden])
     uint64_t head_cores = 0;         ///< cores whose [value L | row L] argmax elements end the head's output
     uint64_t head_out_floats = 0;    ///< logits [L][vocab] then head_cores elements of L * 64
+    /// OPEN-DXL-HEAD: `head` is a stream over `kernel`'s image (no argmax elements); the host takes each row's argmax.
+    bool head_fold = false;
+    uint64_t mode_off = 0, mode_elem = 0;   ///< act: three x elements holding 0, 1, 2 (the mode a dispatch opens with)
     // OPEN-UNO-LORA: `lora_kernel` is another stream for the same core programs; empty means no draft pass.
     std::string lora_kernel, lora_file;
     uint64_t lora_pool_bytes = 0;
@@ -300,7 +333,7 @@ struct Manifest {
     void check_model(const nlohmann::json& config, const std::string& where) const;
     const LayerType& layer_type(size_t layer) const;
     /// Why the host attention (OPEN-HOST-ATTN-GUARD) cannot compute this model, or "" when it can.
-    /// It implements K2's attention only; any other family is refused by name.
+    /// It implements K2's and Granite's attention only; any other family is refused by name.
     std::string host_attention_refusal() const;
     /// OPEN-PREFILL-MODE: gemm_block becomes variant `name` ("" keeps it), and the other routes and the
     /// globals only they name are dropped. False when no layer type has a variant `name`.

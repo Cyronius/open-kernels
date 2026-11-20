@@ -59,7 +59,7 @@ DESIGNS = HERE / "designs"
 XCLBINS = REPO / "src" / "xclbins"
 sys.path.insert(0, str(HERE))
 from recipes.cache import build_key  # noqa: E402
-from recipes.families import for_spec  # noqa: E402
+from recipes.families import family_builds, for_spec  # noqa: E402
 from recipes.load import default_spec, load_spec, spec_from_model_dir  # noqa: E402
 from recipes.manifest import dumps, manifest  # noqa: E402
 
@@ -433,14 +433,18 @@ def main() -> int:
                 f"catalogue) once its fixture passes."
             )
         raise
-    sets = disambiguate_build_dirs(F.builds(spec))
+    sets = disambiguate_build_dirs(family_builds(F, spec, a.max_ctx))
+    # A probe changes the compiled kernel, so it must also change each build's reuse key.
+    probes = getattr(F, "probe_env", dict)()
+    if probes:
+        sets = {n: dict(v, env={**v["env"], **probes}) for n, v in sets.items()}
     if a.build_root:
         sets = {n: dict(v, build_dir=str(a.build_root.resolve() / n)) for n, v in sets.items()}
     names = [n.strip() for n in a.only.split(",") if n.strip()] if a.only else list(sets)
     bad = [n for n in names if n not in sets]
     if bad:
         sys.exit(f"unknown set(s) {bad}; the recipe builds {list(sets)}")
-    key = build_key(spec)
+    key = build_key(spec, max_ctx=a.max_ctx)
     if not a.out and not spec.extra.get("model"):
         # It used to fall back to the 35B's name, so exporting a spec without one wrote
         # over the flagship's shipped set. Say so instead of guessing a published name.

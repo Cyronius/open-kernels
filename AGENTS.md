@@ -13,6 +13,9 @@
 - This repository is the canonical home of `open_kernels/`, `src/open_qwen36/`, `npu_offload/`, `viz/` and
   `specs/open-engine/`. Consult `open_kernels/UPSTREAM.md` before kernel or engine work.
 - openflowlm-next has the same paths. Open one upstream PR per finished feature.
+- Do not do engine or app work in openflowlm-next. Make open-kernel work, including its engine side, here and
+  in phlegm when needed. OFLM's engine, server, registry and `oflm` tools are a separate effort: list what they
+  need in the plan, and do not change them.
 - The kernel writer (`open_kernels/recipes/`) and the engine's manifest reader (`src/open_qwen36/`) are one contract.
   Change them in the same commit. Preserve the manifest/runtime ABI, the local version-7 DIT mapping, and the Llama
   high/low probability contract.
@@ -22,6 +25,11 @@
   against OFLM trunk.
 
 ## Production bar for OFLM kernel sets
+
+Scope here: open-kernels work is separate from OFLM. Verify every item through phlegm first: `phlegm run` /
+`phlegm serve` in place of `oflm add` / `oflm serve`, and `phlegm bench` in place of `oflm bench`. OFLM's registry
+entry, `oflm` commands, docs pages and README row are OFLM's separate effort. Do not list them as open-kernels gaps
+or plan OFLM work for them.
 
 Do not add q4nx support for any model: q4nx is being deprecated. New support
 loads the model from GGUF.
@@ -56,6 +64,8 @@ show each of these items with measurements:
   and the reason.
 
 If an item is not done, the PR stays a draft and lists the item.
+
+Track each top-tier model's progress (OFLM #240) in `RECOMMENDED_MODELS.md`.
 
 ## Research and optimization
 

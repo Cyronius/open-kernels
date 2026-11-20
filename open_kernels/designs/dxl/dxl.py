@@ -25,7 +25,7 @@ sys.path.insert(0, str(DESIGNS.parent))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
-from recipes.attnknobs import TREE8_STACK, dxl_kvslice, kv_slices, t8_split_flags, tree8, tree8_flags  # noqa: E402
+from recipes.attnknobs import TREE8_STACK, dxl_kvslice, hi_only_flags, kv_slices, t8_split_flags, tree8, tree8_flags  # noqa: E402
 from recipes import dxl as DXR  # noqa: E402
 from recipes.dxl import JMAX, NF, Z_ROW, job_table, jobs  # noqa: E402
 
@@ -61,6 +61,7 @@ if NPTAB > 1:
 for _k, _v in QR.probe_env().items():
     if _k not in ("ATTN_RB", "ATTN_FAST", "ATTN_TREE8", "ATTN_KVSLICE", "ATTN_DXL_KVSLICE"):
         ATTN_FLAGS.append(f"-D{_k}={_v}")
+ATTN_FLAGS.extend(hi_only_flags(SPEC))
 ACORES, NHL, RB = G.ACORES, G.NHL, G.RB
 T8 = tree8(SPEC, G.NHL, G.RB, G.HD)           # the same bit-identical score tree as dx (OPEN-ATTN-SCORE-TREE)
 if T8:

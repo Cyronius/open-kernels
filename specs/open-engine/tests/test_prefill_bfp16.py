@@ -99,7 +99,7 @@ def test_granite_manifest_carries_the_bfp16_variant():
     m = manifest(_granite())
     assert m["manifest_version"] == 6      # 5 for the glu steps, 6 for attn_fa's prep stream
     lt = m["layer_types"]["dense"]
-    v, base = lt["gemm_block_variants"]["bfp16"], lt["gemm_block"]
+    v, base = lt["gemm_block_variants"]["bfp16"], lt["gemm_block_variants"]["lean"]
     assert all(s.get("fmt") is None for s in base["program"])
     assert [s["n_pad"] for s in v["program"]] == [4096, 3072, 16384, 3072]
     assert v["kind"] == base["kind"] and v["t"] == base["t"] and v["qw"] == base["qw"]
@@ -125,6 +125,48 @@ def test_granite_bfp16_ffn_is_glu_then_down_from_h():
     assert m["globals"]["gbfp_h"] == 4 * 128 * bp.H_SLOT_WORDS * 4
     assert m["builds"][gu["kernel"]]["env"]["GB_EPI"] == "glu" and m["builds"][dn["kernel"]]["env"]["GB_A"] == "h"
     assert {m["kernels"][s["kernel"]]["context"] for s in v["program"]} == {"gemmbfp"}
+
+
+def test_granite_default_prefill_is_bfp16_with_a_three_term_qkv(monkeypatch):
+    """fast runs qkv as one bfp16 GEMM over 3 K ([hi | lo | hi] x [hi | hi | lo]) and o, gate|up and down as the bfp16
+    route; DENSE_BFP16_QKV=q4 puts qkv on the q4 GEMM; lean is the q4 route; DENSE_BFP16_DEFAULT=0 keeps the q4 route
+    as fast. Traces: OPEN-PREFILL-BFP16-QKV"""
+    lt = manifest(_granite())["layer_types"]["dense"]
+    fast, lean, bfp = lt["gemm_block"], lt["gemm_block_variants"]["lean"], lt["gemm_block_variants"]["bfp16"]
+    q = fast["program"][0]
+    assert (q["kernel"], q["args"], q["a"], q["n_pad"]) == ("gemm_bfp16_n4096_k7680", ["gqkv3_w", "gbfp_x_k7680", "gbfp_y_n4096"], "split3", 4096)
+    assert [o["ksplit"] for o in fast["weights"]["gqkv3_w"]["pack"]] == [3, 3, 3]
+    assert all("ksplit" not in o for w in bfp["weights"].values() for o in w["pack"])
+    assert fast["program"][1:] == bfp["program"][1:] and all(s["fmt"] == "bfp16" for s in fast["program"])
+    assert fast["attn_fa"] == lean["attn_fa"]
+    m = manifest(_granite())
+    assert m["globals"]["gbfp_x_k7680"] == 256 * 7680 // 8 * 9
+    assert m["builds"]["gemm_bfp16_n4096_k7680"]["env"] == {"GB_M": "256", "GB_K": "7680", "GB_N": "4096"}
+    monkeypatch.setenv("DENSE_BFP16_QKV", "q4")
+    fq = manifest(_granite())["layer_types"]["dense"]["gemm_block"]
+    assert fq["program"][0] == lean["program"][0] and fq["weights"]["gqkv3_w"] == {"from": "pool", "ops": [0, 1, 2]}
+    monkeypatch.delenv("DENSE_BFP16_QKV")
+    monkeypatch.setenv("DENSE_BFP16_DEFAULT", "0")
+    lt0 = manifest(_granite())["layer_types"]["dense"]
+    assert lt0["gemm_block"] == lean and "lean" not in lt0["gemm_block_variants"]
+
+
+def test_split3_weight_is_hi_hi_lo_and_sums_to_the_weight():
+    """bfp16_split3 lays a row out [hi | hi | lo]: hi is the bfp16 value, hi + lo is the weight to ~2^-14 of a block's
+    largest, and against an A of [a_hi | a_lo | a_hi] the product is a_hi.hi + a_lo.hi + a_hi.lo. Traces:
+    OPEN-PREFILL-BFP16-QKV"""
+    rng = np.random.default_rng(3)
+    w = (rng.standard_normal((256, 128)) * np.exp(rng.standard_normal((256, 1)))).astype(np.float32)
+    w3 = pack.bfp16_split3(w)
+    assert np.array_equal(w3[:, :128], w) and np.array_equal(w3[:, 128:256], w)
+    hi, lo = bp.decode_blocks(bp.encode_blocks(w.reshape(256, 16, 8))).reshape(256, 128), w3[:, 256:]
+    blk = np.abs(w.reshape(256, 16, 8)).max(-1, keepdims=True)
+    err = np.abs((hi + bp.decode_blocks(bp.encode_blocks(lo.reshape(256, 16, 8))).reshape(256, 128)) - w).reshape(256, 16, 8)
+    assert (err <= blk * 2.0 ** -13).all()
+    out = np.zeros(1024 * 384 // 8 * 9, np.uint8)
+    pack.pack_bfp16_gemm(w3, 0, 1024, out)
+    u = bp.unpack_b(out, 1024, 384)[:256]
+    assert np.array_equal(u[:, :128], hi) and np.array_equal(u[:, 128:256], hi)
 
 
 @pytest.mark.parametrize("name", ["qwen3-4b", "llama31-8b", "phi4-mini-4b"])

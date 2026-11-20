@@ -63,6 +63,9 @@ target_include_directories(attn_window_test PRIVATE ${_inc})
 # kvslice_patch_test (no XRT): attnpos over per-core window fills (OPEN-ATTN-KVSLICE)
 add_executable(kvslice_patch_test kvslice_patch_test.cpp)
 target_include_directories(kvslice_patch_test PRIVATE ${_inc})
+# spec_lookup_test (no XRT): the lookup drafter against tests/fixtures/spec_lookup_cases.json
+add_executable(spec_lookup_test spec_lookup_test.cpp)
+target_include_directories(spec_lookup_test PRIVATE ${_inc})
 
 # block_host.cpp uses AVX2/FMA intrinsics in both targets. The parent app and
 # Windows build.cmd already enable them; the standalone CMake build must too.
@@ -76,7 +79,7 @@ foreach(t open_qwen36_cli block_host_test attn_window_test)
 endforeach()
 
 foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test
-          kvslice_patch_test)
+          kvslice_patch_test spec_lookup_test)
     if(MSVC)
         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -90,6 +93,8 @@ add_test(NAME OPEN-VISION-VIT-WINDOWED COMMAND vit_test --window-index)
 add_test(NAME GGUF-PACK COMMAND gguf_pack_test)
 add_test(NAME OPEN-PREFILL-ATTN-WINDOW COMMAND attn_window_test)
 add_test(NAME OPEN-ATTN-KVSLICE-PATCH COMMAND kvslice_patch_test)
+add_test(NAME OPEN-SPEC-LOOKUP COMMAND spec_lookup_test
+         "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/spec_lookup_cases.json")
 add_test(NAME OPEN-MANIFEST COMMAND manifest_test
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen36.json"
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen3_4b.json"

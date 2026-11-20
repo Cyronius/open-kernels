@@ -66,3 +66,11 @@ FAMILIES = ("qwen36moe", "qwen35", "qwen3", "llama3", "gemma3", "hunyuan", "gran
 # the point: routing such a model to the nearest recipe would emit kernels that drop a whole
 # stage of the layer and then report parity against a replica making the same mistake.
 NOT_IMPLEMENTED: dict[str, str] = {}
+
+
+def family_builds(F: ModuleType, spec: ModelSpec, max_ctx: int = 4096) -> dict:
+    """F.builds(spec), with the context capacity for a family whose builds depend on it (dense's attn_fa)."""
+    import inspect
+    if max_ctx != 4096 and "max_ctx" in inspect.signature(F.builds).parameters:
+        return F.builds(spec, max_ctx=max_ctx)
+    return F.builds(spec)

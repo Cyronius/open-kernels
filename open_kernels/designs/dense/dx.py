@@ -56,7 +56,7 @@ from ironutil import Pipeline, include_dirs, piece_tap  # noqa: E402
 import ln_split as LS  # noqa: E402
 from recipes.load import current_spec  # noqa: E402
 from recipes.families import for_spec  # noqa: E402
-from recipes.attnknobs import TREE8_STACK, g5_expa, g5_rb8_flags, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
+from recipes.attnknobs import TREE8_STACK, g5_expa, g5_rb8_flags, hi_only_flags, kv_cores, kv_slices, kvslice, tree8, tree8_flags  # noqa: E402
 from recipes.dense_precision import q8_projections, ROLES  # noqa: E402
 from recipes.dense import one_context, stream_knobs  # noqa: E402
 from recipes.qwen36moe import BAND_ROWS, ELEM, band_bytes, roundup  # noqa: E402
@@ -176,6 +176,7 @@ def bt(total, off, n):
 
 
 ATTN_FLAGS = QR.attn_flags(G, QR.probe_env().items())
+ATTN_FLAGS.extend(hi_only_flags(SPEC))
 QKVB = G.QKVB
 QLOCAL = bool(G.QLOCAL)                                # attn.h ATTN_QLOCAL (Gemma 4): see _attn
 X_DEPTH = max(2, G.XN_ELEMS, G.XM_ELEMS)                # x elements the norms take in one go
@@ -237,6 +238,7 @@ if KVSL:
     if KV_SHARE > 1:
         ATTN_FLAGS.append("-DATTN_KVB_ALIGN=1")
     E_W = RB * 2 * KVS * G.HD * 2                      # one element: RB rows of [K slice | V slice]
+KW_DEPTH = int(os.environ.get("DX_KW_DEPTH", 2))           # probe: window ring depth
 ASTACK = TREE8_STACK if (T8 or KVC) else 0x1800
 WRING, WORDER = stream_knobs(SPEC)                     # OPEN-DECODE-STREAM
 ONE_CTX = one_context(SPEC)                            # the head runs on these cores, as a second stream
@@ -385,7 +387,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         of_lno = ObjectFifo(u8_ln, name="lno", depth=1)      # one output element at a time (8 KB elements at 4096 wide)
     of_ain = ObjectFifo(u8_a, name="ain", depth=max(4, 1 + NPTAB + 1) if KVSL else max(4, 2 * RB + 2, 1 + NPTAB + 1))   # a block is acquired at once
     # Two block elements: the DMA fills the next block while the core computes this one.
-    of_kw = [ObjectFifo(u8_w, name=f"kw{g}", depth=2) for g in range(len(KW_GROUPS))] if KVSL else []
+    of_kw = [ObjectFifo(u8_w, name=f"kw{g}", depth=KW_DEPTH) for g in range(len(KW_GROUPS))] if KVSL else []
     # Attention over ACORES cores: heads are independent, so each core owns NHL of
     # them and drains its own og element. Separate fifos + separate drains at
     # offsets is the pattern the GEMV cores already use below; a memtile join()
