@@ -5054,6 +5054,14 @@ CLEAN, one sitting, context capacity 16384 and 131072):**
   0.2). Bisect: full layers only and sliding layers only each give KL 0.011; hi / lo probabilities (`AF_PSPLIT`) 0.010. At
   16384 tokens, per-token NLL difference NPU - host by position: 0..2048 +0.049, 2048..4096 +0.065, 4096..8192 +0.030,
   8192..16383 +0.006 (each +/- 0.003 to 0.005): the cost does not grow with depth.
+  Gate (accepted 2026-11-20): for GPT-OSS the NPU attention passes when its per-position KL and top-token change rate
+  against host attention are no worse than llama.cpp's own spread between its KV types and back-ends on the same text
+  (NPU 0.01 / 4%; llama.cpp bf16 or f32 KV, or the CPU, against f16 KV on Vulkan: 0.022-0.032 / 4.3-5.5%), in place of
+  Granite's rule that flips occur only under a 0.2 top-2 margin.
+  End to end through phlegm (2026-11-20, bridge protocol 2 built from this branch, set `exp-runrb8`): `phlegm run`
+  answers the docstring prompt (speculative off and lookup give identical text); `phlegm serve` keeps the analysis
+  channel apart, reasoning effort low / high changes the reasoning (19 / 79 tokens, both "391"), and a tools request
+  returns `get_weather {"city":"Paris"}` with finish `tool_calls`, then answers from the tool result.
 
   Long context (2026-11-20, `exp-runyt2`, `--gemm-block`, a needle "The magic number is 48213" at a quarter of the depth in
   corpus filler, the chat template, greedy):
