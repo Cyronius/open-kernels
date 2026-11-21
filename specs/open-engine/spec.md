@@ -5062,6 +5062,20 @@ CLEAN, one sitting, context capacity 16384 and 131072):**
   answers the docstring prompt (speculative off and lookup give identical text); `phlegm serve` keeps the analysis
   channel apart, reasoning effort low / high changes the reasoning (19 / 79 tokens, both "391"), and a tools request
   returns `get_weather {"city":"Paris"}` with finish `tool_calls`, then answers from the tool result.
+  `phlegm bench --development` (2026-11-21; phlegm 1dc18d8, a development run, not a release result; bridge protocol 2
+  from this branch at 3d5b77f; set `exp-runrb8`; AMD Ryzen AI 9 HX PRO 370, 88 GiB, Windows 11 10.0.26200, NPU driver
+  32.0.20102.3930, NPU performance mode, AC power; 1 warmup + 3 runs, 128 output tokens, greedy, context 8192; report
+  `C:\models\gpt-ossench\gptoss20b-dev-20261121T010518.json`, sha256 43d01ca5...9127):
+
+  | input tokens | prefill tok/s | decode tok/s | first token ms |
+  |---|---|---|---|
+  | 512 | 224.31 | 11.66 | 2282.53 |
+  | 1024 | 276.12 | 11.42 | 3708.51 |
+  | 2048 | 294.81 | 11.11 | 6946.76 |
+  | 4096 | 295.81 | 10.66 | 13846.89 |
+
+  Past 4096 (the CLI, the needle runs): prefill 177 s at 32768 tokens, 548 s at 65534, 1882 s at 130500; decode 188 ms a
+  token at 32768 and 314 at 65534 (RB 4), 457 at 130500 (RB 8; the RB 8 step at 32768 rows is 167 ms).
 
   Long context (2026-11-20, `exp-runyt2`, `--gemm-block`, a needle "The magic number is 48213" at a quarter of the depth in
   corpus filler, the chat template, greedy):
