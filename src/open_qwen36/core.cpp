@@ -3263,6 +3263,16 @@ void Core::step_gemm_block_layer(int l, std::vector<double>& xres, size_t T, siz
     timing_.tail_ms += ms_since(th);
 }
 
+bool Core::gemm_block_pads_cache() const {
+    // the same test step_gemm_block_layer uses to pick dense_attention_block, the one path that caches only real rows
+    if (host_attn_on_ || in_host_decode_ || !attn_block_on_) return true;
+    for (int l = 0; l < nl_; ++l) {
+        const GemmBlockProgram& gb = types_[l]->gemm_block;
+        if (gb.kind != "dense" || !gb.attn_block.present() || gb.attn_block.prep.empty()) return true;
+    }
+    return false;
+}
+
 void Core::step_gemm_block(const std::vector<int>& ids, size_t t_real, bool want_logits) {
     apply_thread_budget();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_gemm_block before load_weights");
@@ -3276,14 +3286,10 @@ void Core::step_gemm_block(const std::vector<int>& ids, size_t t_real, bool want
     if (types_[0]->gemm_block.program.size() == 4)
         throw std::runtime_error("open_qwen36: step_gemm_block: the glu route (OPEN-PREFILL-BFP16-FFN) runs only on the "
                                  "layer-major schedule (step_gemm_prompt)");
-    // Positions [pos_, pos_+T) are all touched (padding columns included --
-    // hardware-proven exact: the real columns' output does not depend on
-    // what the padding columns carry), so the CAPACITY check must cover T,
-    // not just the real tokens -- even though only t_real of them advance
-    // pos_ afterward.
-    if (static_cast<size_t>(pos_) + T > cfg_.max_ctx)
+    const size_t rows = gemm_block_pads_cache() ? T : t_real;
+    if (static_cast<size_t>(pos_) + rows > cfg_.max_ctx)
         throw std::runtime_error("open_qwen36: gemm-block [" + std::to_string(pos_) + ", " +
-                                 std::to_string(pos_ + T) + ") would exceed the context capacity " +
+                                 std::to_string(pos_ + rows) + ") would exceed the context capacity " +
                                  std::to_string(cfg_.max_ctx));
     for (int tok : ids)
         if (tok < 0 || static_cast<size_t>(tok) >= w_->vocab) throw std::runtime_error("open_qwen36: token id out of range");

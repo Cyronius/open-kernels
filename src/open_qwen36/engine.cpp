@@ -170,17 +170,7 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
     if (payload == nullptr) {
         // Decode-as-prefill: exact for this architecture, one step per token, the
         // lm_head only for the last one (whose logits pick the first sampled token).
-        //
-        // 0167/#32: when the kernel set carries a GEMM-route prefill block
-        // (Core::step_gemm_block(), manifest.hpp's GemmBlockProgram) the prompt
-        // runs on it -- T tokens through every layer as whole-array bf16 GEMM
-        // dispatches (q4_1 dequantised on-core) instead of T sequential step()
-        // calls. On by default (#109); OFLM_OPEN_GEMM_BLOCK=0 turns it off. The
-        // whole prompt runs in GT-wide blocks, the tail padded with a repeated
-        // in-range id (hardware-proven exact: the real columns' output does not
-        // depend on the padding), never falling back to step(). A kernel set with
-        // no gemm_block program (GT == 0) runs exactly the sequential path this
-        // engine always has.
+        // A tail whose padding would write past the cache capacity runs sequentially.
         return guarded([&] {
             // Only =0 turns it off: unset, =1 or anything else leaves it on.
             // getenv_oflm, not getenv, so a pre-rename FLM_* export still works (#41).
@@ -205,14 +195,18 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
                 }
                 const size_t GT = core_->gemm_block_t();
                 if (GT > 0) {
+                    const size_t n_block = host::block_prefill_tokens(static_cast<size_t>(core_->position()),
+                                                                      ids.size(), GT, core_->max_ctx(),
+                                                                      core_->gemm_block_pads_cache());
                     size_t i = 0;
-                    while (i < ids.size()) {
-                        const size_t t_real = std::min(GT, ids.size() - i);
+                    while (i < n_block) {
+                        const size_t t_real = std::min(GT, n_block - i);
                         std::vector<int> block(ids.begin() + static_cast<long>(i), ids.begin() + static_cast<long>(i + t_real));
                         block.resize(GT, block.empty() ? 0 : block.back());  // pad the tail with a repeated in-range id
                         core_->step_gemm_block(block, t_real, i + t_real == ids.size());
                         i += t_real;
                     }
+                    for (; i < ids.size(); ++i) core_->step(ids[i], i + 1 == ids.size());
                     return logits_view();
                 }
                 // no route in this kernel set: fall through to the sequential path below

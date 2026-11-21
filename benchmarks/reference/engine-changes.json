@@ -27,7 +27,7 @@
       "id": "dense-layer-major-rope",
       "origin": "phlegm: dense_layer_major_ok also accepts the plain `rope` attention prep (MiniCPM5-2B: byte-identical logits, ~1.4x prefill)",
       "files": {
-        "src/open_qwen36/core.cpp": "d135e5aa41a6b4daea3149ab4b168bbc93553afb2ab48a4f098a6ce2b441d41b"
+        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb"
       }
     },
     {
@@ -41,9 +41,9 @@
       "id": "gptoss-runtime",
       "origin": "open-kernels: upstream-patches/gptoss-runtime.patch + gptoss-prefill-runtime.patch (GPT-OSS 20B decode route and block prefill; OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS), one hunk re-based over the kvslice 8-row message; OFLM #237's `small` -> `is_small` rename (rpcndr.h defines small on Windows)",
       "files": {
-        "src/open_qwen36/core.cpp": "d135e5aa41a6b4daea3149ab4b168bbc93553afb2ab48a4f098a6ce2b441d41b",
-        "src/open_qwen36/core.hpp": "3149acdfbe92cc455c27ec67166e4f6eb0a0f33bfa521c27b4046b962e3413c3",
-        "src/open_qwen36/engine.cpp": "d0b7390abdb7b3c23da677334f5d3dc88d81ddcb4008d29719334e8688555802",
+        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
+        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
+        "src/open_qwen36/engine.cpp": "c39bfc034a1c146989aab9d86e8c3c79bdcc482feaf06010b8caf885c76f8272",
         "src/open_qwen36/gguf_file.cpp": "8d3aa19338a55162aba13836541b1d0312ed67a2439a029730222ec98d572d3f",
         "src/open_qwen36/gguf_file.hpp": "61c4362f99ee9851efc1200452b6ca95beb2ab9142cba5e681df16c9c1b55c66",
         "src/open_qwen36/manifest.cpp": "25064b5c44d09dcc26023f41385384100e7da2f920a36d402c224a4b154701fc",
@@ -62,8 +62,8 @@
       "id": "gptoss-npu-prefill-attention",
       "origin": "open-kernels: gpt-oss block prefill attention on the NPU (attn_fa_gx: 64 heads, learned sink, runtime sliding window; manifest gptoss_prefill.attn_fa; the KV cache padded to the smallest compiled window past the capacity; OPEN-PREFILL-GPTOSS)",
       "files": {
-        "src/open_qwen36/core.cpp": "d135e5aa41a6b4daea3149ab4b168bbc93553afb2ab48a4f098a6ce2b441d41b",
-        "src/open_qwen36/core.hpp": "3149acdfbe92cc455c27ec67166e4f6eb0a0f33bfa521c27b4046b962e3413c3",
+        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
+        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
         "src/open_qwen36/manifest.cpp": "25064b5c44d09dcc26023f41385384100e7da2f920a36d402c224a4b154701fc",
         "src/open_qwen36/manifest.hpp": "d068a4ad51d9153e15d9d1d1117327310600435186ae27b85467e397e052fcf1"
       }
@@ -75,14 +75,14 @@
         "src/open_qwen36/CMakeLists.txt": "9620cd7fb6397d72947ffb42ff2605a7fea36df1a38f7f2a75ae77b52b01dcef",
         "src/open_qwen36/README.md": "5485b78a4dfc2e428060ae224995f531033ba3da3bd9dcafc0b5f112f7b78304",
         "src/open_qwen36/bfp16.hpp": "2cf80c3dc7d5cb3b5cc065f21ed558c2d19f3aa116728da2f93d129328319a23",
-        "src/open_qwen36/block_host.cpp": "1a2bd56227fb6d908d2d26a93f248592f3ba98f40608ed1c953769b0754c892e",
-        "src/open_qwen36/block_host.hpp": "faf9e5d90af75533e79b49979fea2b7bf0dc6efacab40697f375ac1e2dae33ea",
-        "src/open_qwen36/block_host_test.cpp": "a01a66c947b42d80b6bfbde4d55d7d081cded9b82240b4e3746d0af9e750ac04",
+        "src/open_qwen36/block_host.cpp": "8a1ff15e2a62391dcbca5e4171a2b99063e9698a2a1dd487ee5eda90dcc1548f",
+        "src/open_qwen36/block_host.hpp": "795dd158e839bef65d0c9d97e5d2eab1234dfcd1d6ce45702f2eae93302a4901",
+        "src/open_qwen36/block_host_test.cpp": "e5ac438a3936488da28967e3ec2835fd575629edc174739cecca73535f23334d",
         "src/open_qwen36/build.cmd": "5db5fb5a03083be6126e0d3b510f323abb6ca3fc32081dab05afc485ea018935",
         "src/open_qwen36/cli.cpp": "8325ab72656a595535db85d01058c38d5cf802efb2dc7be5a584270c8ec5dd0b",
-        "src/open_qwen36/core.cpp": "89033d5f9367ee69ddccdbf6bb867efd79960128f4aac7019b940405b0180268",
-        "src/open_qwen36/core.hpp": "f9d1070c849fc7dee4a0261803e613fd4bba3108cdeefdb1049f08d2c97564ce",
-        "src/open_qwen36/engine.cpp": "2044bf9b39f0abec67b9b431e06f31bdfac29fd414d17c9d43baadff9d83f25d",
+        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
+        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
+        "src/open_qwen36/engine.cpp": "c39bfc034a1c146989aab9d86e8c3c79bdcc482feaf06010b8caf885c76f8272",
         "src/open_qwen36/engine.hpp": "9630346c7d6481998813f68670324cfbfea6412113783376561d6e4472ff1b21",
         "src/open_qwen36/gguf_file.cpp": "cc2de29f765a353eb3b08e36be111ae08b6da00abc1697ca6159b902b60fe3e3",
         "src/open_qwen36/gguf_file.hpp": "5123a7a0b3916f87fc68c0ccb9371505cf4757168de6e2f883e0b145ed5bb236",
@@ -101,18 +101,18 @@
       "id": "granite-npu-speed",
       "origin": "open-kernels feat/granite-production-bar: OPEN-PREFILL-BFP16-QKV (pack op ksplit 3, step a split3, host::bfp16_pack_a_split3, bfp16_decode_block / bfp16_encode_hilo), a window of OFLM_OPEN_ATTN_FA_MIN (512) rows or fewer takes the host attention, norms by reciprocal multiply",
       "files": {
-        "src/open_qwen36/core.cpp": "9c323ee63341b4a3c3f547f7808cac0618cc9c3830e68123cb8255b0d6e22c3d",
-        "src/open_qwen36/core.hpp": "33a56897147042cd5767d0a8fa543600c5bc0752625eb3fc13404c6d8377d516",
+        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
+        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
         "src/open_qwen36/manifest.cpp": "165582a375cbfd3e3af3cf6b1b825d566c53e7f223c1df9839f0cfd1da2dd8fb",
         "src/open_qwen36/manifest.hpp": "2bdc68fd7918e2544262b4c0072096bce2e181e7177e981fc5884975716cfc40",
         "src/open_qwen36/pools.cpp": "f24f7960e567d46e3f0d308218d17abf6224bdc32f45a3741e4c4fd7a1de7c93",
         "src/open_qwen36/pools.hpp": "8532f9439bcc869001d9d99a61eaedfe1aff653b0befb816afc471e0ada79d3e",
-        "src/open_qwen36/block_host.cpp": "d305ca7299f2a9a1f82bf7a98b12446a93f1c6da3513c7df6a9295964cf84ccc",
-        "src/open_qwen36/block_host.hpp": "e8b0b0fa7249a0c1733cae44af3b1c549c256a3ca538b1a27b64708aa880002a",
+        "src/open_qwen36/block_host.cpp": "8a1ff15e2a62391dcbca5e4171a2b99063e9698a2a1dd487ee5eda90dcc1548f",
+        "src/open_qwen36/block_host.hpp": "795dd158e839bef65d0c9d97e5d2eab1234dfcd1d6ce45702f2eae93302a4901",
         "src/open_qwen36/bfp16.hpp": "2b4f3a9308ca0f2c745dc1ac51817e0bdeb480dee47318b19b465328db227792",
         "src/open_qwen36/manifest_test.cpp": "495acccbc5d7f2114bd37bccfacd3650b468d6da150be4ec5975ad84a1b97ba8",
         "src/open_qwen36/pools_test.cpp": "bc8c6531341606c23986d0c3c7b6f32f5f5562a81582844603a782d57983ecca",
-        "src/open_qwen36/block_host_test.cpp": "e30a49e204b121ceb940ebd7b85065d9b5f637011df32137d8af74993694a0b9"
+        "src/open_qwen36/block_host_test.cpp": "e5ac438a3936488da28967e3ec2835fd575629edc174739cecca73535f23334d"
       }
     }
   ]

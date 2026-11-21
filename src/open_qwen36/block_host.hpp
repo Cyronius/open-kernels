@@ -201,5 +201,7 @@ void softmax_chunk_sum(size_t M, size_t L, size_t hd, size_t c0, const float* hi
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
                   int32_t* idx, float* w);
 
+size_t block_prefill_tokens(size_t pos, size_t n, size_t gt, size_t max_ctx, bool pads_cache);
+
 }  // namespace host
 }  // namespace open_qwen36
