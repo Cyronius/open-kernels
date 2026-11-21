@@ -5396,6 +5396,25 @@ CLEAN, one sitting, context capacity 16384 and 131072):**
   Past 4096 (the CLI, the needle runs): prefill 177 s at 32768 tokens, 548 s at 65534, 1882 s at 130500; decode 188 ms a
   token at 32768 and 314 at 65534 (RB 4), 457 at 130500 (RB 8; the RB 8 step at 32768 rows is 167 ms).
 
+#### Production bar (AGENTS.md, OFLM #240): gpt-oss:20b
+
+Audited 2026-11-21 on the in-tree engine, branch `gptoss-att8`, through phlegm (bridge protocol 2). Source: ggml-org's
+`gpt-oss-20b-MXFP4.gguf` run directly (no q4nx step). Kernel set `exp-runrb8` (merged one-image decode, 16 attention
+cores with KV windows, 8-row decode attention, 68 `attn_fa_gx` prefill streams to 131,072 rows). Machine: HX PRO 370,
+88 GiB, Windows 11, NPU performance mode, mlir-aie 1.4.2.
+
+| Bar item | State | Evidence |
+|---|---|---|
+| Block prefill | Done. `gemm_bfp16` q\|k\|v / o, experts on their MXFP4 GEMM, attention on the NPU (`attn_fa_gx`) to 131,072 rows; host fallback `OFLM_OPEN_GPTOSS_ATTN=host` | OPEN-PREFILL-GPTOSS, NPU prefill attention |
+| Near optimal | Profiled, the rest named. Decode 82-84 ms at short context against ~70 ms at the measured stream rate (attention phases, mx4 epilogue, host router, padding). At depth the decode attention walk is compute-bound: 409 ms a step at 131,071 rows against a 170 ms window-stream floor (`ATTN_NULL`). Prefill: attention is 59-84 % past 32k (quadratic) | decode probes, decode attention at depth |
+| Real context | Done. 131,072 capacity; the needle answers at 32,768, 65,534 and 130,500 prompt tokens | needle table |
+| All on the NPU | Done with named host stages. Decode: the router between the two halves (3 ms a token). Prefill: MoE prep, GEMM collect, packing, residual / norm tail, rotation: 21 % at 32k, 8 % at 130k | long-context table |
+| Drafter | Measured rejection. Prompt lookup through a rows pass (1.6 decode steps for 2 tokens; +11-14 % at best on repetitive text) and DFlash (2.67 tokens a cycle offline; at most 1.05-1.35x once the verify pass and the drafter are counted). EAGLE3 not tried | rows pass, DFlash |
+| Quantized | Done. ggml-org MXFP4 GGUF; the experts are MXFP4 in every source, Unsloth's other tensor types are not read by `gx` | quant reason |
+| Benchmarks | `phlegm bench --development` (not a release result): prefill 224 / 276 / 295 / 296 tok/s and decode 11.7 / 11.4 / 11.1 / 10.7 tok/s at 512 / 1k / 2k / 4k | bench table |
+| Features | Text-only model. Through `phlegm serve`: the analysis channel kept apart, reasoning effort low / high, a tool call and its result. No vision, audio or MTP heads exist | end-to-end check |
+| Quality | 32 of 32 greedy tokens equal llama.cpp's; perplexity at 4096 +1.3 % to llama.cpp without one unstable chunk (+4.8 % with it, where the fp32 reference sides with the engine); NPU attention within llama.cpp's own KV-type spread (the accepted gate) | YaRN, gap analysis, gate |
+
   Long context (2026-11-20, `exp-runyt2`, `--gemm-block`, a needle "The magic number is 48213" at a quarter of the depth in
   corpus filler, the chat template, greedy):
 

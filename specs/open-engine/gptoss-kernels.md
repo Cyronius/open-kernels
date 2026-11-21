@@ -1,7 +1,10 @@
 # GPT-OSS 20B NPU kernel source progress
 
+**2026-11-21:** the production-bar audit is in `spec.md` (OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b"): one
+merged decode image, NPU prefill attention to 131,072 rows, `phlegm bench` numbers.
+
 **2026-10-31: superseded as the running route.** GPT-OSS 20B now runs from ggml-org's GGUF
-through `recipes/gptoss.py` (two dispatches a layer, `designs/gptoss/gx.py`, the router on the
+through `recipes/gptoss.py` (two dispatches a layer then, `designs/gptoss/gx.py`, the router on the
 host) on the open runtime and through `phlegm run` / `serve`; OPEN-FAMILY-GPTOSS in
 `spec.md` has the design, procedure and results. The per-op images below read the FLM q4nx
 container (~986 dispatches over 13 contexts a token) and remain as standalone arithmetic

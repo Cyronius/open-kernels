@@ -22,7 +22,7 @@ Update this file in the same commit as the evidence. Each model's full audit is 
 | BERT embeddings (bge x3, minilm, nomic, gte) | ? | ? | ? | ? | n/a | ? | not started |
 | whisper-v3:turbo | ? | ? | ? | open (decoder on host) | ? | ? | not started |
 | qwen3.6-moe:35b-a3b | ? | ? | open (32k test) | ? | open (DFlash planned) | ? | not started |
-| gpt-oss:20b | ? | ? | open | ? | open | ? | not started (OFLM #237) |
+| gpt-oss:20b | done (`attn_fa_gx` to 131k) | done, rest named (decode 82-84 ms short; 409 ms a step at 131k, compute-bound over a 170 ms stream floor) | done (needle at 130,500) | done (host stages named) | done (measured rejection: prompt lookup, DFlash) | done (ggml-org MXFP4 GGUF) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GPTOSS); bench is a development run |
 | qwen3.5:4b (or :9b) | ? | open (prefill numbers) | open | ? | open | open | not started |
 | Ternary Bonsai 2 27B | ? | ? | open (8k of 262k) | ? | done (DFlash 2 + lookup) | open (reads PQ2_0 via q4nx-build) | not started; work not on main |
 
@@ -68,6 +68,22 @@ The text work is in OFLM draft #238 and is not in this repo yet. The model is no
 - OFLM side: registry entries with mmproj and drafter; video request shape; thinking-on answer
   lost to reasoning; tool calling on the open path; benchmark page.
 
+### gpt-oss:20b
+
+Audit: `spec.md` OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b" (2026-11-21). Branch `gptoss-att8`.
+
+- Done: ggml-org's MXFP4 GGUF runs directly; decode is one merged core image (attention and experts, 16 attention cores
+  with KV windows, 8-row blocks); prefill attention on the NPU (`attn_fa_gx`: 64 heads, learned sink, runtime window)
+  to 131,072 rows; the needle answers at 32k, 65k and 130.5k; YaRN ramp bounds as llama.cpp's; 32 of 32 greedy tokens
+  equal llama.cpp's; `phlegm run` / `serve` with reasoning effort and tool calls; host stages named.
+- Speed (`phlegm bench --development`, 2026-11-21): prefill 224 / 276 / 295 / 296 tok/s and decode 11.7 / 11.4 / 11.1 /
+  10.7 tok/s at 512 / 1k / 2k / 4k. Prefill 177 s at 32k, 1882 s at 130.5k; decode 457 ms a token at 130.5k.
+- Drafter: rejected with measurements. A rows pass costs 1.6 decode steps for 2 tokens (expert unions); DFlash accepts
+  2.67 tokens a cycle offline. EAGLE3 not tried.
+- Open (optional): decode attention at depth (`ATTN_G5` cuts the step 28 % but gives wrong logits at this shape); a tagged phlegm release
+  for a publishable bench report.
+- OFLM side: registry entry (MXFP4 GGUF, gptoss, 131,072); `oflm add` / `serve` / `bench`; benchmark page; README row.
+
 ### Others
 
 Not audited. Local evidence to start from:
@@ -76,8 +92,6 @@ Not audited. Local evidence to start from:
   [flm-kernel-matrix.md](specs/open-engine/flm-kernel-matrix.md).
 - qwen3.6-moe:35b-a3b: OPEN-FAMILY-QWEN36MOE-GGUF;
   [dflash-drafters.md](specs/open-engine/plans/dflash-drafters.md).
-- gpt-oss:20b: OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS;
-  [gptoss-kernels.md](specs/open-engine/gptoss-kernels.md).
 - qwen3.5:4b / 9b: OPEN-FAMILY-QWEN35;
   [qwen35-remaining-sizes.md](specs/open-engine/plans/qwen35-remaining-sizes.md).
 - Ternary Bonsai 2 27B: OPEN-QUANT-T2, OPEN-CONVERT-PRISM-TERNARY;
