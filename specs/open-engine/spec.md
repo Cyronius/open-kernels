@@ -517,7 +517,8 @@ of one kv head share every K and V row they load, and give logits byte-identical
   (`dxl_attn_skipw`), so `dxl` stays bit-identical to `dx`.
 - **4 cores a kv head (`KVCORES` 4)** for the shapes in `KVCORES4_MEASURED`, keyed by (family, heads, kv heads, head dim) so
   a family's other shapes keep their kernels: a kv head's query heads split evenly over 4 cores (MiniCPM5-2B, 16 over 2 at
-  head dim 128: 8 cores of 2 heads on row 4, attn.h `ATTN_G5` at `ATTN_NHL=2`, the original exponential, `ATTN_EXPA=0`).
+  head dim 128: 8 cores of 2 heads on row 4, attn.h `ATTN_G5` at `ATTN_NHL=2`). MiniCPM5-2B's later defaults, the fused
+  exponential and the 8-row block-only walk, are not bit-identical. They are gated in OPEN-FAMILY-MINICPM5.
   Each kv head is its own window stream (`KVS` 1, two streams read by 4 cores each); kv heads share a stream in pairs only
   when one stream a kv head would need more free shim channels than there are (Granite, Gemma 4 unchanged).
 - Probe variables (OPEN-ATTN-CONTEXT): `ATTN_KVSLICE`, `ATTN_DXL_KVSLICE`, `ATTN_KVCORES` (0 / 1 / 2 / 4), `ATTN_G5_PVROLL`.
@@ -574,6 +575,50 @@ Plain decode, 128 tokens after N tokens of context (`--gemm-block` prefill; N = 
 - Gates on the shipped set (KVCORES 2): the logit files 22 of 22 byte-identical at 70 + 20 and 2100 + 20, and on the
   GGUF-direct route (`dx_f32`, a model dir holding only `granite-4.2-3b-Q4_1.gguf` as `model.gguf`) at 70 + 20 and 300 + 20;
   the 10 greedy prompts identical; `--rows-check 17` ROWS PASS at 70 / 1030 / 2060.
+
+### OPEN-ATTN-HI-ONLY: Granite's decode attention takes q and p as one bf16 each
+**Applies to:** open-kernels (`open_kernels/designs/attn/attn.h` `ATTN_HI_ONLY`, `recipes/attnknobs.py`
+`HI_ONLY_MEASURED` / `hi_only_flags`, `designs/dense/dx.py`, `designs/dxl/dxl.py`)
+**Verification:** test (the knob: `tests/test_attn_geometry.py::test_hi_only_is_granite_only_and_the_probe_overrides_it`);
+manual (the hardware procedure below)
+
+For a family in `HI_ONLY_MEASURED` (Granite), `dx` and `dxl` shall compile attn.h with `ATTN_HI_ONLY=1`: q and every p
+are one bf16 each. The q prep writes q's lo half as zeros and every p split stores a zero lo, so each scorer's hi +
+lo sum is the hi product alone and `dxl` stays bit-identical to `dx`. The G5 block kernel skips the zero halves'
+MACs. `ATTN_HI_ONLY=0` at export gives the hi / lo kernel back; `2` drops p's lo half only (a probe).
+
+Why: past a few thousand rows decode is the attention arithmetic, not its stream. An `ATTN_NULL` build at 32768 took
+107.7 ms a step against 167.1, and a deeper window ring (`DX_KW_DEPTH` 3 and 4) changed nothing. The `ATTN_ABL`
+builds put the scores at 109.1 ms (hidden under the stream), scores and softmax at 152.7, all of it at 167.5.
+
+**Acceptance criteria (manual):**
+- `--rows-check 17` prints ROWS PASS.
+- 32 decoded tokens after 2048- and 8192-token prompts: the same greedy tokens as the hi / lo kernel, and the same
+  top-1 at every step.
+- Decode faster at 8192 and 32768, `dibs run --measure` CLEAN.
+
+**Result 2026-11-19 (HX PRO 370, IBM's Q4_1 GGUF):**
+- ROWS PASS; greedy identical at 2048 and 8192, top-1 32 of 32. Logit corr against the hi / lo kernel: min 0.999908 at
+  2048; at 8192 min 0.995000 at one step (KL 0.0069, top-2 margin 5.28), the other 31 steps 0.9998 or more. With p
+  alone in bf16 that step is 0.997157, so q and p both move it.
+- `--bench-step 20` wall time a step, min (one unit, CLEAN): 8192: 65.8 ms against 73.4 (p alone 71.2); 32768: 137.2
+  against 167.2 (p alone 158.9), 1.22x.
+- With `ATTN_HI_ONLY` the exponential is ATTN_EXPA 3's (`attn_expa`: x + 1.5 * 2^23 rounding in fp32, single bf16
+  Horner products; ATTN_EXPA 2's polynomial): 8192: 63.3 ms against 65.8; 32768: 128.0 against 137.1. `dxl`'s scorer
+  (`attn_score2g`) and its value pass skip the zero halves too: ROWS PASS, SPEC IDENTICAL on the four prompt-lookup
+  prompts at 2000 and 8000.
+- `ATTN_G5_MMUL=1` (a probe, off): the block scores as bf16 8x8x4 mmuls, S^T = K . Q^T, with Q^T built at a token's
+  first block. In `dxl`'s 8-head cores a group of 4 heads that spans two kv heads runs one mmul set a kv head with the
+  other's Q^T columns zero, so each head gets `dx`'s sums plus exact zeros: ROWS PASS, SPEC IDENTICAL. Decode (one
+  unit, CLEAN): 32768 120.9 ms against 128.1, 8192 61.6 against 63.5, 2048 46.7 against 47.1. Rolled to fit `dxl`'s
+  program memory (unrolled it overflows the 16 KB), the verify pass got slower: quote at 8000 1.21x against 1.81x,
+  at 2000 2.01x against 2.29x. Not the default for that reason. `ATTN_T8_MMUL_U=2` and `ATTN_T8_MMUL_FIX2=1` (two
+  sets a group always) brought the verify pass at 8000 to 144 and 132 ms (v4 113; spec 1.38x and 1.48x against 1.83x),
+  still behind; unroll 4 overflows program memory.
+- Against llama.cpp's top 10 over 32 teacher-forced steps (OPEN-FAMILY-GRANITE's production bar), every variant sits
+  at the same distance: RMS deviation at 8192 0.298 (hi / lo), 0.278 (bf16 q and p), 0.272 (with ATTN_EXPA 3). The
+  one step where the hi / lo kernel was nearer the reference (0.32 against 0.90 / 1.51) is offset by steps where it
+  is farther (its worst |d| 3.52 against 1.53 / 1.50).
 
 ### OPEN-ATTN-BLOCK8: Granite's attention takes 8-row blocks and a cheaper exponential
 **Applies to:** openflowlm-next (`open_kernels/designs/attn/attn.h` `ATTN_RB`, `ATTN_EXPA`, `recipes/attnknobs.py` `BLOCK8_MEASURED`, `src/open_qwen36/manifest.cpp`)
@@ -1792,42 +1837,8 @@ the `llama_npu` DLL for both.
 
 **Result 2026-09-06 (Llama-3.2-3B-NPU2 and Llama-3.2-1B-NPU2):** both 3.2 shapes' first hardware run, and both containers materialise `lm_head.weight` despite `tie_word_embeddings: true`, as the acceptance criteria above assume. **3B** (3072 / 28 / 8192, 24 query heads over 8 kv heads -- GQA group 3, the first odd group, `OG_AOUT_ELEMS` 3): step 2 logits corr 0.999998 / 0.999995, argmax 2 / 2 matching the fp64 replica with top-5 identical at both positions, residual corr 1.000000 in all four layers at t0 and >= 0.999996 at t1, maxrel <= 5.3e-3; step 3 through the engine bit-identical to step 2 and reproduced; step 4 a coherent answer ending in `<|eot_id|>` at token 72 (334 ms/token). **1B** (2048 / 16 / 8192, head_dim 64 -- `E_A` 1024, `KV_ROW` 2048, `PTAB_ROW` 1024, one KV band per core, a 768-byte RoPE record in a 1024-byte position row): step 2 logits corr 0.999999 / 0.999994, argmax 1757 / 1757 matching, top-5 identical at both positions, residual corr 1.000000 in all four layers at t0 and >= 0.999996 at t1, maxrel <= 2.4e-3; step 3 bit-identical and reproduced; step 4 `<|eot_id|>` at token 92 (262 ms/token). The 1B is the run that decides head dim 64, since a wrong q/k rotation there gives fluent nonsense rather than a crash: position 0 does not rotate and position 1 does, and both are clean in every layer, so the rotation is right. Together these admit `gemv_q4` K = 3072 and K = 8192, `ln` width 3072, `lm_head_q4` K = 3072 and the attention combinations (128, 24, 8, 128, False, False, False) and (64, 32, 8, 64, False, False, False). Note `chat.py`'s default `--max-tokens 64` truncates both models mid-sentence; 200 is enough. Details: `.claude/plans/k-new-points-results.md`.
 
-**MiniCPM5-2B (2026-11-10).** `openbmb/MiniCPM5-2B` is a plain `LlamaForCausalLM`: 2048 / 42 / 6144, 16 query heads
-over **2** kv heads at head_dim 128 (GQA group 8), theta 5e6, eps 1e-6, no scaling, an untied 130560-row head. #85's spec
-said 8 kv heads, a shape the checkpoint does not have; the spec now says 2 and the attention tuple
-`(128, 16, 2, 128, False, False, False)` is new in the catalogue (the kv-8 tuple stays, #85's pass validated it).
-**Q/k row order:** llama.cpp's converter stores a Llama-arch GGUF's q and k rows paired for
-interleaved RoPE (`reshape(h, 2, hd/2).swapaxes`); the kernels rotate half-split pairs. `std_perm_gguf` undoes the
-pairing for `general.architecture == "llama"` q and k tensors, per head (`head_count` for q, `head_count_kv` for k), at
-pack time, in both GGUF row readers (`std_perm_gguf` and `bfp16_gemm`). Without it the model is fluent and wrong ("We need to be careful with our environment." for "What is the capital
-of France?", then a loop). The change is in the in-tree engine, `src/open_qwen36/pools.cpp`, recorded in
-`benchmarks/reference/engine-changes.json` (`gguf_pack_test` case: row-for-row against the permutation). Other archs are untouched; Granite's GGUF is not changed.
-
-**Result 2026-11-10 (MiniCPM5-2B, bartowski Q4_1, Strix Point, Windows, mlir-aie 1.4.2):** `dx` program memory 14192 of
-16384 B; spec hash `sha256:cb630a529a48`. Stock GGUF, one request: `<think>` block, then "The capital of France is Paris."
-and `<|im_end|>`, identical to llama.cpp (`-ngl 0 --temp 0`) for the whole 221-character answer; decode 19-21 tok/s (47-52 ms
-a token, development machine). A second prompt (a Fibonacci function) is coherent on both but diverges at the first token
-("The user asks" against "We need to respond"), a tie not investigated. **Not run:** the fp64 replica slice
-(`make_decode.py` reads only a q4nx container) and `flm-test`; the new attention tuple is in the catalogue on the strength of the
-two-request llama.cpp match and the unit test, not the OPEN-FAMILY-QWEN3 slice procedure. `chat.py` does not know MiniCPM's
-`<|im_start|>` template; the runs above pass token ids to `open_qwen36_cli`.
-
-**Decode attention, 2026-11-15 (MiniCPM5-2B, O7; Strix Halo, Linux, in-tree engine, compact GGUF set, development runs under the
-npu lease, host load ~15 from other sessions):** the 4-core head split broadcast both kv heads to every core and gave each core
-4 heads. `KVSLICE` alone (4 cores, one kv head each) and then `KVCORES` 4 (8 cores of 2 heads, OPEN-ATTN-KVSLICE) were measured
-in two alternating rounds of 31 decode tokens after 993-, 8191- and 16320-token prompts (`open_qwen36_cli --gemm-block`, OMP 16):
-
-| context | shipped (4 cores, broadcast) | `KVSLICE` | `KVCORES` 4 |
-|---|---|---|---|
-| 1k | 70 / 65 ms | 53 / 64 ms | 48 / 45 ms |
-| 8k | 160 / 170 ms | 137 / 134 ms | 95 / 92 ms |
-| 16k | 278 / 288 ms | 231 / 231 ms | 157 / 146 ms |
-
-The context slope goes from about 14 to 6.8 us a cached position; at 16k the 42 layers take 139 ms against 277 (the head
-7-9 ms in both). Greedy tokens are identical to the shipped kernel in all twelve runs, and the logits of 256 forced decode
-steps after 4352- and 16320-token prefixes are byte-identical to it (fp32 torch reference, same for both: median cos
-0.999871 / 0.999850, argmax 250 / 244 of 256, loss ratio 0.9997 / 1.0004); forced decode 99.5 -> 65.8 ms at 4352 and
-284 -> 152 ms at 16320. `dx` program memory 13616 of 16384 B. The shape joined `KVCORES4_MEASURED` on this evidence.
+**MiniCPM5-2B** is a Llama 3 shape with 2 kv heads, run from its own GGUF. Its requirement, acceptance bar and results are
+OPEN-FAMILY-MINICPM5.
 
 **Nanbeige4.1-3B (2026-09-10).** Declares `model_type: llama` and is one for the
 recipe: 2560 / 32 / 10752, 20 query heads over 4 kv heads at head_dim 128 (GQA group
@@ -2742,7 +2753,7 @@ originals under `q4nx_folded_multipliers`.
 
 **Acceptance criteria (unit):**
 - HF and GGUF derivations agree; the RoPE table is the plain unscaled `1e7^(-2i/64)`; `rope_scaling` and tied embeddings are refused by name.
-- An unfolded `attention_multiplier`, or any of the other three unequal to 1.0, is refused by name and names q4nx-build as the fix â€” from HF `config.json` and from GGUF metadata alike.
+- An unfolded `attention_multiplier`, or any of the other three unequal to 1.0, in a q4nx container's `config.json` is refused by name and names q4nx-build as the fix. An unfolded GGUF is folded at load instead (OPEN-GGUF-GRANITE-FOLD).
 - `hf_config_check` carries `attention_multiplier`, so the **engine** refuses an unfolded container at load, not only the recipe at generation.
 - The 3B layout: `PER_CALL 2`, `TAB_BYTES 18432` (the K = 8192 table), `ELN 5120`, `E_A 1024`, `KV_ROW 2048`, `PTAB_ROW 1024`, `LMHEAD_BANDS 1568`; one `dx` step per layer plus the `dxh` tail in `dx`'s context (OPEN-DECODE-ONE-CONTEXT-DENSE; the GGUF-direct section keeps `ln` + `lm`).
 
@@ -2790,6 +2801,167 @@ dispatches â€” 1.16Ã—, the direction one dispatch per layer was expected
 Everything above that is the context term, and it is **not** Granite's: see
 OPEN-ATTN-CONTEXT below. Decode measured 5.92 tok/s over 63 tokens because the
 context grew underneath it, not because the family is slow.
+
+#### Production bar (AGENTS.md, OFLM #240)
+
+Audited 2026-11-19 on the in-tree engine (`src/open_qwen36`, the phlegm runtime, with OFLM #209's Granite work ported).
+Source: IBM's `ibm-granite/granite-4.2-3b-GGUF` `granite-4.2-3b-Q4_1.gguf` (revision `c40945d`), run directly as
+`model.gguf` beside IBM's `config.json` and `tokenizer.json`, with no q4nx step (OPEN-GGUF-GRANITE-FOLD,
+OPEN-GGUF-BASE-VIEW). Kernel set: `export_qwen36_kernels.py --max-ctx 131072` (`g131072`, 47 `attn_fa` streams).
+Machine: HX PRO 370, NPU performance mode, mlir-aie 1.4.2, Windows. Timings are from one `dibs run --measure` unit
+(CLEAN before and after; control pp512 2236 / 2267 ms) unless marked otherwise.
+
+| Bar item | State | Evidence |
+|---|---|---|
+| Block prefill | Done. Both GEMM routes with `attn_fa` on every window up to 131,072 | OPEN-PREFILL-ATTN-FA, long windows |
+| Near optimal | Decode at its weight-stream floor at depth 0, within 5 % of the floor at 2k and 9 % of the measured stream at 8k; 19 % over the stream at 32k. Prefill NPU-bound to 8k (GEMMs at the bfp16 rate), attention-bound past it. 2.2-2.9x the old default, 0.89-1.07x Vulkan. What bounds each remainder: "What is left" | the 2026-11-19 speed tables |
+| Real context | Done. 131,072 capacity; runs complete at 120k and 130k. Needle answers match llama.cpp to 64k at every depth on the default route | needle table |
+| All on the NPU | Done with named host stages. Decode: all on the NPU. Prefill: the host stages in the table below | host stages |
+| Drafter | Done. Prompt lookup ships (OPEN-SPEC-LOOKUP); SPEC IDENTICAL at 2k / 8k / 32k. Uno rejected for the default (OPEN-FAMILY-GRANITE-UNO) | drafter table |
+| Quantized | Done. IBM's own Q4_1 GGUF (no Unsloth GGUF exists, checked 2026-11-18); the Q6_K head is requantized to q4_1 at load | OPEN-GGUF-BASE-VIEW |
+| Features | Text-only model; thinking toggle done. Reasoning parse and tool calling are OFLM app code | this requirement |
+
+**Speed after the 2026-11-19 work (kernel set `g131072_v4`; one `dibs run --measure` unit, CLEAN before and after,
+control pp512 on the old set 2216 / 2225 ms; prefill at 512 and 2048 the median of 3 alternating runs).** The default
+route is OPEN-PREFILL-BFP16-QKV's (bfp16 with a three-term qkv), `attn_fa` with exp2c (OPEN-PREFILL-ATTN-FA), decode
+attention with bf16 q and p (OPEN-ATTN-HI-ONLY). Floors are computed: 2.13 GB of weights and 80 KiB of KV a position
+at about 52 GB/s (R-0012), and the `ATTN_NULL` build's measured window stream (107.7 ms at 32768).
+
+| | 512 | 2048 | 8192 | 32768 |
+|---|---|---|---|---|
+| Prefill, tok/s: old default (bf16 route) | 226 | 248 | 194 | 103 |
+| Prefill, tok/s: this default | 666 | 727 | 428 | 162 |
+| Prefill, tok/s: llama.cpp Vulkan | 747 | 680 | 457 | 157 |
+| Decode step at depth 0 / 2048 / 8192 / 32768, ms: old | 41.8 | ~50 | 73.2 | 167.1 |
+| Decode step, ms: this default (`--bench-step 20` min) | 41.7 | 47.2 | 63.3 | 128.2 |
+| Decode step, ms: DDR floor | ~41 | ~45 | ~54 | ~93 (stream measured 107.7) |
+| Decode, tok/s: llama.cpp Vulkan (depth 0 / 2048 / 8192 / 32768) | 33.5 | 30.7 | 26.0 | 11.2 |
+
+The six needle prompts below give this default the old route's margins (64k, 10 %: -0.80; 64k, 50 %: -0.25; 64k,
+90 %: -0.10; 32k: -0.06 / -0.13 / -0.001), all six answers '7319-KESTREL-42'. Outside `--measure` 64,000 tokens
+prefill in 704 s (was 995) and 32,000 in 194 s (was 307). Prompt lookup on this set is SPEC IDENTICAL: quote 2.30x at
+2000 and 1.80x at 8000, summarize 1.05x and 0.95x. Logits against llama.cpp's top 10 over 32 teacher-forced decode
+steps after 2048 and 8192 tokens: RMS deviation 0.265 / 0.251 (the old kernels 0.260 / 0.298), greedy identical.
+
+**Speed against llama.cpp Vulkan before that work (same machine, same GGUF, `llama-bench -fa 1 -r 2`, build
+2459f68b5), tok/s:**
+
+| | 512 | 2048 | 8192 | 32768 |
+|---|---|---|---|---|
+| Prefill, bf16 route (default `fast`) | 226 | 248 | 194 | 103 |
+| Prefill, bfp16 route (`--prefill-mode bfp16`) | 715 | 730 | 396 | not run |
+| Prefill, Vulkan | 747 | 680 | 457 | 157 |
+| Decode at that depth, NPU | 22.6 | 19.9 | 13.5 | 5.94 |
+| Decode at that depth, Vulkan | not run | 30.7 | 26.0 | 11.2 (+-4.0) |
+
+Decode at depth 0: NPU 23.6, Vulkan 33.5 tok/s. Outside `--measure`, the default route took 995 s to prefill 64,000 tokens
+and decoded at 3.45 tok/s there; the bfp16 route took 3482 s at 120,000 (1.95 tok/s) and 3414 s at 130,000 (1.83 tok/s).
+KV is bf16, 80 KiB a token: 10 GiB at 131,072 (computed, under R-0005's ~26 GiB).
+
+**Long-context quality (needle: a vault code planted in repo text, greedy; log-probability of the answer's first token
+'73').** llama.cpp Vulkan (f16 KV) is the reference.
+
+| Prompt, depth | NPU bf16 route | NPU bfp16 route | llama.cpp | llama.cpp, bf16 KV |
+|---|---|---|---|---|
+| 32k, 10 % | -0.11 | -0.18 | -0.16 | |
+| 32k, 50 % | -0.13 | -0.13 | -0.21 | |
+| 32k, 90 % | -0.001 | -0.001 | -0.002 | |
+| 64k, 10 % | -0.80 | **-1.87, wrong answer** | -0.24 | -0.52 |
+| 64k, 50 % | -0.23 | -0.24 | -0.27 | |
+| 64k, 90 % | -0.10 | -0.12 | -0.40 | |
+
+At 32k with the needle at 30 % depth the reference itself is a near tie ('73' -1.45, '000' -1.57); both NPU routes pick
+'000'. At 120k llama.cpp answers "N/A" and both NPU runs say there is no code: the model's own limit. The bf16 KV cache
+costs llama.cpp 0.28 nats at 64k / 10 %; the bfp16 route loses 1.1 nats more there. Use the default route past 32k.
+
+**Prompt lookup at depth** (`--spec 128`, adaptive, bf16 route; every run SPEC IDENTICAL; outside `--measure`):
+
+| Prompt | 2000 | 8000 | 32000 |
+|---|---|---|---|
+| Quote the last section verbatim | 2.28x | 2.00x | 1.52x |
+| Summarize in five sentences | 1.06x | 0.95x | 1.00x |
+| Verify pass / decode step | 1.5x | 1.8x | 2.1x |
+
+**Host stages, bf16 route** (ms of the prompt; the GEMM and `attn_fa` waits are NPU time):
+
+| Stage | 2048 tokens (8263 total) | 32768 tokens (318890 total) |
+|---|---|---|
+| `attn_fa` dispatches (NPU) | 1274 | 212544 |
+| Tail (residual, norms) | 686 | 10731 |
+| GEMM transposes | 640 | 10128 |
+| GEMM tile | 426 | 6834 |
+| Sync | 237 | 3765 |
+| Q pack + sync | 152 | 2190 |
+| Prenorm | 79 | 1109 |
+| RoPE + KV write | 63 | 874 |
+| Other | 154 | 2538 |
+| Host total | 2294 (28 %) | 35762 (11 %) |
+
+On the bfp16 route at 2048 the host has 817 ms of 2804: tail 493, GEMM tile 231, sync 80, other 91; the prep (RoPE,
+Q pack, KV write) runs on the NPU, 245 ms. Decode at depth 80: 42.3 ms a step, 37.3 ms of it the 40 layers and 3.3 ms the
+head; the host's part (embedding) is 0.4 ms.
+
+**What is left, and what bounds it (2026-11-19, after the speed work):**
+1. Decode attention past 8k: 128.1 ms at 32k against the 107.7 ms window stream. The stream runs at ~41 GB/s on
+   its 4 shim channels, near their limit (one channel ~12 GB/s, F-0199); no more channels are free (5 columns have
+   one, so the 8 kv heads share them in pairs). About 20 ms of the step is arithmetic. In the 3-head core's block kernel (about 760 bundles for 8 rows) 257 vmov, 144 stores (244
+   stack accesses) and 128 shuffles are the score trees and spills, against 48 MACs. The `mmul` scorer
+   (OPEN-ATTN-HI-ONLY, `ATTN_G5_MMUL`) takes `dx` to 120.9 ms at 32k, but `dxl`'s 8-head cores mix two kv heads and
+   need four times its matrix work: its verify pass went 113 -> 132-151 ms at 8000 (rolled or unrolled by 2;
+   unrolled by 4 it overflows program memory), so copy-heavy replies with prompt lookup are served slower (23.9-19.6
+   against 28.1 tok/s at 8k). A `dxl` whose cores follow kv heads would remove that.
+2. `attn_fa` in long prefill (about 85 % of a 32k prefill): 16.5 ms a dispatch at L 8192; QK 9.4 (57 %), the softmax
+   3.3, PV 3.3 (`AF_ABL` builds, CLEAN). QK runs at ~69 % of the vector MAC rate with hi / lo Q, which the 64k needle
+   needs (single Q: 14.5 ms, needle lost). Native bf16 `mmul` has about the same MAC rate (R-0009) and would need an
+   on-core K transpose, so it buys at most ~1.3x on QK.
+3. Context switches: the switch into `af` (with the prep) and back to `gemmbfp` cost ~2.7 ms each a layer, about
+   200 ms a prompt. To 512 tokens the host attention now runs instead (OPEN-PREFILL-ATTN-FA, short windows: 256
+   tokens 494 -> 350 ms); from 768 the switches stay, 7-20 % of a 768-2048-token prompt. One context for both is not
+   possible: the two per-core programs do not fit 16 KB.
+4. Prefill host stages are mostly hidden: at 2048 the GEMM phases take 1670 ms against ~1.6 s of NPU GEMM work at
+   the bfp16 rate; the host's last post of each phase (~100 ms a prompt) is what shows.
+
+### OPEN-GGUF-GRANITE-FOLD: an unfolded Granite GGUF is folded at load
+**Applies to:** open-kernels (`open_kernels/recipes/{spec,load}.py`, `src/open_qwen36/gguf_file.{hpp,cpp}`, `pools.cpp`, `core.cpp`); ported from OFLM `fix/granite-gguf-multipliers` (1ef63a0d), not merged there
+**Verification:** test (`tests/test_granite.py`, `src/open_qwen36/gguf_pack_test.cpp`); the model is manual, below
+
+llama.cpp's Granite GGUFs are unfolded: `granite.attention.scale` (0.015625 for 4.2-3B) replaces the 1/sqrt(head_dim)
+that `attn.h` hard-codes, and `embedding_scale`, `residual_scale` and `logit_scale` apply at run time. The engine shall fold
+them into the weights as it reads the GGUF, the rule q4nx-build applies at conversion: `attn_q` x attention_scale *
+sqrt(head_dim), `attn_output` and `ffn_down` x residual_scale, `token_embd` x embedding_scale, `output` x 1/logit_scale.
+Each factor must be a power of two, so scaling the pool scales and the embedding rows is exact; anything else is refused.
+A GGUF model directory carries the publisher's unfolded `config.json`; `recipes/load.py` derives the folded spec from it
+(`granite_gguf_config`), so the GGUF finds the folded container's kernel set. llama.cpp also stores a Granite GGUF's q / k
+rows paired for its interleaved rotation; `pools.cpp` `llama_qk_rows` reads them back in HF order for arch `granite` as it
+does for `llama`.
+
+**Acceptance criteria:**
+- granite-4.2-3B's metadata gives one fold, `attn_q.weight` x 0.125, in `recipes/spec.py` `granite_gguf_folds` and in the
+  engine's `granite_folds`; the raw GGUF metadata and the unfolded `config.json` of a GGUF model directory derive the
+  folded spec's hash.
+- A missing attention scale, or a factor that is not a power of two (0.02 attention, 0.3 residual, 3.0 logit, -1
+  embedding), is refused. Without `model.gguf`, the unfolded `config.json` is still refused (UNFOLDED).
+- Packed with a fold of 0.125, a Q4_1 tensor's pool scales are the unfolded pool's times 0.125 bit for bit with the codes
+  unchanged; an embedding row with a fold of 0.5 is the unfolded row times 0.5 bit for bit.
+
+**Verification (manual):** run `ibm-granite/granite-4.2-3b-GGUF` `granite-4.2-3b-Q4_1.gguf` (revision `c40945d`, sha256
+`2fe0f96e...abfb7e`) as `model.gguf` beside IBM's `config.json` and `tokenizer.json`. The load log names the fold, and the
+greedy answers are coherent. Result: OPEN-FAMILY-GRANITE's production bar section.
+
+### OPEN-GGUF-BASE-VIEW: a Granite GGUF runs the q4nx manifest itself
+**Applies to:** open-kernels (`open_kernels/recipes/dense.py` `gguf_base_view`, `_gguf_base_section`)
+**Verification:** test (`tests/test_gguf_twin.py`)
+
+For a family in `GGUF_BASE_VIEW_FAMILIES` (Granite) whose spec is pure q4_1, the manifest's `gguf` section shall be the
+manifest itself, with every `std_perm` pack op read through `std_perm_gguf` (the q4_1 law's 5120-byte chunks, scales
+rounded to bf16 as the cores narrow them) and the Uno `lora_*` keys dropped from `rows`. The GGUF model so runs the same
+kernels and programs as the converted container: the one-context `dxh` tail, both block prefill routes with `attn_fa`,
+and the L-row pass that prompt lookup needs. The head is the GGUF's own `output.weight` (Q6_K for IBM's Q4_1 file)
+requantized to q4_1 at load. `DENSE_GGUF_BASE_VIEW=0` at export keeps the f32-twin section. A pack op that reads only a
+q4nx container (`std_fuse`, `q8_perm`, `bf16_gemm`) is refused at export.
+
+**Acceptance criteria:** the Granite section equals the manifest with `std_perm` renamed and the `lora_*` keys dropped,
+and contains no `std_perm`.
 
 ### OPEN-FAMILY-K2: K2-Horizon on the dense recipe
 **Applies to:** openflowlm-next (`open_kernels/recipes/spec.py`, `dense.py`, `designs/ln`, `designs/lin_layer/ln_nr.cc`, `src/open_qwen36/`, `utilities/q4nx-build`)
@@ -3174,6 +3346,10 @@ Random histories (a small alphabet, so matches are common) agree with the rule r
 ### OPEN-FAMILY-GRANITE-UNO: Granite 4.2 3B's Uno drafter
 **Applies to:** openflowlm-next (`open_kernels/recipes/dense.py` `ROWS_FAMILIES`, `src/common/AutoModel/modeling_granite.cpp`, `utilities/q4nx-build` `--uno-adapter`)
 **Verification:** manual (the procedure below compares every token with greedy decode)
+
+**Not the shipped drafter (2026-11-18).** Uno stays opt-in. Its adapter ships only as a q4nx sidecar, and q4nx is
+deprecated. Adaptive with Uno beat prompt lookup alone by at most 0.03x geomean (results below). The GGUF set drops the
+`lora_*` keys (OPEN-GGUF-BASE-VIEW); prompt lookup is the drafter (OPEN-FAMILY-GRANITE's production bar).
 
 Granite 4.2 3B with its Uno adapter (`Cyronius/granite-4.2-3b-uno`: r 128, alpha 8192, all seven projections of
 the 40 layers, noise ids `[1, 100256)`) shall run the cycle of OPEN-UNO-DECODE, identical to greedy decode:
@@ -3952,6 +4128,149 @@ first, then the NPU gates (same day, below): PASS.**
   (128, 56, 8, 128). The base manifest's `lm_head_q4` K 7168 never ran (the GGUF view uses the Q8_0 head),
   so the export still needs `OPEN_KERNELS_UNVALIDATED=1` for that one point
   (`test_only_the_q4_head_is_unvalidated`). Contexts past 4096 are untested.
+
+### OPEN-FAMILY-MINICPM5: MiniCPM5-2B, a dense Llama with 2 kv heads, from its own pure Q4_1 GGUF
+**Applies to:** `open_kernels/recipes/specs/minicpm5-2b.json`; `recipes/dense.py` (the `gemm_route` PTAB guard, `KVJOIN_MEASURED`,
+`HEAD8_MEASURED`, `STREAM_MEASURED_SHAPES`, the `DENSE_GGUF_*` views); `recipes/attnknobs.py` (`KVCORES4_MEASURED`, `EXPA2_MEASURED`,
+`G5_RB8_MEASURED` / `G5_RB8_DEFAULTS`); `designs/attn/attn.h` (`ATTN_G5`, `ATTN_G5_JT`, `ATTN_G5_JT_U`, `ATTN_KVS_BLOCK_ONLY`);
+`designs/dense/dx.py`, `dx_attn.py`; `designs/lm_head_q8`; `src/open_qwen36/pools.cpp` (the Llama Q / K un-permute, the raw-GGUF
+`lmhead_q8`), `manifest.cpp` (`kvslice` 8); `phlegm-core/config/model_list.json` (`minicpm5:2b`)
+**Test category:** unit (`tests/test_dense_kvjoin.py`, `test_dense_gguf_bfp16.py`, `test_attn_geometry.py`, the pinned spec hash in
+`test_lfm2.py`) + manual (NPU and model)
+
+`openbmb/MiniCPM5-2B` is a plain `LlamaForCausalLM`: 2048 / 42 / 6144, 16 query heads
+over **2** kv heads at head_dim 128 (GQA group 8), theta 5e6, eps 1e-6, no scaling, an untied 130560-row head. #85's spec
+said 8 kv heads, a shape the checkpoint does not have; the spec now says 2 and the attention tuple
+`(128, 16, 2, 128, False, False, False)` is new in the catalogue (the kv-8 tuple stays, #85's pass validated it).
+**Q/k row order:** llama.cpp's converter stores a Llama-arch GGUF's q and k rows paired for
+interleaved RoPE (`reshape(h, 2, hd/2).swapaxes`); the kernels rotate half-split pairs. `std_perm_gguf` undoes the
+pairing for `general.architecture == "llama"` q and k tensors, per head (`head_count` for q, `head_count_kv` for k), at
+pack time, in both GGUF row readers (`std_perm_gguf` and `bfp16_gemm`). Without it the model is fluent and wrong ("We need to be careful with our environment." for "What is the capital
+of France?", then a loop). The change is in the in-tree engine, `src/open_qwen36/pools.cpp`, recorded in
+`benchmarks/reference/engine-changes.json` (`gguf_pack_test` case: row-for-row against the permutation). Other archs are untouched; Granite's GGUF is not changed.
+
+**Result 2026-11-10 (MiniCPM5-2B, bartowski Q4_1, Strix Point, Windows, mlir-aie 1.4.2):** `dx` program memory 14192 of
+16384 B; spec hash `sha256:cb630a529a48`. Stock GGUF, one request: `<think>` block, then "The capital of France is Paris."
+and `<|im_end|>`, identical to llama.cpp (`-ngl 0 --temp 0`) for the whole 221-character answer; decode 19-21 tok/s (47-52 ms
+a token, development machine). A second prompt (a Fibonacci function) is coherent on both but diverges at the first token
+("The user asks" against "We need to respond"), a tie not investigated. **Not run:** the fp64 replica slice
+(`make_decode.py` reads only a q4nx container) and `flm-test`; the new attention tuple is in the catalogue on the strength of the
+two-request llama.cpp match and the unit test, not the OPEN-FAMILY-QWEN3 slice procedure. `chat.py` does not know MiniCPM's
+`<|im_start|>` template; the runs above pass token ids to `open_qwen36_cli`.
+
+**Result 2026-11-15, decode attention (O7; Strix Halo, Linux, in-tree engine, compact GGUF set, development runs under the
+npu lease, host load ~15 from other sessions):** the 4-core head split broadcast both kv heads to every core and gave each core
+4 heads. `KVSLICE` alone (4 cores, one kv head each) and then `KVCORES` 4 (8 cores of 2 heads, OPEN-ATTN-KVSLICE) were measured
+in two alternating rounds of 31 decode tokens after 993-, 8191- and 16320-token prompts (`open_qwen36_cli --gemm-block`, OMP 16):
+
+| context | shipped (4 cores, broadcast) | `KVSLICE` | `KVCORES` 4 |
+|---|---|---|---|
+| 1k | 70 / 65 ms | 53 / 64 ms | 48 / 45 ms |
+| 8k | 160 / 170 ms | 137 / 134 ms | 95 / 92 ms |
+| 16k | 278 / 288 ms | 231 / 231 ms | 157 / 146 ms |
+
+The context slope goes from about 14 to 6.8 us a cached position; at 16k the 42 layers take 139 ms against 277 (the head
+7-9 ms in both). Greedy tokens are identical to the shipped kernel in all twelve runs, and the logits of 256 forced decode
+steps after 4352- and 16320-token prefixes are byte-identical to it (fp32 torch reference, same for both: median cos
+0.999871 / 0.999850, argmax 250 / 244 of 256, loss ratio 0.9997 / 1.0004); forced decode 99.5 -> 65.8 ms at 4352 and
+284 -> 152 ms at 16320. `dx` program memory 13616 of 16384 B. The shape joined `KVCORES4_MEASURED` on this evidence.
+
+The published GGUFs mix K-quants (bartowski's "Q4_1" has Q6_K `attn_q` in 17 layers), which the per-role format rule refuses. So
+the model runs from a GGUF we build: openbmb's F16 GGUF through `llama-quantize --pure --output-tensor-type q6_K ... Q4_1`
+(llama.cpp build 11393). That gives 295 Q4_1 tensors, 85 F32 and a Q6_K head, carried as Q8 codes on `lm_head_q8`. The shipped
+kernel set is the compact GGUF view (`DENSE_GGUF_GEMM=1 DENSE_GGUF_HEAD_Q8=1 DENSE_GGUF_COMPACT=1 DENSE_GGUF_BFP16=1`). Prefill
+mode `fast`, the default, runs on bfp16 GEMMs and `accurate` runs on the q4 route, both layer-major.
+
+**Acceptance criteria.** This is the bar that OPEN-FAMILY-NANBEIGE and OPEN-FAMILY-CLOVER set for a model run from its own GGUF:
+- Unit: the derivation and the checked-in spec agree (`sha256:cb630a529a48`), and the layouts and knob defaults match the tests above.
+- Pack check: ALL OK from `model/dense_gguf_check.py` with the patched `gguf_pack_test`. Every Q4_1 projection must be bit-exact
+  after the Q / K un-permute, the norms exact, and the head within its bf16 scale rounding.
+- Tokenizer: phlegm's template and tokenizer reproduce transformers' text and ids on chat prompts, with thinking on and off.
+- References on the same GGUF: llama.cpp CPU against Vulkan (the control), and an independent fp32 or fp64 forward against llama.cpp
+  CPU. Measure top-20 partial KL and argmax on a short prompt and on a prompt of about 500 tokens.
+- Whole model, every prompt position, on both prefill modes: the NPU against llama.cpp CPU must sit within the control's argmax and KL.
+  Report the NPU against the independent forward too.
+- Long context: the NPU against the independent forward on the last 256 positions past the 4096 window and at capacity minus 64
+  (`decgate.py`: prefill P - 255, then 255 forced decode steps).
+- Greedy: equal to llama.cpp CPU's tokens, apart from near ties.
+- `phlegm run` and `phlegm serve` on the installed set: correct answers, streamed and not, the reasoning in `reasoning_content`, a stop
+  at `<|im_end|>`, and `enable_thinking: false` honoured.
+- A decode-attention change that is not bit-identical carries its `decgate.py` result at 4352 and 16320 tokens against the previous
+  default.
+
+**Procedure (manual):** model folder `/home/cyrus/models/MiniCPM5-2B-NPU2` (model.gguf, the Hub's config and tokenizer files,
+`open_kernels/`). Scripts and fp32 references are in phlegm's `target/npu-dev/minicpm5/`:
+- `cpu_llama.py` (`utilities/gguf-prefill/`) writes the fp32 torch forward over the GGUF: `cpu300.bin` and `cpulast{1024,4352,16320}.bin`.
+- `bridge_dump.py` and `cmp.py` run the 300-token gates. `cmp_long*.py`, `longgate.py` and `decgate.py` run the long-context gates.
+- `greedy.py` compares greedy tokens with llama.cpp.
+- `d0.sh`, `meas.sh` and `summ.sh` time decode in alternating rounds. These are development timings, not benchmark results.
+
+Plan and handoff: `.plans/minicpm5-2b.md`.
+
+**Result 2026-11-11 (fp32 reference and llama.cpp greedy; Strix Halo, Linux, own Q4_1 GGUF):** 300-token passage
+(`tests/fixtures/issue212/llama-quality-source.txt`), every position, against the fp32 forward:
+
+| route | median cos | argmax | next-token loss (fp32 2.7461) | partial KL median |
+| --- | --- | --- | --- | --- |
+| sequential | 0.999897 | 297/300 | 2.7455 | 1.6e-5 |
+| block, accurate | 0.999895 | 298/300 | 2.7473 | 5.3e-5 |
+| block, fast | -- | 294/300 | 2.7495 | 6.5e-4 |
+
+- Block against sequential directly: median cos 0.999974, 297/300.
+- Fast against accurate: NLL +0.16% at 300 tokens and -0.29% at 1024; top-1 within 3 points.
+- Greedy against llama.cpp CPU (raw ids, 48 tokens): 2 of 3 prompts identical. The third departs at token 19 on a near tie
+  (fp32 logits 20.495 against 20.480).
+- `phlegm run`: the chat answer is right, and a 5013-token needle (across the 4096 window) is retrieved.
+
+**Result 2026-11-16..18 (decode, O7; Strix Halo, in-tree engine; alternating rounds of 31 decode tokens, d0.sh):**
+- Every step below kept greedy tokens identical to the previous default at each depth it was timed at. Steps marked
+  bit-identical also kept `decgate.py` logits byte-identical (at 4352, and at 16320 for `KVJOIN`).
+- Decode at 1k (and 8k), with the previous default as control in each pair:
+
+| step (commit) | 1k tok/s | 8k tok/s | arithmetic |
+| --- | --- | --- | --- |
+| 8 main cores, k / v banded as one run (`KVJOIN`, dba3f23), quiet host | 22.5 -> 24.3 | 11.0 -> 11.3 | bit-identical |
+| memtile weight ring on `dx` (`STREAM_MEASURED_SHAPES`, d635d28) | 24.3 -> 25.8 | 11.4 -> 11.7 | bit-identical |
+| Q8 head on 8 cores (`HEAD8_MEASURED`, f990da7) | 25.8 -> 26.2 | -- | bit-identical |
+| fused exponential (`EXPA2_MEASURED`, 9397f4c) | 26.2 -> 26.5 | 11.8 -> 12.4 | not bit-identical |
+| 8-row blocks, joint-tree scorer, block-only walk (`G5_RB8_DEFAULTS`, 57dd125) | 26.5 -> 28.2 | 12.4 -> 15.9 | not bit-identical |
+
+- `decgate.py` against the fp32 forward. Columns are cos / argmax of 256 / loss against fp32 / KL median:
+
+| set | P = 4352 (fp32 loss 3.7178) | P = 16320 (fp32 loss 4.1540) |
+| --- | --- | --- |
+| before the fused exponential | 0.999871 / 250 / 3.7166 / 9.4e-5 | 0.999850 / 244 / 4.1558 / 5.5e-4 |
+| fused exponential | 0.999870 / 250 / 3.7166 / 8.2e-5 | 0.999841 / 243 / 4.1545 / 6.0e-4 |
+| RB 8 + joint tree + block-only (installed) | 0.999873 / 251 / 3.7174 / 5.2e-5 | 0.999848 / 243 / 4.1552 / 6.9e-4 |
+
+- The joint-tree scorer and its unrolls are byte-identical to the 4-row scorer. The block-only walk masks the tail and the new row
+  inside a block, and that is the source of the difference.
+- **llvm-aie** (Peano 21.0.0.2026080301) miscompiles a dot-product chain started as `mac` into `aie::zeros` in a rolled row loop.
+  `attn_score2m` starts each chain with `mul` instead. The broken build still produced the same 32 greedy tokens at 1k while
+  `decgate` cosine was 0.37, so token agreement at short context is not a gate for attention changes.
+- Decode is stream-bound outside attention. A null-arithmetic layer costs the same as the real one, so arithmetic is not the limit
+  there. The head reads about 48 GB/s. Attention arithmetic is the context-growth term, about 0.091 us a cached position a layer
+  after RB 8.
+- The decode ceiling at the NPU's ~57 GB/s port is about 36 tok/s [estimate].
+- llama.cpp b11393 Vulkan on the same GGUF, measured on the same host: decode about 128 tok/s. Prefill with flash attention is
+  4406 / 3512 / 2810 / 1965 tok/s at 1k / 4k / 8k / 16k, against about 610 tok/s for the NPU at 1k.
+
+**Status 2026-11-18: not accepted.**
+
+| criterion | status |
+| --- | --- |
+| unit | PASS |
+| pack check | NOT RUN |
+| tokenizer | NOT RUN: runs pass ids to `open_qwen36_cli`, and `chat.py` does not know the template |
+| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | NOT RUN: only the fp32 forward has been compared |
+| NPU vs independent forward, whole model and long context | measured (tables above) |
+| greedy vs llama.cpp | PASS (2026-11-11 set; later sets are token-identical to it) |
+| `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
+| `phlegm serve` | NOT RUN |
+| decode-attention changes gated | PASS (`decgate.py` on each non-identical step) |
+
+The attention tuple `(128, 16, 2, 128, False, False, False)` entered the catalogue on the two-request llama.cpp match and the unit
+test. Points enter only after a compare (OPEN-OP-RANGE), so this one stays provisional until the teacher-forced comparison has run.
 
 ### OPEN-CONVERT-QWEN35-VHEADS: a GGUF's tiled value heads come back in grouped order
 **Applies to:** openflowlm-next (`utilities/q4nx-build/q4nx/models/qwen35.py`)
@@ -7571,6 +7890,7 @@ compute.
 **Acceptance criteria (unit):**
 - The Granite emission carries `attn_fa` on `gemm_block` and on the `bfp16` variant: `hd` 64, `l_max` 4096, `q_head` 36864 (the record and Q hi / lo for 256 tokens), `qsplit`, streams `af256` .. `af4096` on context `af`; the builds pass `AF_L`, `AF_HEADS` 40, `AF_KV_HEADS` 8, `AF_KV_LD` 1024 (a KV row is every kv head's K then V), `AF_MAX_ROWS`, `AF_QSPLIT`; Qwen3-4B, Llama 3.1, Phi-4-mini, K2-Horizon and Gemma 3 carry none (`test_prefill_attn_fa.py`).
 - The parser: four windows of 256 rows parse with their kernels; a missing window, a head dim other than 64 and a `q_head` that is not the design's layout are refused (`manifest_test.cpp`).
+- Long windows: an export with `--max-ctx` past 4096 adds a stream every 4096 rows up to the capacity (`af8192` .. `af131072` at 131072, plus the capacity itself when it is not a multiple of 4096), builds them with `AF_MAX_ROWS` = the capacity, and gives the set its own build key; the 4096 default emits exactly the 16 streams above. The design refuses a window past `max_rows` and streams any window past 64 key chunks as 64-chunk slices (`test_prefill_attn_fa.py`).
 
 **Verification (manual):**
 1. The kernel: `designs/attn_fa/make_test.py --build <dir> --out <t> --L 512` (40 / 8 heads, a block at p0 256 against 512 cached rows, an attention-sink row), `run_kernel.exe <t>/run.cfg`, `compare.py <t>`: rel_fro <= 4e-3 against fp64, no NaN.
@@ -7627,6 +7947,45 @@ same box (2026-10-14, the overnight plan's table): 753 / 766 / 641 tok/s.
   host attention's ~200-270 ms of which part overlapped the GEMMs. A context shared with the GEMMs (one xclbin carrying
   both, or the full-ELF register-write reconfiguration of the `full-elf-context` skill, 0.3-0.7 ms a switch) is what
   removes it.
+
+**Long windows (2026-11-18, open-kernels).** Past 64 key chunks a pass's KV fills no longer fit the shim's BD pool
+(R-0001: under 4 queued BDs a channel). Each pass now queues Q, then the window as 64-chunk slices, K on one channel and
+V on the other, and waits for the oldest slice before it queues a third. Windows up to 4096 keep the stream above
+unchanged. The engine uses a tier only when the window fits the KV buffer, and a set may skip tiers: a block takes the
+smallest tier that covers its window. Measured on IBM's Q4_1 GGUF set (`g131072`, HX PRO 370, outside `--measure`):
+- *The kernel against fp64* (`make_test.py --max-rows 131072`): rel_fro 1.85e-3 to 2.05e-3 at L 4096 / 8192 / 16384 /
+  32768, 16.0 / 28.7 / 56.3 / 112.2 ms a dispatch, about 0.77 TFLOPS on the full rectangle. With one planted far key
+  that holds half the last row's weight (a needle test: `make_test` plus one aligned K row), the last row's relative
+  error is 3.8e-4 to 4.3e-4 at L 32768, 65536 and 131072, with the key at rows 3200 to 60000.
+- *The model, NPU against host attention, 16k tokens:* logits corr 0.99939 to 0.99985, the same top-1 at 4 steps.
+- *A 5217-token prompt:* the same tokens as the host attention, 17 s against 206 s.
+
+**Short windows take the host attention (2026-11-19, open-kernels).** A block whose window is 512 rows or fewer
+(`pos0 + N <= OFLM_OPEN_ATTN_FA_MIN`, default 512) runs the host attention: there the two context switches a layer
+cost more than the host's arithmetic. Measured on the default route (`g131072_v4`, one `--measure` unit, 3 runs a
+cell, NPU / host attention): 256 tokens 493-497 / 349-356 ms; 512 tokens 741-748 / 698-707 ms; 768 tokens 1021-1059 /
+1274-1319 ms; 1024 tokens 1333-1373 / 2028-2618 ms. With the threshold: 256 tokens 346-356 ms, 512 tokens 692-724 ms,
+768 and 1024 unchanged.
+
+**Single Q, the softmax exponential and its unroll (2026-11-19, open-kernels).** `AF_QSPLIT=0` at export (or a family
+in `recipes/dense.py AF_QHI_FAMILIES`, none today) makes Q one bf16, not a hi / lo pair: `qsplit` false, `q_head`
+20480, and no prep stream, which writes hi / lo. It is not Granite's default: with it the 64k needle at 10 % depth
+lost its answer ('73' -1.39 against 'The' -1.12; with hi / lo Q on the same set -0.80, correct). The softmax's
+exponential is `exp2c` (`AF_EXPV=1`): x + 1.5 * 2^23 rounds in fp32 without float-to-int conversions, which rewrite
+the saturation mode registers each time, and the polynomial's linear term is one bf16 product. Its loop takes 2 keys
+an iteration (`AF_SMU`, was 4: the 4-key body spilled 240 vector loads to the stack in 1030 bundles).
+- *Where a dispatch goes* (`AF_ABL` builds at L 8192, `make_test.py` inputs, `dibs run --measure` CLEAN): 19.9 ms in
+  all; without QK 10.5, without the softmax 13.2, without PV 16.7. QK (hi / lo Q) is 47 %, the softmax 34 %, PV 17 %.
+- *Single Q:* 15.4 ms against 19.9 at L 8192 (1.30x); rel_fro 2.83e-3 against fp64 (hi / lo Q 1.24e-3), min row cosine
+  0.999935. The 4-key unroll at 2 keys: 19.1 ms. The model cost, CPU emulation (OPEN-PREFILL-BFP16-QKV's method): KL
+  against fp32 0.00010 -> 0.00016 with bf16 KV, 0.00097 -> 0.00122 on the default route, but the long needle above.
+- *exp2c* (single Q, 2 keys): 11.9 ms against 14.6 (1.22x), rel_fro 2.88e-3 against 2.83e-3; at 1 key 12.96, at 4
+  keys 12.32.
+- *Prefill with single Q* (the q4-qkv route, one `--measure` unit, CLEAN, control pp512 974 / 968 ms): 512: 541 tok/s;
+  2048: 640 (was 609); 8192: 425 (363); 32768: 175 (136). The default keeps hi / lo Q: OPEN-FAMILY-GRANITE's
+  production bar has its timings.
+- *hi / lo Q with exp2c* (the default): 16.5 ms at L 8192, 65.1 ms at 32768, 129.6 ms at 65536 (rel_fro 1.27e-3 /
+  1.31e-3 against fp64); single Q 46.8 / 93.3 ms at 32768 / 65536.
 
 ### OPEN-PREFILL-GLUE-PREP: RoPE, Q packing and the cache write of the bfp16 prefill run on the NPU, in the attention context
 **Applies to:** openflowlm-next (`open_kernels/designs/attn_fa/{attn_fa.py,attn_fa.cc,make_prep_test.py}`, `open_kernels/recipes/{dense,manifest}.py`, `src/open_qwen36/{manifest,core}.cpp`)
@@ -7891,6 +8250,63 @@ from the user's own work, so the timings are not quiet-box numbers.
 - Accuracy on the combined set, `prefill_mode_check.py --cases random,chat,decode,ppl` (not a timing claim): 512 random ids corr min 0.998151 mean 0.999580, argmax 485/512 with all 27 flips at top-2 margins under 0.1; six prompts corr min 0.995189 (math) and 0.998008-0.998333 on the rest, every flip at a margin of 0.173 or less; all six 80-token greedy continuations identical; perplexity 20.7226 against 20.6713 (ratio 0.9975), mean KL 0.00276 nats. Every criterion above holds, identical to the pre-merge figures.
 - bfp16 prefill followed by Uno decode (`uno_bench.py --gemm-block --prefill-mode bfp16`, six prompts x 128): all six identical to plain decode, 3.05 tokens a cycle, 1.08x (CLEAN, OPEN-FAMILY-GRANITE-UNO has the table and the 1024 / 2048 results).
 - The merge of `perf/granite-prefill-int8` into `perf/granite-uno-core-compute` had no textual conflict (`dense.py`, `core.cpp`, `spec.md` all merged cleanly: the two routes' hunks are in different functions). One exporter run builds the union, the four bfp16 xclbins beside `dxl` / `dxl_lora` / `lmhl`, and the `manifest_test`, `pools_test`, `block_host_test` and `gguf_pack_test` binaries pass on it.
+
+### OPEN-PREFILL-BFP16-QKV: Granite's default prefill is the bfp16 route with a precise qkv
+**Applies to:** open-kernels (`open_kernels/recipes/dense.py` `bfp16_default`, `bfp16_qkv_mode`, `bfp16_route(qkv=)`,
+`programs`; `recipes/pack.py` `bfp16_split3`; `src/open_qwen36/{manifest,pools,block_host,core}.cpp`, `bfp16.hpp`)
+**Verification:** test (`tests/test_prefill_bfp16.py::test_granite_default_prefill_is_bfp16_with_a_three_term_qkv`,
+`::test_split3_weight_is_hi_hi_lo_and_sums_to_the_weight`; `manifest_test.cpp`, `pools_test.cpp`,
+`block_host_test.cpp`); the model gates are manual, below
+
+For a family in `BFP16_DEFAULT_FAMILIES` (Granite), the manifest's `gemm_block` (prefill mode `fast`, the default) shall
+be the bfp16 route of OPEN-PREFILL-BFP16 and -FFN with a qkv step that keeps K and Q at about bf16 precision. The
+default (`DENSE_BFP16_QKV=split3`) is one `gemm_bfp16` GEMM over 3 K: the weight packs each row as [hi | hi | lo]
+(pack op `ksplit: 3`; hi the row's bfp16 encoding, lo the encoding of the row minus hi's value) and the engine packs
+x as [hi | lo | hi] (step `a: split3`, `host::bfp16_pack_a_split3`), so the product is hi.hi + lo.hi + hi.lo. The
+kernel does not change, and qkv stays in the bfp16 GEMMs' context. `DENSE_BFP16_QKV=q4` runs qkv on the q4 route's
+GEMM instead (its weight read from the decode pool; one more context switch a layer). The q4 route stays as variant
+`lean` (`--prefill-mode lean` / `accurate`) and the all-bfp16 route as `bfp16`. `DENSE_BFP16_DEFAULT=0` at export
+keeps the q4 route as `fast`. An engine that predates `a: split3` refuses the step by name; the engine refuses a
+split3 step on any route other than layer-major, a split3 step past qkv, and a ksplit other than 1 or 3.
+
+Why qkv stays on q4: a CPU emulation of the whole model on IBM's Q4_1 weights (`scratchpad/emu`, 512 tokens of
+`spec.md`, 64 positions scored against fp32 arithmetic) put most of the bfp16 route's error in that one GEMM. Its K
+feeds every score at every distance, and it is 10 % of the GEMM work.
+
+| GEMM numerics, KL against fp32 on the q4 weights | KL mean |
+|---|---|
+| q4 route (bf16 activations and weights, bf16 KV) | 0.00017 |
+| bf16 KV alone | 0.00010 |
+| bfp16 on qkv only / o only / gate\|up only / down only | 0.0022 / 0.0003 / 0.0007 / 0.0006 |
+| all bfp16 | 0.0026 |
+| qkv bf16 (the q4 GEMM), the rest bfp16 | 0.00097 |
+| qkv split3, the rest bfp16 (K error 0.90 %, as the q4 GEMM's 0.91 %) | 0.0012 |
+| qkv with hi / lo W only, or hi / lo A only | 0.0019 / 0.0020 |
+
+Against IBM's own bf16 weights (`ibm-granite/granite-4.2-3b` revision `4e9c275`) every route sits at the q4 file's own
+loss: KL 0.162 for exact arithmetic on the q4 weights, 0.164 for the q4 route, 0.158 for all bfp16 and 0.159 for this
+route. The Q4_1 tensors differ from the bf16 ones by 8 % (relative Frobenius, layers 0 / 20 / 39).
+
+**Acceptance criteria (manual):**
+- The long-context needle of OPEN-FAMILY-GRANITE's production bar at 64k, 10 % depth answers correctly; the all-bfp16
+  route does not.
+- Prefill faster than the q4 route at 512 to 32768 tokens, `dibs run --measure` CLEAN with a control.
+
+**Result 2026-11-19 (HX PRO 370, IBM's Q4_1 GGUF, `g131072`):**
+- Needle, 64k at 10 %: this route '73' -1.18 (answer correct, 'The' -1.28); the q4 route -0.80; all bfp16 -1.87
+  (wrong); llama.cpp Vulkan -0.24.
+- Prefill, tok/s (one `--measure` unit, CLEAN, control pp512 945 / 943 ms): 512: 536 (q4 route 235); 2048: 609 (258);
+  8192: 363 (q4 route 194, an earlier unit); 32768: 136 (103). llama.cpp Vulkan: 747 / 680 / 457 / 157.
+- At 2048 the prompt is 3357 ms: `attn_fa` 1240, the qkv GEMM 569 (with its context switch, one a layer more than the
+  all-bfp16 route), gate|up 454, o 118, down 42, the host 1065 (tail 510, GEMM tile 210, Q pack 114, RoPE and cache
+  write 58).
+
+**Result 2026-11-19, split3 (the default since):** the qkv GEMM (`gemm_bfp16_n4096_k7680`) at 512 tokens is 80
+dispatches, 269 ms (`OFLM_OPEN_DISPATCH_LOG`), against the q4 GEMM's 304; at 2048 its waits fall from 545 to 24 ms
+behind the host's pack. The three-term pack first cost 289 ms at 2048; decoding blocks by a power-of-two multiply
+instead of `std::ldexp` took GEMM tile 450 -> 265 ms (logits unchanged to the bit). With hi / lo Q and exp2c in
+`attn_fa` (set `g131072_v4`) the six needle prompts keep the q4 route's margins (64k, 10 %: -0.80). Timings:
+OPEN-FAMILY-GRANITE's production bar.
 
 ### OPEN-PREFILL-BFP16-FFN: the bfp16 route's FFN stays on the NPU from gate|up to down
 **Applies to:** openflowlm-next (`open_kernels/designs/gemm_bfp16/{gemm_bfp16.py,mm_bfp_acc.cc,pack.py,make_test.py}`, `open_kernels/recipes/{dense,pack,manifest}.py`, `src/open_qwen36/{bfp16.hpp,block_host.hpp,pools,manifest,core,cli}.cpp`)

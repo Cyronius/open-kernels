@@ -6,12 +6,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "open_qwen36/manifest.hpp"
 
+using open_qwen36::AttnFa;
 using open_qwen36::Manifest;
 using open_qwen36::PackOp;
 using nlohmann::json;
@@ -51,6 +53,161 @@ void refused_manifest(const char* path, const std::string& needle, const std::st
     }
 }
 
+/// Refused with `needle` after `edit` (on a copy of `base`).
+void refused_json(const json& base, const std::string& needle, const std::string& what, const std::function<void(json&)>& edit) {
+    json e = base;
+    edit(e);
+    try {
+        Manifest::parse(e, "edited");
+        check(false, what + " (accepted)");
+    } catch (const std::runtime_error& x) {
+        check(std::string(x.what()).find(needle) != std::string::npos, what + ": " + x.what());
+    }
+}
+
+// OPEN-PREFILL-ATTN-FA, OPEN-PREFILL-GLUE-PREP, OPEN-PREFILL-BFP16-FFN on the qwen3 fixture's dense route. Runs before
+// the qwen36 fixture's load so a failure there does not hide these.
+void attn_fa_checks(const char* dense_path) {
+    std::ifstream ff(dense_path);
+    json fj = json::parse(ff);
+    fj["layer_types"]["dense"]["gemm_block"].erase("attn_block");
+    auto with_tiers = [&](std::vector<int> tiers, int l_max) {
+        json j = fj;
+        json fa = {{"hd", 64}, {"l_max", l_max}, {"q_head", 4096 * 9}, {"qsplit", true}, {"kernels", json::object()}};
+        for (int L : tiers) {
+            const std::string k = "af" + std::to_string(L);
+            j["kernels"][k] = {{"context", "af"}, {"insts", k + "/insts.bin"}};
+            fa["kernels"][std::to_string(L)] = k;
+        }
+        j["contexts"]["af"] = "af256/final.xclbin";
+        j["layer_types"]["dense"]["gemm_block"]["attn_fa"] = fa;
+        return j;
+    };
+    const json dense4 = with_tiers({256, 512, 768, 1024}, 1024);
+    {
+        const Manifest fm = Manifest::parse(dense4, "attn_fa");
+        const AttnFa& f = fm.layer_types.at("dense").gemm_block.attn_fa;
+        check(f.present() && f.hd == 64 && f.l_max == 1024 && f.q_head == 4096 * 9 && f.qsplit && f.kernels.size() == 4 &&
+                  f.kernels.at(768) == "af768" && !f.has_prep(),
+              "attn_fa: four windows of 256 rows, Q hi / lo, head dim 64");
+        check(f.tier(1) && *f.tier(1) == "af256" && *f.tier(300) == "af512" && *f.tier(1024) == "af1024" && !f.tier(1025),
+              "attn_fa: a window takes the narrowest stream that covers it");
+    }
+    {
+        // past 4096 the tiers are sparse: every 4096 rows, the capacity the widest
+        const Manifest sm = Manifest::parse(with_tiers({256, 512, 4096, 8192, 12288}, 12288), "attn_fa sparse");
+        const AttnFa& f = sm.layer_types.at("dense").gemm_block.attn_fa;
+        check(f.kernels.size() == 5 && *f.tier(600) == "af4096" && *f.tier(4352) == "af8192" && *f.tier(12288) == "af12288" &&
+                  !f.tier(12289),
+              "attn_fa: sparse tiers parse, a window between two takes the wider one");
+    }
+    auto refused_fa = [&](const char* what, const char* label, const std::function<void(json&)>& edit) {
+        refused_json(dense4, what, label, [&](json& e) { edit(e["layer_types"]["dense"]["gemm_block"]["attn_fa"]); });
+    };
+    refused_fa("has no stream for l_max 1024", "attn_fa: no stream at l_max is refused", [](json& a) { a["kernels"].erase("1024"); });
+    refused_fa("not a positive multiple of 256", "attn_fa: a window off the 256 grid is refused",
+               [](json& a) { a["kernels"]["384"] = "af256"; });
+    refused_fa("not a positive multiple of 256", "attn_fa: a window past l_max is refused",
+               [](json& a) { a["kernels"]["1280"] = "af256"; });
+    refused_fa("wants hd 64", "attn_fa: a head dim the design does not build is refused", [](json& a) { a["hd"] = 128; });
+    refused_fa("is not the record plus Q hi", "attn_fa: a Q layout that is not the design's is refused",
+               [](json& a) { a["qsplit"] = false; });
+    refused_fa("unknown kernel", "attn_fa: an unknown stream is refused", [](json& a) { a["kernels"]["512"] = "nope"; });
+    // OPEN-PREFILL-GLUE-PREP: a prep stream on the same context, manifest_version 6
+    json pj = dense4;
+    pj["manifest_version"] = 6;
+    pj["kernels"]["afp"] = {{"context", "af"}, {"insts", "afp/insts.bin"}};
+    pj["layer_types"]["dense"]["gemm_block"]["attn_fa"]["prep"] = {{"kernel", "afp"}, {"n_pad", 4096}};
+    {
+        const Manifest pm = Manifest::parse(pj, "attn_fa prep");
+        const AttnFa& pf = pm.layer_types.at("dense").gemm_block.attn_fa;
+        check(pf.has_prep() && pf.prep_kernel == "afp" && pf.prep_npad == 4096, "attn_fa: a prep stream parses at version 6");
+    }
+    refused_json(pj, "needs manifest_version 6", "attn_fa prep: a version 5 manifest is refused",
+                 [](json& e) { e["manifest_version"] = 5; });
+    refused_json(pj, "unknown kernel", "attn_fa prep: an unknown stream is refused",
+                 [](json& e) { e["layer_types"]["dense"]["gemm_block"]["attn_fa"]["prep"]["kernel"] = "nope"; });
+    refused_json(pj, "whole number of 1024", "attn_fa prep: a width that is not a whole number of 1024 columns is refused",
+                 [](json& e) { e["layer_types"]["dense"]["gemm_block"]["attn_fa"]["prep"]["n_pad"] = 3584; });
+    refused_json(fj, "this engine reads 1 to 6", "manifest_version 7 (bfp16_dit) is refused by this engine",
+                 [](json& e) { e["manifest_version"] = 7; });
+    // OPEN-PREFILL-BFP16-FFN: a dense route of 4 bfp16 steps, gate|up through the glu epilogue and down reading its H
+    auto glu_route = [](json& j, int version, bool down_reads_h) {
+        j["manifest_version"] = version;
+        json& gb = j["layer_types"]["dense"]["gemm_block"];
+        auto op = [](const char* t, uint64_t n_total, const char* glu) {
+            json o = {{"op", "bfp16_gemm"}, {"tensor", t}, {"nch", 380}, {"in_dim", 2560}, {"dst", 0}, {"row0", 0},
+                      {"n_total", n_total}};
+            if (*glu) o["glu"] = glu;
+            return o;
+        };
+        gb["weights"] = {{"gqkv3_w", {{"from", "pack"}, {"pack", json::array({op("model.layers.{l}.self_attn.q_proj.weight", 1024, "")})}}},
+                         {"go_w", {{"from", "pack"}, {"pack", json::array({op("model.layers.{l}.self_attn.o_proj.weight", 1024, "")})}}},
+                         {"ggu_w", {{"from", "pack"}, {"pack", json::array({op("model.layers.{l}.mlp.gate_proj.weight", 19456, "gate"),
+                                                                            op("model.layers.{l}.mlp.up_proj.weight", 19456, "up")})}}},
+                         {"gdown_w", {{"from", "pack"}, {"pack", json::array({op("model.layers.{l}.mlp.down_proj.weight", 1024, "")})}}}};
+        j["globals"]["gbfp_h"] = 1024;
+        json p = gb["program"];
+        for (auto& s : p) s["fmt"] = "bfp16", s["n_pad"] = 1024;
+        p[2] = {{"op", "run"}, {"kernel", "gemm_n9728_k2560"}, {"args", {"ggu_w", "gemm_x_k2560", "gbfp_h"}}, {"fmt", "bfp16"},
+                {"n_pad", 19456}, {"epi", "glu"}};
+        p[4]["args"][1] = down_reads_h ? "gbfp_h" : "gemm_x_k9728";
+        p[4]["a"] = "h";
+        gb["program"] = json::array({p[0], p[1], p[2], p[4]});
+    };
+    {
+        json g = fj;
+        glu_route(g, 5, true);
+        bool ok = true;
+        try {
+            const Manifest m5 = Manifest::parse(g, "glu");
+            const auto& gb = m5.layer_types.at("dense").gemm_block;
+            ok = gb.program.size() == 4 && gb.program[2].epi == "glu" && gb.program[3].a_from == "h" &&
+                 gb.weights.at("ggu_w").pack[1].glu == "up";
+        } catch (const std::runtime_error& e) { ok = false; std::printf("      %s\n", e.what()); }
+        check(ok, "a version 5 manifest with a glu gate|up and a down from H loads");
+    }
+    refused_json(fj, "needs manifest_version 5", "a glu route in a version 4 manifest is refused at load",
+                 [&](json& j) { glu_route(j, 4, true); });
+    refused_json(fj, "or 4 with gate|up's glu H as down's x", "a 4-step route whose down does not read the H is refused",
+                 [&](json& j) { glu_route(j, 5, false); });
+    refused_json(fj, "glu must be gate or up", "a glu half that is neither gate nor up is refused", [&](json& j) {
+        glu_route(j, 5, true);
+        j["layer_types"]["dense"]["gemm_block"]["weights"]["ggu_w"]["pack"][1]["glu"] = "down";
+    });
+    // OPEN-PREFILL-BFP16-QKV: qkv as one 3 K GEMM, its x [hi | lo | hi], its weight ksplit 3
+    auto split3 = [&](json& j) {
+        glu_route(j, 5, true);
+        json& gb = j["layer_types"]["dense"]["gemm_block"];
+        gb["program"][0]["a"] = "split3";
+        gb["weights"]["gqkv3_w"]["pack"][0]["ksplit"] = 3;
+    };
+    {
+        json g = fj;
+        split3(g);
+        bool ok = true;
+        try {
+            const Manifest m3 = Manifest::parse(g, "split3");
+            const auto& gb = m3.layer_types.at("dense").gemm_block;
+            ok = gb.program[0].a_from == "split3" && gb.weights.at("gqkv3_w").pack[0].ksplit == 3;
+        } catch (const std::runtime_error& e) { ok = false; std::printf("      %s\n", e.what()); }
+        check(ok, "a split3 qkv step on a ksplit 3 weight loads");
+    }
+    refused_json(fj, "a split3 step reads a ksplit 3 weight", "a split3 step on a ksplit 1 weight is refused", [&](json& j) {
+        split3(j);
+        j["layer_types"]["dense"]["gemm_block"]["weights"]["gqkv3_w"]["pack"][0].erase("ksplit");
+    });
+    refused_json(fj, "a split3 only on qkv", "a split3 step past qkv is refused", [&](json& j) {
+        split3(j);
+        j["layer_types"]["dense"]["gemm_block"]["program"][1]["a"] = "split3";
+        j["layer_types"]["dense"]["gemm_block"]["weights"]["go_w"]["pack"][0]["ksplit"] = 3;
+    });
+    refused_json(fj, "ksplit must be 3", "a ksplit other than 1 or 3 is refused", [&](json& j) {
+        split3(j);
+        j["layer_types"]["dense"]["gemm_block"]["weights"]["gqkv3_w"]["pack"][0]["ksplit"] = 2;
+    });
+}
+
 json matching_config(const Manifest& m) {
     json cfg = m.hf_config_check;
     cfg["model_type"] = m.hf_config_check["model_type"][0];
@@ -64,6 +221,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: manifest_test <manifest_qwen36.json> [<manifest_qwen3_4b.json>]\n");
         return 2;
     }
+    if (argc > 2) attn_fa_checks(argv[2]);
     Manifest m;
     try {
         m = Manifest::load(argv[1]);
@@ -248,12 +406,12 @@ int main(int argc, char** argv) {
     refused(m, bad, "num_hidden_layers", "a 24-layer slice config is refused (the manifest is the 40-layer set)");
 
     // ---- a broken manifest
-    json j = json::parse(std::string("{\"manifest_version\": 4}"));
+    json j = json::parse(std::string("{\"manifest_version\": 8}"));
     try {
         Manifest::parse(j, "broken");
-        check(false, "manifest_version 4 is refused");
+        check(false, "manifest_version 8 is refused");
     } catch (const std::runtime_error& e) {
-        check(std::string(e.what()).find("manifest_version 4") != std::string::npos, std::string("manifest_version 4 is refused: ") + e.what());
+        check(std::string(e.what()).find("manifest_version 8") != std::string::npos, std::string("manifest_version 8 is refused: ") + e.what());
     }
     // OPEN-MANIFEST: the bf16 GEMM pool op needs version 3, and one weight reads one format
     auto bf16_weight = [](json& j, int version, bool mixed) {

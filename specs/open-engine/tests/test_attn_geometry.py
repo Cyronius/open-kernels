@@ -272,6 +272,17 @@ def test_block8_is_granite_only_and_forced_back_by_the_probe(unvalidated, monkey
     assert "-DATTN_EXPA=2" not in attnknobs.tree8_flags(4)
 
 
+def test_hi_only_is_granite_only_and_the_probe_overrides_it(monkeypatch):
+    # Traces: OPEN-ATTN-HI-ONLY
+    from recipes import attnknobs
+    monkeypatch.delenv("ATTN_HI_ONLY", raising=False)
+    assert attnknobs.hi_only_flags(load_spec(SPECS / "granite42-3b.json")) == ["-DATTN_HI_ONLY=1"]
+    assert attnknobs.hi_only_flags(load_spec(SPECS / "qwen3-4b.json")) == []
+    monkeypatch.setenv("ATTN_HI_ONLY", "0")
+    assert attnknobs.hi_only_flags(load_spec(SPECS / "granite42-3b.json")) == []
+    assert "ATTN_HI_ONLY" in attnknobs.PROBE_VARS
+
+
 def test_dxl_score_split_is_on_by_default_and_the_probe_turns_it_off(monkeypatch):
     # Traces: OPEN-ATTN-SPLIT8
     from recipes import attnknobs

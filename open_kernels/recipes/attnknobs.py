@@ -26,7 +26,7 @@ from .spec import ModelSpec
 # LX_NULL_DN / LX_NULL_GEMV (designs/layer_x/xcommon.py) are the same kind of knob on the
 # main cores: LX_NULL_DN compiles the DeltaNet arithmetic away, LX_NULL_GEMV the q4/q8 GEMV
 # tile body, both leaving every stream, fifo and DMA -- and so insts.bin -- byte-identical.
-PROBE_VARS = ("ATTN_T8_SPLIT", "ATTN_T8_SPLIT_U1", "ATTN_T8_SPLIT_U2", "ATTN_NULL", "ATTN_ABL", "ATTN_RB", "ATTN_FAST", "LX_NULL_DN", "LX_NULL_GEMV", "DXL_NULL_PREP", "DXL_NULL_LN", "ATTN_TREE8", "ATTN_REPEAT",
+PROBE_VARS = ("ATTN_HI_ONLY", "ATTN_G5_MMUL", "ATTN_T8_MMUL_U", "ATTN_T8_MMUL_FIX2", "ATTN_T8_SPLIT", "ATTN_T8_SPLIT_U1", "ATTN_T8_SPLIT_U2", "ATTN_NULL", "ATTN_ABL", "ATTN_RB", "ATTN_FAST", "LX_NULL_DN", "LX_NULL_GEMV", "DXL_NULL_PREP", "DXL_NULL_LN", "ATTN_TREE8", "ATTN_REPEAT",
               "DX_WRING", "DX_WORDER", "DX_ONECTX", "ATTN_KVSLICE", "ATTN_KVCORES", "ATTN_G4CORES", "ATTN_G5_PVROLL", "ATTN_DXL_KVSLICE", "DXL_WRING", "DXL_WDEPTH", "ATTN_EXPA", "DXL_T8_UNROLL", "DXL_NULL_OUT", "ATTN_INTFP",
               "ATTN_G5_JT", "ATTN_G5_JT_U", "ATTN_T8_UNROLL", "ATTN_KVS_BLOCK_ONLY")
 
@@ -80,6 +80,12 @@ TREE8_STACK = 0x3000       # the tree spills past the usual 0x1800 stack, and th
 # OPEN-ATTN-BLOCK8: Granite's attention takes 8-row blocks and the fused degree-4 exponential (not bit-identical to the 4-row kernel);
 # ATTN_RB=4 / ATTN_EXPA=0 give the old kernel back for an A/B build.
 BLOCK8_MEASURED = ("granite",)
+# OPEN-ATTN-HI-ONLY: bf16 q and p in decode attention (attn.h ATTN_HI_ONLY=1); ATTN_HI_ONLY=0 gives the hi / lo kernel back.
+HI_ONLY_MEASURED = ("granite",)
+
+
+def hi_only_flags(spec: ModelSpec) -> list[str]:
+    return [] if "ATTN_HI_ONLY" in os.environ or spec.family not in HI_ONLY_MEASURED else ["-DATTN_HI_ONLY=1"]
 
 
 def tree8_flags(unroll: int) -> list[str]:

@@ -44,6 +44,7 @@ void put_kv_str(std::vector<uint8_t>& f, const std::string& k, const std::string
     put_u32(f, 8);                                   // GGUF_TYPE_STRING
     put_str(f, v);
 }
+void put_kv_f32(std::vector<uint8_t>& f, const std::string& k, float v);
 void put_kv_u32(std::vector<uint8_t>& f, const std::string& k, uint32_t v) {
     put_str(f, k);
     put_u32(f, 4);                                   // GGUF_TYPE_UINT32
@@ -258,6 +259,30 @@ std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb,
         f.insert(f.end(), b, b + 4);
     }
     const fs::path out = dir / ("test-" + std::to_string(mm.type) + (heads ? "-h" + std::to_string(heads) : "") + ".gguf");
+    std::ofstream of(out, std::ios::binary);
+    of.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
+    return out.string();
+}
+
+void put_kv_f32(std::vector<uint8_t>& f, const std::string& k, float v) {
+    put_str(f, k);
+    put_u32(f, 6);                                   // GGUF_TYPE_FLOAT32
+    f.insert(f.end(), reinterpret_cast<const uint8_t*>(&v), reinterpret_cast<const uint8_t*>(&v) + 4);
+}
+
+/// A tensor-less granite GGUF: just the metadata granite_folds reads.
+std::string write_granite_meta(const fs::path& dir, const std::vector<std::pair<std::string, float>>& scales) {
+    std::vector<uint8_t> f;
+    f.insert(f.end(), {'G', 'G', 'U', 'F'});
+    put_u32(f, 3);
+    put_u64(f, 0);
+    put_u64(f, 4 + scales.size());
+    put_kv_str(f, "general.architecture", "granite");
+    put_kv_u32(f, "granite.embedding_length", 2560);
+    put_kv_u32(f, "granite.attention.head_count", 40);
+    put_kv_u32(f, "granite.attention.key_length", 64);
+    for (const auto& [k, v] : scales) put_kv_f32(f, "granite." + k, v);
+    const fs::path out = dir / "granite-meta.gguf";
     std::ofstream of(out, std::ios::binary);
     of.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
     return out.string();
@@ -593,6 +618,80 @@ int main() {
         }
         std::printf("%s embed_row Q6_K (both super-block halves bit-exact)\n", bad6 ? "FAIL" : "ok");
         if (bad6) return 1;
+    }
+
+    // ---- OPEN-GGUF-GRANITE-FOLD: the folds granite-4.2-3b's metadata asks for, and their refusals
+    {
+        const auto folds = [&](const std::vector<std::pair<std::string, float>>& s) {
+            GgufFile gm(write_granite_meta(dir, s));
+            return granite_folds(gm);
+        };
+        const auto f42 = folds({{"attention.scale", 0.015625f}, {"embedding_scale", 1.f}, {"residual_scale", 1.f},
+                                {"logit_scale", 1.f}});
+        if (f42.size() != 1 || f42.count("attn_q.weight") != 1 || f42.at("attn_q.weight") != 0.125f) {
+            std::printf("FAIL granite_folds(granite-4.2-3b): want only attn_q.weight x0.125\n");
+            return 1;
+        }
+        const auto all = folds({{"attention.scale", 0.25f}, {"embedding_scale", 4.f}, {"residual_scale", 0.5f},
+                                {"logit_scale", 2.f}});
+        if (all.size() != 5 || all.at("attn_q.weight") != 2.f || all.at("attn_output.weight") != 0.5f ||
+            all.at("ffn_down.weight") != 0.5f || all.at("token_embd.weight") != 4.f || all.at("output.weight") != 0.5f) {
+            std::printf("FAIL granite_folds: the four multipliers map to the wrong tensors\n");
+            return 1;
+        }
+        int refused = 0;
+        for (const auto& s : std::vector<std::vector<std::pair<std::string, float>>>{
+                 {{"attention.scale", 0.02f}}, {{"residual_scale", 1.f}}, {{"attention.scale", 0.015625f}, {"logit_scale", 3.f}}}) {
+            try {
+                folds(s);
+            } catch (const std::runtime_error&) {
+                ++refused;
+            }
+        }
+        if (refused != 3) {
+            std::printf("FAIL granite_folds refused %d of 3 (not a power of two, no attention scale, logit 1/3)\n", refused);
+            return 1;
+        }
+        std::printf("ok    granite_folds (4.2-3b: attn_q x0.125; non-power-of-two and missing refused)\n");
+    }
+
+    // ---- the fold in std_perm_gguf and embed_row: values scale exactly, codes do not move
+    {
+        GgufFile gf(write_gguf(dir, mm, emb, norm));
+        PackOp fo;
+        fo.op = "std_perm_gguf";
+        fo.tensor = "model.layers.0.self_attn.q_proj.weight";
+        fo.in_dim = 512;
+        fo.nch = 64ull * 512 / (32 * 256);
+        std::vector<uint8_t> p0(static_cast<size_t>(fo.nch) * 6144, 0), pf(p0.size(), 0);
+        pools::apply(fo, gf, 0, p0.data(), p0.size(), 6144);
+        gf.set_fold("attn_q.weight", 0.125f);
+        gf.set_fold("token_embd.weight", 0.5f);
+        pools::apply(fo, gf, 0, pf.data(), pf.size(), 6144);
+        size_t badf = 0;
+        for (size_t c = 0; c < fo.nch; ++c) {
+            const uint8_t* a = p0.data() + c * 6144;
+            const uint8_t* b = pf.data() + c * 6144;
+            for (size_t i = 0; i < 2048; i += 4) {
+                float x, y;
+                std::memcpy(&x, a + i, 4);
+                std::memcpy(&y, b + i, 4);
+                badf += f32_bits(y) != f32_bits(x * 0.125f);
+            }
+            badf += std::memcmp(a + 2048, b + 2048, 6144 - 2048) != 0;
+        }
+        std::vector<float> row(256);
+        gf.embed_row("token_embd.weight", 7, 256, row.data());
+        for (size_t i = 0; i < 256; ++i) badf += f32_bits(row[i]) != f32_bits(emb.values[7 * 256 + i] * 0.5f);
+        bool refused = false;
+        try {
+            gf.set_fold("attn_q.weight", 0.3f);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        std::printf("%s fold: pool scales x0.125 and embed_row x0.5 bit-exact, codes unchanged, 0.3 refused (%zu differ)\n",
+                    badf || !refused ? "FAIL" : "ok   ", badf);
+        if (badf || !refused) return 1;
     }
 
     std::printf("GGUF-PACK OK\n");

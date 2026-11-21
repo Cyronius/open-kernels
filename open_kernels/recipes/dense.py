@@ -128,8 +128,13 @@ BLOCK_ATTN_ROPE = ("k2", "llama3")
 # designs/attn_fa: head dim 64, full rotary, no q/k norm, no gate, no window), by measurement
 # against their host attention
 BLOCK_ATTN_FA = ("granite",)
-# Q as a bf16 hi / lo pair; AF_QSPLIT=0 exports the single-bf16 Q experiment (its own kernel set)
-AF_QSPLIT = os.environ.get("AF_QSPLIT", "1") != "0"
+# single-bf16 Q families (OPEN-PREFILL-ATTN-FA); Granite lost the 64k needle with it. AF_QSPLIT forces either
+AF_QHI_FAMILIES: tuple[str, ...] = ()
+
+
+def af_qsplit(spec: ModelSpec) -> bool:
+    e = os.environ.get("AF_QSPLIT")
+    return e != "0" if e is not None else spec.family not in AF_QHI_FAMILIES
 # OPEN-PREFILL-GEMM8: the 8-bit route's block (designs/dit_gemm streams are built per M)
 DIT_T = 1024
 # families whose q/k/v projections carry a per-channel bias. Like the post-RoPE norm this
@@ -411,7 +416,7 @@ from .attnknobs import probe_env as attn_knobs_probe_env
 #                    FF fits whole, so the split can be compared against the whole path
 #                    on a model that is already tested end to end.
 #   DENSE_NORM_SPLIT  "1" -- force the streaming norm helper (the same, for the norm).
-DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM", "DENSE_KVJOIN")
+DENSE_PROBE_VARS = ("DENSE_DOWN_SPLIT", "DENSE_NORM_SPLIT", "DENSE_GGUF_GEMM", "DENSE_GGUF_HEAD_Q8", "DENSE_GGUF_COMPACT", "DENSE_GGUF_BFP16", "DENSE_AG_SHL", "DENSE_GGUF_LAYER", "DENSE_FLASH_PREFILL", "AF_LMAX", "AF_LONG_STREAM", "DENSE_KVJOIN", "DX_KW_DEPTH", "DENSE_BFP16_DEFAULT", "DENSE_BFP16_QKV")
 
 
 def probe_env() -> dict[str, str]:
@@ -737,16 +742,21 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
     fa_rows = fa_cap if flash_probe else max_ctx
     fa_limit = fa_cap if flash_probe else min(ATTN_LMAX, max_ctx, fa_cap)
     fa_tiers = list(range(256, fa_limit + 1, 256))
+    if not flash_probe and "AF_LMAX" not in os.environ and max_ctx > ATTN_LMAX:
+        # past 4096 a tier every 4096 rows: a block reads at most 4095 masked rows more than it needs
+        fa_tiers += list(range(2 * ATTN_LMAX, max_ctx + 1, ATTN_LMAX))
+        if max_ctx % ATTN_LMAX and max_ctx % 256 == 0:
+            fa_tiers.append(max_ctx)
     if (((spec.family in BLOCK_ATTN_FA and not attn_block) or flash_probe) and set(spec.layer_types) == {DENSE} and T == 256
             and spec.head_dim == 64 and spec.rotary_dim == spec.head_dim and not spec.qk_norm and not spec.attn_gate
             and spec.num_heads % 4 == 0 and fa_tiers):
         attn_block = None
-        attn_fa = {"hd": 64, "l_max": fa_tiers[-1], "q_head": 4096 * (9 if AF_QSPLIT else 5), "qsplit": AF_QSPLIT,
+        attn_fa = {"hd": 64, "l_max": fa_tiers[-1], "q_head": 4096 * (9 if af_qsplit(spec) else 5), "qsplit": af_qsplit(spec),
                    **({"psplit": True} if flash_probe else {}),
                    "kernels": {str(Lw): f"af{Lw}" for Lw in fa_tiers}}
         # OPEN-PREFILL-GLUE-PREP: the bfp16 route's rope, Q packing and cache write as one more stream of the same
         # context (Q hi / lo only); n_pad is the qkv GEMM's padded width, the c-tiled y it reads
-        if AF_QSPLIT and not f32_gemm:
+        if af_qsplit(spec) and not f32_gemm:
             attn_fa["prep"] = {"kernel": "afp", "n_pad": -(-(qw + 2 * kvw) // BFP16_ROWS) * BFP16_ROWS}
     plans = pack_plan(spec)["layer_types"]
     shapes: set[tuple[int, int]] = set()
@@ -820,16 +830,16 @@ def gemm_route(spec: ModelSpec, max_ctx: int = 4096) -> dict | None:
             name = f"af{Lw}"
             out["kernels"][name] = {"context": "af", "insts": f"{name}/insts.bin", "build": name}
             out["builds"][name] = {"design": "attn_fa/attn_fa.py",
-                                   "build_dir": f"attn_fa/build_l{Lw}_h{spec.num_heads}_kv{spec.num_kv_heads}{sfx}" + (f"_r{fa_rows}" if flash_probe else ""),
+                                   "build_dir": f"attn_fa/build_l{Lw}_h{spec.num_heads}_kv{spec.num_kv_heads}{sfx}" + (f"_r{fa_rows}" if flash_probe or fa_rows != ATTN_LMAX else ""),
                                    "env": {"AF_L": str(Lw), "AF_HEADS": str(spec.num_heads),
                                            "AF_KV_HEADS": str(spec.num_kv_heads), "AF_KV_LD": str(L.KV_ROW // 2),
-                                           "AF_MAX_ROWS": str(fa_rows), "AF_QSPLIT": str(int(AF_QSPLIT)),
+                                           "AF_MAX_ROWS": str(fa_rows), "AF_QSPLIT": str(int(af_qsplit(spec))),
                                            **({"AF_PSPLIT": "1"} if flash_probe else {}),
                                            **({"AF_LONG_STREAM": "1"} if fa_long else {})}}
         if "prep" in attn_fa:
             out["kernels"]["afp"] = {"context": "af", "insts": "afp/insts.bin", "build": "afp"}
             out["builds"]["afp"] = {"design": "attn_fa/attn_fa.py",
-                                    "build_dir": f"attn_fa/build_prep_h{spec.num_heads}_kv{spec.num_kv_heads}{sfx}",
+                                    "build_dir": f"attn_fa/build_prep_h{spec.num_heads}_kv{spec.num_kv_heads}{sfx}" + (f"_r{max_ctx}" if max_ctx != ATTN_LMAX else ""),
                                     "env": {"AF_L": "256", "AF_HEADS": str(spec.num_heads),
                                             "AF_KV_HEADS": str(spec.num_kv_heads), "AF_KV_LD": str(L.KV_ROW // 2),
                                             "AF_MAX_ROWS": str(max_ctx), "AF_QSPLIT": "1", "AF_MODE": "prep",
@@ -979,6 +989,7 @@ def dit_route(spec: ModelSpec, q4: dict, plans: dict) -> dict | None:
 # The bfp16 block prefill route (OPEN-PREFILL-BFP16): the same five GEMMs on designs/gemm_bfp16 with the weights
 # repacked from the container's q4_1 to bfp16 at load. Only a family whose route has run on hardware gets one.
 BFP16_FAMILIES = ("granite",)
+BFP16_DEFAULT_FAMILIES = ("granite",)
 BFP16_ROWS = 1024       # gemm_bfp16's n * 8 columns: a weight's rows are padded to a whole number of these
 
 
@@ -994,7 +1005,21 @@ def gguf_bfp16_on() -> bool:
     return os.environ.get("DENSE_GGUF_BFP16") == "1"
 
 
-def bfp16_route(spec: ModelSpec, max_ctx: int = 4096, gguf: bool = False) -> dict | None:
+def bfp16_default(spec: ModelSpec) -> bool:
+    """Granite's default prefill (`fast`) is the bfp16 route with a precise qkv; `lean` keeps the q4 route and
+    `bfp16` the all-bfp16 one (OPEN-PREFILL-BFP16-QKV). DENSE_BFP16_DEFAULT=0 at export keeps the q4 route as `fast`."""
+    return spec.family in BFP16_DEFAULT_FAMILIES and os.environ.get("DENSE_BFP16_DEFAULT") != "0"
+
+
+def bfp16_qkv_mode() -> str:
+    """The default route's qkv: split3 (bfp16 hi / lo terms, K tripled), q4 (the q4 GEMM) or bfp16 (DENSE_BFP16_QKV)."""
+    mode = os.environ.get("DENSE_BFP16_QKV", "split3")
+    if mode not in ("split3", "q4", "bfp16"):
+        raise OpRangeError(f"DENSE_BFP16_QKV={mode}: split3, q4 or bfp16")
+    return mode
+
+
+def bfp16_route(spec: ModelSpec, max_ctx: int = 4096, gguf: bool = False, qkv: str = "bfp16") -> dict | None:
     """`gemm_route`'s five steps on gemm_bfp16, as the `bfp16` variant of the route (the user picks it with
     OFLM_OPEN_PREFILL_MODE=bfp16), plus its contexts / kernels / globals / builds; None when the spec has no q4_1
     route or its family is not in BFP16_FAMILIES (`gguf`: or the GGUF view's opt-in, gguf_bfp16_on, is set)."""
@@ -1024,6 +1049,8 @@ def bfp16_route(spec: ModelSpec, max_ctx: int = 4096, gguf: bool = False) -> dic
                 o = pool[i]
                 op = {"op": "bfp16_gemm", "tensor": o["tensor"], "nch": o["nch"], "in_dim": o["in_dim"],
                       "dst": 0, "row0": row0, "n_total": n_pad}
+                if wname == "gqkv3_w" and qkv == "split3":
+                    op["ksplit"] = 3
                 if "chunk0" in o:
                     op["chunk0"] = o["chunk0"]
                 ops.append(op)
@@ -1051,8 +1078,11 @@ def bfp16_route(spec: ModelSpec, max_ctx: int = 4096, gguf: bool = False) -> dic
             if glu and i == 2:
                 wname = "ggu_w"
             n_pad = pad_of[wname]
+            opt = {}
+            if i == 0 and qkv == "split3":
+                K, opt = 3 * K, {"a": "split3"}             # A [hi | lo | hi] against W [hi | hi | lo]
             env = {"GB_M": str(T), "GB_K": str(K), "GB_N": str(n_pad)}
-            x, y, opt, tag = f"gbfp_x_k{K}", f"gbfp_y_n{n_pad}", {}, ""
+            x, y, tag = f"gbfp_x_k{K}", f"gbfp_y_n{n_pad}", ""
             if glu and i == 2:
                 y, opt, tag = "gbfp_h", {"epi": "glu"}, "_glu"
                 env["GB_EPI"] = "glu"
@@ -1070,6 +1100,10 @@ def bfp16_route(spec: ModelSpec, max_ctx: int = 4096, gguf: bool = False) -> dic
                 out["globals"][y] = n_pad * T * 4
             out["builds"][kname] = {"design": "gemm_bfp16/gemm_bfp16.py",
                                     "build_dir": f"gemm_bfp16/build_n{n_pad}_k{K}_m{T}{tag}{sfx}", "env": env}
+        if qkv == "q4":
+            # bfp16 on qkv costs most of the route's error (K feeds every score): keep the q4 GEMM there
+            steps[0] = copy.deepcopy(base["layer_types"][lt]["program"][0])
+            weights["gqkv3_w"] = copy.deepcopy(base["layer_types"][lt]["weights"]["gqkv3_w"])
         gb["program"] = steps
         out["layer_types"][lt] = gb
     return out
@@ -1150,6 +1184,14 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
                 out[k].update(bf[k])
             for lt, gb in bf["layer_types"].items():
                 out["layer_types"][lt].setdefault("gemm_block_variants", {})["bfp16"] = gb
+        mixed = bf and bfp16_default(spec) and bfp16_route(spec, max_ctx, qkv=bfp16_qkv_mode())
+        if mixed:
+            for k in ("contexts", "kernels", "globals"):
+                out[k].update(mixed[k])
+            for lt, gb in mixed["layer_types"].items():
+                layer = out["layer_types"][lt]
+                layer["gemm_block_variants"]["lean"] = layer["gemm_block"]
+                layer["gemm_block"] = gb
         for name, types in r.get("variants", {}).items():
             for lt, gb in types.items():
                 out["layer_types"][lt].setdefault("gemm_block_variants", {})[name] = gb
@@ -1224,6 +1266,45 @@ def _gguf_q41_section(spec: ModelSpec, manifest: dict) -> dict:
     return g
 
 
+# OPEN-GGUF-BASE-VIEW: families whose GGUF runs the q4nx manifest itself (decode, both prefill routes, the rows pass,
+# the one-context tail), with only the q4_1 packs reading the GGUF.
+GGUF_BASE_VIEW_FAMILIES = ("granite",)
+GGUF_Q4NX_ONLY_OPS = ("std_fuse", "q8_perm", "bf16_gemm")
+
+
+def gguf_base_view(spec: ModelSpec) -> bool:
+    return (spec.family in GGUF_BASE_VIEW_FAMILIES and spec.quant == "q4_1" and not spec.q8_roles
+            and os.environ.get("DENSE_GGUF_BASE_VIEW") != "0")
+
+
+def _gguf_base_section(manifest: dict) -> dict:
+    g = copy.deepcopy({k: v for k, v in manifest.items() if k != "gguf"})
+
+    def walk(x):
+        if isinstance(x, dict):
+            if "op" in x and "tensor" in x and isinstance(x["op"], str):
+                if x["op"] in GGUF_Q4NX_ONLY_OPS:
+                    raise OpRangeError(f"GGUF base view: pack op {x['op']} reads a q4nx container")
+                if x["op"] == "std_perm":
+                    x["op"] = "std_perm_gguf"
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(g["pack"])
+    for layer in g["layer_types"].values():
+        walk(layer["pack"])
+        for gb in [layer.get("gemm_block")] + list(layer.get("gemm_block_variants", {}).values()):
+            if gb:
+                walk(gb.get("weights", {}))
+    if "rows" in g:
+        # Uno's LoRA ships as a q4nx sidecar; the GGUF view has none
+        g["rows"] = {k: v for k, v in g["rows"].items() if not k.startswith("lora_")}
+    return g
+
+
 def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
     """Opt-in BF16 scale storage: the same rounding already done by the cores.
 
@@ -1234,6 +1315,9 @@ def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
     """
     if gguf_q41_view(spec) and "gguf" not in manifest:
         manifest["gguf"] = _gguf_q41_section(spec, manifest)
+    if gguf_base_view(spec):
+        manifest["gguf"] = _gguf_base_section(manifest)
+        return
     if os.environ.get("DENSE_GGUF_COMPACT") != "1" or spec.quant == "q4_1_f32":
         return
     if (spec.family not in DENSE_FAMILIES or spec.quant != "q4_1" or spec.q8_roles
@@ -1362,7 +1446,7 @@ def rows_route(spec: ModelSpec) -> dict | None:
     }
 
 
-def builds(spec: ModelSpec) -> dict[str, dict]:
+def builds(spec: ModelSpec, max_ctx: int = 4096) -> dict[str, dict]:
     """Every kernel set the recipe ships: the q4nx build of each weight-consuming
     design AND its GGUF-direct f32-scale twin (`*_f32`, see programs())."""
     n = cores_for(spec)
@@ -1402,14 +1486,16 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
               f"f32-scale build does not fit a core at this shape", flush=True)
         del b["dx_f32"]
         del b["lm_head_q4_f32"]     # the head's twin has no section to serve either
-    r = gemm_route(spec)
+    r = gemm_route(spec, max_ctx)
     if r:
         b.update(r["builds"])
-        bf = bfp16_route(spec, gguf=gguf_bfp16_on())
+        bf = bfp16_route(spec, max_ctx, gguf=gguf_bfp16_on())
         if bf:
             b.update(bf["builds"])
+            if bfp16_default(spec):
+                b.update(bfp16_route(spec, max_ctx, qkv=bfp16_qkv_mode())["builds"])
     if os.environ.get("DENSE_GGUF_GEMM") == "1" and f32_twin_fits(spec):
-        gr = gemm_route(replace(spec, quant="q4_1_f32"))
+        gr = gemm_route(replace(spec, quant="q4_1_f32"), max_ctx)
         if gr:
             b.update(gr["builds"])
     if gguf_q41_view(spec):

@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "xrt/xrt_bo.h"
@@ -58,7 +59,7 @@ struct CoreConfig {
     size_t max_ctx = 4096;   ///< KV rows per attention layer and RoPE records: the context capacity
     unsigned timeout_ms = 60000;  ///< per dispatch; 0 blocks
     bool verbose = true;
-    std::string prefill_mode = "fast";  ///< OPEN-PREFILL-MODE: fast | lean (accurate is lean)
+    std::string prefill_mode = "fast";  ///< OPEN-PREFILL-MODE: fast | lean (accurate is lean) | bfp16
     bool draft = false;      ///< pack the model's draft adapter (uno.q4nx) if it has one; off unless asked (OPEN-UNO-DECODE)
 };
 
@@ -111,6 +112,12 @@ struct StepTiming {
     double moe_read_ms = 0;   ///< xres back
     double shared_ms = 0;     ///< the shared expert over the block (its GEMMs are in part0)
     double qkv_scatter_ms = 0;  ///< Stage 2.5 Gate A: y_qkv3 columns into gact Q/K/V rows + the device sync (used to sit inside gemm_tr_ms)
+    double prep_ms = 0;       ///< OPEN-PREFILL-GLUE-PREP: the prep dispatches (rope, Q pack, cache write), host-blocked time
+    double rope_ms = 0, qpack_ms = 0, qsync_ms = 0;   ///< the host path's rope + cache write, Q pack, and the Q / cache syncs (of mid)
+    /// per layer-major dense GEMM step (the attn_fa route): the host stage before it, its pack, syncs, NPU wait, untile
+    /// and the stage after
+    struct GemmStageMs { double prep = 0, pack = 0, sync = 0, wait = 0, untile = 0, post = 0; };
+    GemmStageMs gemm_stage[6];
 };
 
 /// The config.json fields a manifest checks, derived from a GGUF's metadata
@@ -271,6 +278,11 @@ public:
     /// (T at a time), the clamped SwiGLU and the weighted sum on the host. The KV rows land in the
     /// cache as the decode kernels keep them (bf16), so decode continues from pos + ids.size().
     void step_gptoss_prompt(const std::vector<int>& ids, bool want_logits);
+    /// Whether the dense attn_fa route runs the prompt (OPEN-PREFILL-ATTN-FA / OPEN-PREFILL-HOST-ATTN): every layer the
+    /// plain dense shape (no attn_block, q/k norm, window, sandwich or gate; silu), layer-major and stage-major.
+    bool dense_fa_ok() const { return fa_route_; }
+    /// The shape dense_fa_ok() needs, before the operator's switches.
+    bool dense_fa_fits() const;
     /// Validation: logits for EVERY real token of the next blocks (one lm_head pass each),
     /// read back with block_logits() -- what a position-for-position diff against the
     /// sequential path needs. Off by default; costs a tail per token.
@@ -278,7 +290,8 @@ public:
     const std::vector<std::vector<float>>& block_logits() const { return block_logits_; }
 
     // OPEN-DECODE-ROWS: step_rows writes the L rows' KV but does not move the position; the caller seeks.
-    size_t rows_l() const { return gguf_ ? 0 : man_.rows.l; }  // the rows kernels read bf16-scale pools only
+    // the loaded view's own rows: a GGUF view carries one only where its pools are what the rows kernels read
+    size_t rows_l() const { return w_ ? w_->rows.l : 0; }
     // draft: the OPEN-UNO-LORA pass, the LoRA on every row but row 0.
     void step_rows(const int* ids, int* argmax, bool want_logits = false, bool draft = false);
     bool has_draft() const { return !lora_.empty(); }
@@ -287,6 +300,8 @@ public:
     /// Row j's logits from the last step_rows(want_logits = true).
     const float* rows_logits(size_t j);
     double rows_ms() const { return rows_ms_; }
+    struct RowsPhase { double embed_ms = 0, patch_ms = 0, submit_ms = 0, blocked_ms = 0, layers_ms = 0, head_ms = 0, total_ms = 0; };
+    const RowsPhase& rows_phase() const { return rows_phase_; }
 
     int position() const { return pos_; }
     /// Test hook: place the next token at `pos` without decoding up to it.
@@ -506,11 +521,21 @@ private:
         std::vector<uint8_t> a[2];
     };
     DenseStaged ds_;
+    /// The attn_fa route's layer-major rows: residual after attention, normed rows, gate, host K / V windows, and the
+    /// next layer's input norm when the down pass fused it.
+    struct FaScratch {
+        std::vector<float> og, xm, gate, K, V, q, xn_next;
+        std::vector<double> res1;
+    };
+    FaScratch fs_;
+    int xn_ready_ = -1;     ///< the layer whose input norm fs_.xn_next already holds, or -1
+    bool y_rows_ = false;   ///< gemm_phase hands `post` y as [T, N] token rows (a bfp16 step), not [N, T]
     bool block_logits_all_ = false;
     std::vector<std::vector<float>> block_logits_;     ///< per real token of the last block, when asked
 
     std::vector<float> logits_host_;
     double rows_ms_ = 0;
+    RowsPhase rows_phase_;
     StepTiming timing_;
     /// Stage 2.5 Gate A: per-dxB-dispatch phase log (OFLM_OPEN_DXB_LOG=path.csv).
     /// Records layer,pos,patch/prep/submit/wait/read per token dispatch so the
@@ -539,6 +564,14 @@ private:
     bool host_attn_decode_on_ = false;
     /// Manifest::host_attention_refusal(): empty when the host attention computes this model (OPEN-HOST-ATTN-GUARD).
     std::string host_attn_refusal_;
+    bool fa_route_ = false;      ///< dense_fa_ok(): the plain dense shape's layer-major route (OFLM_OPEN_HOST_ATTN=0 off)
+    bool attn_fa_on_ = true;     ///< attn_fa in that route where the set carries it (OFLM_OPEN_ATTN_FA=0: host attention)
+    size_t fa_min_rows_ = 512;   ///< a window of this many rows or fewer takes the host attention (OFLM_OPEN_ATTN_FA_MIN)
+    size_t af_blocks_ = 0;       ///< af_q#b / af_o#b (and af_tbl#b / af_y#b) buffers allocated: one set a 256-token block
+    bool attn_prep_on_ = true;   ///< attn_fa's prep stream on a bfp16 qkv step (OFLM_OPEN_PREFILL_PREP=0 off)
+    bool prep_run_ = false;      ///< this prompt runs it (prep_setup)
+    size_t prep_pos0_ = 0;       ///< its first position
+    std::map<std::tuple<int, size_t, size_t>, xrt::bo> kv_sub_;   ///< (layer, block, pos0) -> the cache rows the block writes
     /// Stage 2.7 Gate A: the RUNTIME decode route selector. The 2.6 env stays
     /// as the constructor-time default (compat/debug: env on -> initial route
     /// Host); set_decode_route() overrides it any time -- including between
@@ -747,9 +780,25 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// layer-major one; the cached rows below it are pulled off the device on `first` only.
     void block_layer_full(int l, float* xres, size_t T, size_t t_real, size_t pos0, size_t row0, bool first);
     /// One GEMM step over B blocks: block b + 1 runs on the NPU while post(b, [N, T] y) runs on the host.
+    /// `slot` names the StepTiming::gemm_stage it adds to. `raw`: a bfp16 step hands post the c-tiled y itself
+    /// (bfp16_c_row reads it), not token rows. `before_last_post` runs once the last GEMM is done. `y_dev`: block b's
+    /// y stays on the device in the global y_dev[b] and nothing reads it back (post is not called).
     void gemm_phase(int l, const Step& s, size_t B, size_t T, size_t K, size_t N,
                     const std::function<const float*(size_t)>& prep,
-                    const std::function<void(size_t, const float*)>& post);
+                    const std::function<void(size_t, const float*)>& post, int slot = -1, bool raw = false,
+                    const std::function<void()>& before_last_post = nullptr,
+                    const std::vector<std::string>* y_dev = nullptr);
+    /// OPEN-PREFILL-BFP16-FFN: gate|up then down from H per block; one H buffer, as down(b) ends before gate|up(b + 1)
+    void glu_phase(int l, const Step& gu, const Step& dn, size_t B, size_t T, size_t hid,
+                   const std::function<const float*(size_t)>& prep,
+                   const std::function<void(size_t, const float*)>& post);
+    /// The attn_fa route over the whole prompt: host or attn_fa attention, each GEMM step over every block.
+    void step_gemm_prompt_fa(const std::vector<int>& ids, bool want_logits);
+    void layer_fa_staged(int l, std::vector<double>& xres, size_t B, size_t T, size_t N, size_t pos0);
+    /// attn_fa's per-block Q / O (and with a prep stream its table / qkv y) for at least B blocks.
+    void ensure_af_blocks(size_t B);
+    /// Decide whether the prompt's blocks go through attn_fa's prep stream and, if so, write each block's table and records.
+    void prep_setup(size_t B, size_t T, size_t N, size_t pos0);
     /// block_layer_linear / block_layer_full over all B blocks, same arithmetic per block, steps reordered.
     void layer_linear_staged(int l, float* xres, size_t B, size_t T, size_t N);
     void layer_full_staged(int l, float* xres, size_t B, size_t T, size_t N, size_t pos0);

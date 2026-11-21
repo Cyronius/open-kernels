@@ -49,7 +49,7 @@ def source_files(spec: ModelSpec, root: Path = ROOT) -> list[Path]:
     return out
 
 
-def build_key(spec: ModelSpec, root: Path = ROOT) -> str:
+def build_key(spec: ModelSpec, root: Path = ROOT, max_ctx: int = 4096) -> str:
     h = hashlib.sha256()
     for f in source_files(spec, root):
         h.update(f.relative_to(root).as_posix().encode())
@@ -67,4 +67,6 @@ def build_key(spec: ModelSpec, root: Path = ROOT) -> str:
     probes = getattr(for_spec(spec), "probe_env", dict)()
     if probes:
         h.update(b"\0probes=" + json.dumps(probes, sort_keys=True).encode())
+    if max_ctx != 4096:        # the capacity changes the attn_fa builds (tiers, cache rows)
+        h.update(b"\0max_ctx=" + str(max_ctx).encode())
     return "sha256:" + h.hexdigest()

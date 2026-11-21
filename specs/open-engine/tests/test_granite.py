@@ -1,4 +1,4 @@
-# Traces: OPEN-SPEC-DERIVE, OPEN-FAMILY-GRANITE, OPEN-DECODE-STREAM, OPEN-DECODE-ONE-CONTEXT-DENSE (canonical spec: specs/open-engine/spec.md)
+# Traces: OPEN-SPEC-DERIVE, OPEN-FAMILY-GRANITE, OPEN-GGUF-GRANITE-FOLD, OPEN-DECODE-STREAM, OPEN-DECODE-ONE-CONTEXT-DENSE (canonical spec: specs/open-engine/spec.md)
 """IBM Granite 4.2 3B on the dense recipe: spec derivation (HF and GGUF), the
 four scalar multipliers and why the recipe may ignore them, the 3B's layout
 (head_dim 64 at hidden 2560 -- the point every shipped design refused), and the
@@ -12,7 +12,7 @@ import pytest
 
 from recipes import dense as DR
 from recipes.manifest import manifest
-from recipes.spec import DENSE, ModelSpec, SpecError
+from recipes.spec import DENSE, ModelSpec, SpecError, granite_gguf_folds
 
 # The FOLDED container's config.json (vegahyo/Granite-4.2-3B-NPU2). q4nx-build
 # folds Granite's four multipliers into the weights, so attention_multiplier
@@ -48,14 +48,41 @@ def test_spec_from_hf_and_gguf_agree():
     assert da == db
 
 
+# granite-4.2-3b-Q4_1.gguf's own metadata: the GGUF is unfolded.
+GGUF_GRANITE_42_3B_RAW = dict(GGUF_GRANITE_42_3B, **{"granite.attention.scale": 0.015625})
+
+
+def test_an_unfolded_gguf_derives_the_folded_spec():
+    """OPEN-GGUF-GRANITE-FOLD: the engine folds the GGUF's multipliers at load, so the raw GGUF
+    derives the same spec (and finds the same kernel set) as the folded one."""
+    assert ModelSpec.from_gguf_metadata(GGUF_GRANITE_42_3B_RAW).spec_hash() == \
+        ModelSpec.from_gguf_metadata(GGUF_GRANITE_42_3B).spec_hash()
+
+
+def test_the_gguf_folds_are_pinned():
+    """OPEN-GGUF-GRANITE-FOLD: 4.2-3b folds q_proj by exactly 0.015625 * sqrt(64) = 0.125 and nothing else."""
+    assert granite_gguf_folds(GGUF_GRANITE_42_3B_RAW) == {"attn_q.weight": 0.125}
+    assert granite_gguf_folds(GGUF_GRANITE_42_3B) == {}
+    every = {"granite.attention.scale": 0.25, "granite.embedding_scale": 4.0, "granite.residual_scale": 0.5,
+             "granite.logit_scale": 2.0}
+    assert granite_gguf_folds(dict(GGUF_GRANITE_42_3B, **every)) == {
+        "attn_q.weight": 2.0, "attn_output.weight": 0.5, "ffn_down.weight": 0.5, "token_embd.weight": 4.0,
+        "output.weight": 0.5}
+
+
+@pytest.mark.parametrize("key, value", [("granite.attention.scale", 0.02), ("granite.residual_scale", 0.3),
+                                        ("granite.logit_scale", 3.0), ("granite.embedding_scale", -1.0)])
+def test_a_gguf_fold_that_is_not_a_power_of_two_is_refused(key, value):
+    with pytest.raises(SpecError, match="power-of-two"):
+        ModelSpec.from_gguf_metadata(dict(GGUF_GRANITE_42_3B_RAW, **{key: value}))
+
+
 def test_unfolded_multipliers_are_refused_by_name():
     """The whole reason Granite fits: attn.h hard-codes 1/sqrt(HD), so the
     recipe accepts a FOLDED container and must refuse an unfolded one loudly
     rather than run it and return plausible garbage."""
     with pytest.raises(SpecError, match=r"attention_multiplier 0\.015625 != head_dim\*\*-0\.5"):
         ModelSpec.from_hf_config(dict(HF_GRANITE_42_3B, attention_multiplier=0.015625))
-    with pytest.raises(SpecError, match="UNFOLDED"):
-        ModelSpec.from_gguf_metadata(dict(GGUF_GRANITE_42_3B, **{"granite.attention.scale": 0.015625}))
     for name in ("embedding_multiplier", "residual_multiplier", "logits_scaling"):
         with pytest.raises(SpecError, match=f"{name} 2.0 != 1.0"):
             ModelSpec.from_hf_config(dict(HF_GRANITE_42_3B, **{name: 2.0}))
@@ -168,3 +195,17 @@ def test_rope_is_the_plain_unscaled_table():
     got = np.array(s.rope_inv_freq())
     assert got.shape == (32,)
     assert np.allclose(got, 1e7 ** (-np.arange(32) / 32))
+
+
+def test_a_gguf_dirs_unfolded_config_derives_the_folded_spec(tmp_path):
+    """OPEN-GGUF-GRANITE-FOLD: a GGUF model dir carries IBM's unfolded config.json; the engine folds at load."""
+    import json
+    from recipes.load import spec_from_model_dir
+    raw = dict(HF_GRANITE_42_3B, attention_multiplier=0.015625)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "model.gguf").write_bytes(b"GGUF")
+    folded = ModelSpec.from_hf_config(HF_GRANITE_42_3B)
+    assert spec_from_model_dir(tmp_path).spec_hash() == folded.spec_hash()
+    (tmp_path / "model.gguf").unlink()
+    with pytest.raises(SpecError, match="UNFOLDED"):
+        spec_from_model_dir(tmp_path)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any, Mapping
@@ -2031,6 +2032,34 @@ def _granite_hf(cfg: Mapping[str, Any], real_vocab: int | None) -> ModelSpec:
     )
 
 
+def granite_gguf_folds(md: Mapping[str, Any]) -> dict[str, float]:
+    """OPEN-GGUF-GRANITE-FOLD: the per-tensor factors the engine folds into an unfolded Granite
+    GGUF at load (GGUF tensor names, per-layer ones without "blk.N."), only those unequal to 1.
+    src/open_qwen36 `granite_folds` is the same rule."""
+    a = md["general.architecture"]
+    hd = md.get(f"{a}.attention.key_length") or _need(md, f"{a}.embedding_length", "GGUF metadata") // _need(
+        md, f"{a}.attention.head_count", "GGUF metadata")
+    scale = md.get(f"{a}.attention.scale")
+    if scale is None:
+        raise SpecError(
+            f"granite: '{a}.attention.scale' in the GGUF does not state the attention multiplier, and it is "
+            f"not optional: attn.h scales by 1/sqrt(HD) = {hd ** -0.5}, and an absent key cannot be told "
+            f"from 1.0.")
+
+    def opt(k: str) -> float:
+        v = md.get(f"{a}.{k}")
+        return 1.0 if v is None else float(v)
+
+    res = opt("residual_scale")
+    want = {"attn_q.weight": float(scale) * math.sqrt(hd), "attn_output.weight": res, "ffn_down.weight": res,
+            "token_embd.weight": opt("embedding_scale"), "output.weight": 1.0 / opt("logit_scale")}
+    for t, f in want.items():
+        if not (f > 0 and math.frexp(f)[0] == 0.5):
+            raise SpecError(f"granite: folding the GGUF's multipliers needs a power-of-two factor, and {t} would "
+                            f"take {f}; convert the model with q4nx-build")
+    return {t: f for t, f in want.items() if f != 1.0}
+
+
 def _granite_gguf(md: Mapping[str, Any], tensors=None) -> ModelSpec:
     a = md["general.architecture"]
 
@@ -2048,13 +2077,8 @@ def _granite_gguf(md: Mapping[str, Any], tensors=None) -> ModelSpec:
         vocab = len(toks)
     if f"{a}.rope.scaling.factor" in md:
         raise SpecError("granite: rope_scaling is not supported (only the unscaled RoPE is validated)")
-    # A raw Granite GGUF is UNFOLDED, so these are the real multipliers and this
-    # is where that is caught -- the q4nx container is the folded artefact.
-    _granite_scale_check(
-        f"'{a}.attention.scale' in the GGUF", md.get(f"{a}.attention.scale"), hd,
-        {"embedding_scale": md.get(f"{a}.embedding_scale"),
-         "residual_scale": md.get(f"{a}.residual_scale"),
-         "logit_scale": md.get(f"{a}.logit_scale")})
+    # A raw Granite GGUF is unfolded; the engine folds it at load, so the spec is the folded model's.
+    granite_gguf_folds(md)
     return ModelSpec(
         family="granite",
         hidden=k("embedding_length"),

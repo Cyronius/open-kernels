@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string>
@@ -436,6 +437,25 @@ int main(int argc, char** argv) {
         for (uint8_t b : a) h = (h ^ b) * 1099511628211ull;
         std::printf("      bfp16_pack_a fnv1a = 0x%016llx\n", static_cast<unsigned long long>(h));
         check(h == 0x8b24e0b36ad1f427ull, "bfp16_pack_a: byte-identical to the NumPy packer");
+        // OPEN-PREFILL-BFP16-QKV: [hi | lo | hi] is bfp16_pack_a of the 3 K-wide [x | x - value(x) | x]
+        std::vector<float> x3(T2 * 3 * K2);
+        for (size_t r = 0; r < T2; ++r)
+            for (size_t c0 = 0; c0 < K2; c0 += 8) {
+                const float* s = x.data() + r * K2 + c0;
+                uint8_t blk[BFP16_BLOCK_BYTES];
+                float d[8];
+                bfp16_encode_block(s, blk);
+                bfp16_decode_block(blk, d);
+                for (size_t j = 0; j < 8; ++j) {
+                    x3[r * 3 * K2 + c0 + j] = s[j];
+                    x3[r * 3 * K2 + K2 + c0 + j] = s[j] - d[j];
+                    x3[r * 3 * K2 + 2 * K2 + c0 + j] = s[j];
+                }
+            }
+        std::vector<uint8_t> a3(T2 * 3 * K2 / 8 * BFP16_BLOCK_BYTES), r3(a3.size());
+        host::bfp16_pack_a_split3(x.data(), T2, K2, Bfp16Tiling{}, a3.data());
+        host::bfp16_pack_a(x3.data(), T2, 3 * K2, Bfp16Tiling{}, r3.data());
+        check(a3 == r3, "bfp16_pack_a_split3: the packer over [x | x - value(x) | x], byte for byte");
 
         const size_t M = 512, N = 2048, rb = 256, J = N / 1024;
         std::vector<float> c(M * N), un(N * M), rows(M * N);
@@ -531,6 +551,24 @@ int main(int argc, char** argv) {
         host::softmax_chunk_sum(M, L, hd, c0, hi.data(), lo.data(), pos.data(), m2.data(), l2.data(), acc.data(), pb.data(), window);
         check(pa == pb && std::memcmp(m1.data(), m2.data(), M * 4) == 0 && std::memcmp(l1.data(), l2.data(), M * 4) == 0,
               "softmax_chunk_sum: softmax_chunk of the stored hi + lo, bit for bit (window and causal mask)");
+    }
+
+    // ---- OPEN-DXL-HEAD: the rows head's argmax is the app's greedy (bf16 rounding, subnormals to zero, lowest id on a tie)
+    {
+        bool ok = true;
+        for (size_t n : {size_t{1}, size_t{7}, size_t{8}, size_t{37}, size_t{1001}}) {
+            std::vector<float> p(n);
+            for (size_t i = 0; i < n; ++i) p[i] = static_cast<float>(static_cast<int>((i * 7919) % 97) - 48) * 0.37f;
+            if (n > 20) { p[3] = 1e-40f; p[11] = 100.0f; p[19] = 100.0001f; }   // 19 rounds to 11's bf16: the lower id wins
+            int ref = 0;
+            float bv = -std::numeric_limits<float>::infinity();
+            for (size_t i = 0; i < n; ++i) {
+                const float x = std::fpclassify(p[i]) == FP_SUBNORMAL ? 0.0f : bf16_to_f32(f32_to_bf16(p[i]));
+                if (x > bv) { bv = x; ref = static_cast<int>(i); }
+            }
+            ok = ok && host::argmax_bf16_row(p.data(), n) == ref;
+        }
+        check(ok, "argmax_bf16_row: the scalar bf16 greedy's answer, ties to the lowest id");
     }
 
     std::printf("%s\n", failures ? "FAIL" : "PASS");

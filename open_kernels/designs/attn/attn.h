@@ -91,6 +91,12 @@
 #define ATTN_ABL 3           // PROBE ONLY: 1 = score only, 2 = score + softmax, 3 = the real thing.
 #endif
 
+#ifndef ATTN_G5_MMUL
+#define ATTN_G5_MMUL 0       // the block scorers (G5 in dx, TREE8 in dxl) as bf16 8x8x4 mmuls, S^T = K . Q^T; needs ATTN_HI_ONLY 1
+#endif
+#ifndef ATTN_HI_ONLY
+#define ATTN_HI_ONLY 0       // 1: bf16 q and p (lo halves zero; the G5 kernel skips them); 2: bf16 p only. Either takes ATTN_EXPA 3's exp
+#endif
 #ifndef ATTN_RB
 #define ATTN_RB 1            // cached rows per kernel call (see attn_rowb_impl); 1 = one row, as before
 #endif
@@ -259,7 +265,38 @@ static constexpr unsigned kMLU = ((kNHL + kVE - 1) / kVE) * kVE;
 #ifndef ATTN_EXPA
 #define ATTN_EXPA 0          // 1: exp with each Horner step's constant folded into the accumulator (not bit-identical to vexpN)
 #endif
-#if ATTN_EXPA
+#if ATTN_EXPA == 3 || (ATTN_EXPA == 2 && ATTN_HI_ONLY)
+// bf16-p precision (~2^-10); fp32 magic-number rounding avoids float-to-int's saturation-mode writes
+template <unsigned N>
+__attribute__((noinline)) inline vfN<N> attn_expa(vfN<N> x) {
+  constexpr float kMagic = 12582912.0f;
+  x = aie::max(x, aie::broadcast<float, N>(-87.0f));
+  const vfN<N> t = fmulN<N>(x, aie::broadcast<float, N>(1.44269504f));
+  accN<N> r;
+  r.from_vector(t);
+  r = aie::add(r, aie::broadcast<float, N>(kMagic));
+  const vfN<N> tv = r.template to_vector<float>();
+  const aie::vector<int32_t, N> n = aie::sub(tv.template cast_to<int32_t>(), aie::broadcast<int32_t, N>(0x4B400000));
+  accN<N> nf;
+  nf.from_vector(tv);
+  nf = aie::sub(nf, aie::broadcast<float, N>(kMagic));
+  accN<N> fa;
+  fa.from_vector(t);
+  fa = aie::sub(fa, nf.template to_vector<float>());
+  const vbN<N> f = fa.template to_vector<bfloat16>();
+  constexpr float c[5] = {9.68571144e-3f, 5.59220257e-2f, 2.40218655e-1f, 6.93121036e-1f, 1.00000015f};
+  vbN<N> p = aie::broadcast<bfloat16, N>((bfloat16)c[0]);
+  accN<N> acc;
+  AIE_LOOP_UNROLL_FULL
+  for (unsigned i = 1; i < 5; ++i) {
+    acc.from_vector(aie::broadcast<float, N>(c[i]));
+    acc = aie::mac(acc, p, f);
+    if (i < 4) p = acc.template to_vector<bfloat16>();
+  }
+  return aie::add(acc.template to_vector<float>().template cast_to<int32_t>(), aie::upshift(n, 23)).template cast_to<float>();
+}
+#define ATTN_EXPN attn_expa
+#elif ATTN_EXPA
 template <unsigned N>
 __attribute__((noinline)) inline vfN<N> attn_expa(vfN<N> x) {
   x = aie::max(x, aie::broadcast<float, N>(-87.0f));
@@ -657,6 +694,11 @@ static inline void attn_q_impl(const float *__restrict qe ATTN_BIAS_PARM, const 
     }
   }
 #endif
+#if ATTN_HI_ONLY == 1
+  // a zero lo half makes every scorer's hi + lo sum the hi product alone, so dx and dxl stay bit-identical
+  for (unsigned i = 0; i < ATTN_QN; ++i)
+    for (unsigned j = 0; j < kHD; j += kV) aie::store_v(qs + ATTN_QDST(i) * kHD + kQW + j, aie::zeros<bfloat16, kV>());
+#endif
 #undef ATTN_QN
 #undef ATTN_QSRC
 #undef ATTN_QDST
@@ -845,7 +887,11 @@ __attribute__((noinline)) inline void attn_row_impl(const bfloat16 *__restrict K
     aie::store_v(al + v, t1);
     splitN<kVE>(b, t0, t1);
     aie::store_v(bh + v, t0);
+#if ATTN_HI_ONLY
+    aie::store_v(bl + v, aie::zeros<bfloat16, kVE>());
+#else
     aie::store_v(bl + v, t1);
+#endif
     aie::store_v(grew_i + v, aie::select(aie::zeros<int32_t, kVE>(),
                                          aie::broadcast<int32_t, kVE>(1), grew));
   }
@@ -1000,13 +1046,53 @@ static inline __attribute__((always_inline)) v32f attn_score2(const bfloat16 *__
   ATTN_UNROLL_HD
   for (unsigned j = 0; j < kHD; j += kV) {
     const vbN<kV> kj = aie::load_v<kV>(k + j);
+#if ATTN_HI_ONLY == 1
+    a0 = aie::mac(a0, aie::load_v<kV>(qa + j), kj);
+    b0 = aie::mac(b0, aie::load_v<kV>(qb + j), kj);
+#else
     a0 = aie::mac(a0, aie::load_v<kV>(qa + j), kj);
     a1 = aie::mac(a1, aie::load_v<kV>(qa + kQW + j), kj);
     b0 = aie::mac(b0, aie::load_v<kV>(qb + j), kj);
     b1 = aie::mac(b1, aie::load_v<kV>(qb + kQW + j), kj);
+#endif
   }
+#if ATTN_HI_ONLY == 1
+  return attn_tree2(a0.template to_vector<float>(), b0.template to_vector<float>(), 16);
+#else
   return attn_tree2(aie::add(a0, a1).template to_vector<float>(), aie::add(b0, b1).template to_vector<float>(), 16);
+#endif
 }
+#ifndef ATTN_T8_MMUL_U
+#define ATTN_T8_MMUL_U 1     // PROBE: dxl's mmul chunk loop unroll count
+#endif
+#ifndef ATTN_T8_MMUL_FIX2
+#define ATTN_T8_MMUL_FIX2 0  // PROBE: two mmul sets a group always, a fixed trip count
+#endif
+#if ATTN_TREE8 && ATTN_G5_MMUL
+static_assert(kRB == 8 && kNHL == 8 && ATTN_HI_ONLY == 1, "attn.h ATTN_G5_MMUL on TREE8: 8-row blocks, 8 heads, bf16 q");
+// Q^T by [group of 4 heads][kv head set][8-dim chunk][dim][4 heads]; a set's columns of the other kv head are zero
+alignas(64) static bfloat16 attn_qt8[2 * 2 * 8 * 32];
+static unsigned attn_t8_ko[2][2], attn_t8_two[2];
+static inline void attn_t8_qt(const bfloat16 *__restrict q0, const unsigned *t8ko) {
+  for (unsigned g = 0; g < 2; ++g) {
+    const unsigned k0 = t8ko[4 * g];
+    unsigned k1 = k0;
+    for (unsigned j = 1; j < 4; ++j)
+      if (t8ko[4 * g + j] != k0) k1 = t8ko[4 * g + j];
+    attn_t8_ko[g][0] = k0;
+    attn_t8_ko[g][1] = k1;
+    attn_t8_two[g] = k1 != k0;
+    for (unsigned s = 0; s < 2; ++s)
+      for (unsigned c = 0; c < 8; ++c)
+        for (unsigned d = 0; d < 8; ++d)
+          for (unsigned j = 0; j < 4; ++j) {
+            const unsigned h = 4 * g + j;
+            const bool in = t8ko[h] == attn_t8_ko[g][s] && (s == 0 || attn_t8_two[g]);
+            attn_qt8[((g * 2 + s) * 8 + c) * 32 + d * 4 + j] = in ? q0[h * kHD + c * 8 + d] : (bfloat16)0.0f;
+          }
+  }
+}
+#endif
 #if ATTN_TREE8
 // attn_score2 for two heads that may sit on different kv heads: each takes its own K row.
 static inline __attribute__((always_inline)) v32f attn_score2g(const bfloat16 *__restrict ka, const bfloat16 *__restrict kb,
@@ -1018,9 +1104,13 @@ static inline __attribute__((always_inline)) v32f attn_score2g(const bfloat16 *_
     const vbN<kV> kja = aie::load_v<kV>(ka + j);
     const vbN<kV> kjb = aie::load_v<kV>(kb + j);
     a0 = aie::mac(a0, aie::load_v<kV>(qa + j), kja);
+#if ATTN_HI_ONLY != 1
     a1 = aie::mac(a1, aie::load_v<kV>(qa + kQW + j), kja);
+#endif
     b0 = aie::mac(b0, aie::load_v<kV>(qb + j), kjb);
+#if ATTN_HI_ONLY != 1
     b1 = aie::mac(b1, aie::load_v<kV>(qb + kQW + j), kjb);
+#endif
   }
   return attn_tree2(aie::add(a0, a1).template to_vector<float>(), aie::add(b0, b1).template to_vector<float>(), 16);
 }
@@ -1110,9 +1200,38 @@ static inline __attribute__((always_inline)) void attn_g5_spread(const vfN<2 * k
   aie::store_v(sv + 3 * N, b3);
 }
 #endif
+#if ATTN_G5_MMUL
+static_assert(kRB == 8 && kNHL <= 4 && ATTN_HI_ONLY == 1, "attn.h ATTN_G5_MMUL: 8-row blocks, up to 4 heads, bf16 q");
+alignas(64) static bfloat16 attn_qt[8 * 32];     // Q^T by 8-dim chunk: [dim][4 head slots], rebuilt at a token's first block
+static inline void attn_g5_qt(const bfloat16 *__restrict q0) {
+  for (unsigned c = 0; c < 8; ++c)
+    for (unsigned d = 0; d < 8; ++d)
+      for (unsigned j = 0; j < 4; ++j)
+        attn_qt[c * 32 + d * 4 + j] = j < kNHL ? q0[j * kHD + c * 8 + d] : (bfloat16)0.0f;
+}
+#endif
 static inline __attribute__((always_inline)) void attn_g5_score(const bfloat16 *const *__restrict Kb, const bfloat16 *__restrict q0,
                                                                unsigned kvl, float *__restrict sv) {
-#if ATTN_G5_JT
+#if ATTN_G5_MMUL
+  aie::mmul<8, 8, 4, bfloat16, bfloat16> mm;
+  const unsigned ko = kvl * kHD;
+  AIE_LOOP_UNROLL_FULL
+  for (unsigned c = 0; c < 8; ++c) {
+    const unsigned o = ko + c * 8;
+    const vbN<64> a = aie::concat(aie::load_v<8>(Kb[0] + o), aie::load_v<8>(Kb[1] + o), aie::load_v<8>(Kb[2] + o),
+                                  aie::load_v<8>(Kb[3] + o), aie::load_v<8>(Kb[4] + o), aie::load_v<8>(Kb[5] + o),
+                                  aie::load_v<8>(Kb[6] + o), aie::load_v<8>(Kb[7] + o));
+    if (c == 0) mm.mul(a, aie::load_v<32>(attn_qt));
+    else mm.mac(a, aie::load_v<32>(attn_qt + c * 32));
+  }
+  const v32f s = mm.template to_vector<float>();   // [row][head slot]
+  const v32f neg = aie::broadcast<float, 32>(-1e30f);
+  const auto [lo, hi] = aie::interleave_zip(s, neg, 4);  // [row][8 lanes], slots 4.. padding
+  constexpr uint32_t kRow = 0xffu & ~((1u << kNHL) - 1u);
+  const auto pad = aie::mask<32>::from_uint32(kRow | kRow << 8 | kRow << 16 | kRow << 24);
+  aie::store_v(sv, aie::select(lo, neg, pad));
+  aie::store_v(sv + 32, aie::select(hi, neg, pad));
+#elif ATTN_G5_JT
   alignas(128) float z[kRB * 32];                // level 1 a row: [head 0: 16 | head 1: 16]
 #ifdef ATTN_G5_JT_U
   ATTN_PRAGMA(clang loop unroll_count(ATTN_G5_JT_U))
@@ -1196,7 +1315,9 @@ static inline __attribute__((always_inline)) void attn_g5_pv(const bfloat16 *con
       AIE_LOOP_UNROLL_FULL
       for (unsigned hl = 0; hl < kNHL; ++hl) {
         acc[hl] = aie::mac(acc[hl], vj, ph[r * kNL + hl]);
+#if !ATTN_HI_ONLY
         acc[hl] = aie::mac(acc[hl], vj, pl[r * kNL + hl]);
+#endif
       }
     }
     AIE_LOOP_UNROLL_FULL
@@ -1270,7 +1391,39 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
     unsigned t8ko[8];                               // each head's K slice offset in a window row, the same for every row
     AIE_LOOP_UNROLL_FULL
     for (unsigned h = 0; h < 8; ++h) t8ko[h] = ATTN_T8_KV(hb + h) * kHD;
-#if ATTN_T8_SPLIT
+#if ATTN_G5_MMUL
+    // one mmul set per kv head, other columns zero: each head gets dx's exact sums, which keeps dxl bit-identical to dx
+    if (reinterpret_cast<const int32_t *>(ml)[0] == static_cast<int32_t>(0xF149F2CAu)) attn_t8_qt(q0, t8ko);
+    v32f sg[2];
+    AIE_LOOP_UNROLL_FULL
+    for (unsigned g = 0; g < 2; ++g) {
+      aie::mmul<8, 8, 4, bfloat16, bfloat16> mm;
+#if ATTN_T8_MMUL_FIX2
+      constexpr unsigned two = 1;                   // a one-kv-head group's second set has zero Q^T: it adds exact zeros
+#else
+      const unsigned two = attn_t8_two[g];
+#endif
+#if ATTN_T8_MMUL_U > 1
+      ATTN_PRAGMA(clang loop unroll_count(ATTN_T8_MMUL_U))
+#else
+      _Pragma("clang loop unroll(disable)")         // unrolled, dxl's core overflows its 16 KB of program memory
+#endif
+      for (unsigned c = 0; c < 8; ++c)
+        for (unsigned s = 0; s < 1 + two; ++s) {
+          const unsigned o = attn_t8_ko[g][s] + c * 8;
+          const vbN<64> a = aie::concat(aie::load_v<8>(Kb[0] + o), aie::load_v<8>(Kb[1] + o), aie::load_v<8>(Kb[2] + o),
+                                        aie::load_v<8>(Kb[3] + o), aie::load_v<8>(Kb[4] + o), aie::load_v<8>(Kb[5] + o),
+                                        aie::load_v<8>(Kb[6] + o), aie::load_v<8>(Kb[7] + o));
+          const vbN<32> b = aie::load_v<32>(attn_qt8 + ((g * 2 + s) * 8 + c) * 32);
+          if (c == 0 && s == 0) mm.mul(a, b);
+          else mm.mac(a, b);
+        }
+      sg[g] = mm.template to_vector<float>();       // [row][4 heads of the group]
+    }
+    const auto [lo, hi] = aie::interleave_zip(sg[0], sg[1], 4);   // [row][heads 0..7]
+    aie::store_v(sv, lo);
+    aie::store_v(sv + 32, hi);
+#elif ATTN_T8_SPLIT
     // few live values per pass lets the compiler unroll rows: 4,000 B of program for the one-pass loop, 5,056 B here
     alignas(128) static float t8z[kRB * 4 * 32];
     ATTN_PRAGMA(clang loop unroll_count(ATTN_T8_SPLIT_U1))
@@ -1306,6 +1459,10 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
 #undef ATTN_T8_KV
   }
 #elif ATTN_G5
+#if ATTN_G5_MMUL
+  // the token's first block: m is still attn_init's -1e30 (compared as bits: scalar float is a software call here)
+  if (reinterpret_cast<const int32_t *>(ml)[0] == static_cast<int32_t>(0xF149F2CAu)) attn_g5_qt(qs + (unsigned)h0 * kHD);
+#endif
   attn_g5_score(Kb, qs + (unsigned)h0 * kHD, attn_kvh((unsigned)h0) - attn_kvb(h0), sv);
 #else
 #if ATTN_NHL < 8
@@ -1427,7 +1584,11 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
   vbN<kPV> t0, t1;
   splitN<kPV>(pv, t0, t1);
   aie::store_v(ph, t0);
+#if ATTN_HI_ONLY
+  aie::store_v(pl, aie::zeros<bfloat16, kPV>());
+#else
   aie::store_v(pl, t1);
+#endif
 
   // a = exp(m - mn): one of (m - mn) and (smax - mn) is zero, so one exp gives both
 #if !ATTN_TREE && !ATTN_TREE8 && !ATTN_G5
@@ -1500,7 +1661,9 @@ __attribute__((noinline)) inline void attn_rowb_impl(const bfloat16 *const *__re
       for (unsigned r = 0; r < kRB; ++r) {
         const vbN<kV> vj = aie::load_v<kV>(Vb[r] + kvh * kHD + j);
         acc = aie::mac(acc, vj, ph[r * kNL + hl]);
+#if !ATTN_HI_ONLY
         acc = aie::mac(acc, vj, pl[r * kNL + hl]);
+#endif
       }
       aie::store_v(o + j, acc.template to_vector<float>());
     }
