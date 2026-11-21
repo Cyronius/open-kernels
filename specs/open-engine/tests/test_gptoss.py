@@ -15,6 +15,7 @@ installed.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
@@ -145,8 +146,10 @@ def test_the_spec_round_trips_through_json():
 def test_yarn_inverse_frequencies_match_the_published_table():
     """The values transformers' own `_compute_yarn_parameters` produces for this config,
     read off it in fp32 (torch's dtype there); the derivation works in fp64, so the
-    comparison is at fp32's own precision."""
-    inv = ModelSpec.from_hf_config(HF_GPTOSS_20B).rope_inv_freq()
+    comparison is at fp32's own precision. The engine's own table floors and ceils the ramp
+    bounds (llama.cpp's; the next test), so this one asks for the published bounds."""
+    spec = ModelSpec.from_hf_config(HF_GPTOSS_20B)
+    inv = dataclasses.replace(spec, rope_scaling={**spec.rope_scaling, "truncate_bounds": False}).rope_inv_freq()
     assert len(inv) == 32
     # the low pairs are pure extrapolation: the ramp clamps to 0 there, so no 1/32
     assert inv[0] == pytest.approx(1.0, rel=1e-12)
@@ -155,6 +158,21 @@ def test_yarn_inverse_frequencies_match_the_published_table():
     assert inv[16] == pytest.approx(0.0004564839182421565, rel=1e-6)
     assert inv[17] == pytest.approx(0.00012931869423482567, rel=1e-6)
     assert inv[31] == pytest.approx(3.023511396804679e-07, rel=1e-6)
+
+
+def test_the_engines_yarn_table_floors_and_ceils_the_ramp_bounds():
+    """llama.cpp's correction range is floor(8.10) = 8 .. ceil(17.41) = 18 where the config's `truncate: false` gives
+    8.10 .. 17.41, so pairs 9 to 17 differ (up to x1.76). Against llama.cpp's perplexity on 8 chunks of 4096 tokens of
+    real text (second halves, 12.74): 14.30 with the published bounds, 13.35 with these. Pairs outside 9..17 are equal."""
+    spec = ModelSpec.from_hf_config(HF_GPTOSS_20B)
+    assert spec.rope_scaling["truncate"] is False and spec.rope_scaling["truncate_bounds"] is True
+    inv = spec.rope_inv_freq()
+    assert inv[8] == pytest.approx(0.050813274815461475, rel=1e-9)
+    assert inv[9] == pytest.approx(0.031620752275346484, rel=1e-9)
+    assert inv[12] == pytest.approx(0.007015713910504388, rel=1e-9)
+    assert inv[15] == pytest.approx(0.0012061309690418727, rel=1e-9)
+    assert inv[17] == pytest.approx(0.00022794779579512524, rel=1e-9)
+    assert inv[18] == pytest.approx(3.8308812373753384e-05, rel=1e-9)
 
 
 def test_yarn_interpolates_the_high_pairs_by_the_full_factor():

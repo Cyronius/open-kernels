@@ -17,4 +17,16 @@ void LMHEAD_Q8_WRAP(LMHEAD_Q8_PREFIX, _group)(const uint8_t *__restrict t, const
     gemv_q8_tile(t + i * kTileBytes, tab, kt, kt == 0, y + quarter * kRows);
   }
 }
+#if LMHEAD_ROWS == 2
+void LMHEAD_Q8_WRAP(LMHEAD_Q8_PREFIX, _group2)(const uint8_t *__restrict t, const uint8_t *__restrict tab,
+                                               float *__restrict y0, float *__restrict y1, int group) {
+#pragma clang loop unroll(disable)
+  for (unsigned i = 0; i < kPerCall; ++i) {
+    const unsigned c = (unsigned)group * kPerCall + i;
+    const unsigned quarter = c % kRowSplit;
+    const unsigned kt = c / kRowSplit;
+    gemv_q8_tile2(t + i * kTileBytes, tab, kt, kt == 0, y0 + quarter * kRows, y1 + quarter * kRows);
+  }
+}
+#endif
 }
