@@ -4282,6 +4282,14 @@ Fused attention with source-scale projections reached 499/508 and median partial
 against uncached CPU, still above the Vulkan control median. Production integration, populated 128K
 quality and matched timing remain open. The installed set is unchanged.
 
+**2026-11-21 KV storage isolation (measured).** Rounding the independent forward's rotated K and
+V to FP16 or BF16, with FP32 attention arithmetic and source GGUF weights, gave 498/508 against
+uncached CPU in both cases. Median top-20 partial KL was 0.000565 and 0.000547 respectively,
+compared with 0.000564 for FP32 storage and 0.000381 for the Vulkan control. Adding simulated
+Q8_1 projection and Q8_K head activation quantization with FP16/BF16 storage gave 494/508 and
+496/508 (median partial KL 0.000830 and 0.000834). All cases agreed at 18/18 on the short prompt.
+Cache storage precision alone does not explain the reference gap in this diagnostic.
+
 **Status 2026-11-21: not accepted.**
 
 | criterion | status |
