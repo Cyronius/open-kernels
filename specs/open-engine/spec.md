@@ -4670,9 +4670,9 @@ before it, both misread the container identically and every comparison passed.
 ### OPEN-ATTN-QKV-BIAS: a per-channel bias on the q, k and v projections
 **Applies to:** openflowlm-next (`open_kernels/designs/attn/attn.h`, `designs/dense/dx.py`,
 `recipes/dense.py`, `model/replica_dense.py`)
-**Test category:** unit (`tests/test_qwen2.py`, `tests/test_op_range.py`) for the layout and
-the refusal; manual (the procedure below, needs the NPU and a Qwen2.5 container) for the
-numbers
+**Test category:** unit (layout and catalogue refusal), manual on the NPU.
+The attention gate in `designs/attn/probe_dense.py` streams the production bias FIFO.
+Use `python utilities/build-new-spec.py` to validate a new tuple. The whole-layer procedure below remains available for model-level checks.
 
 A family whose q, k and v projections carry a per-channel bias shall have it added to
 each projection's output before the q/k norm and the rotation -- `q = q + b_q`, and the
@@ -10211,3 +10211,13 @@ dispatch is one hardware context from the configuration's full ELF.
 `&` and `%PATH%` arrives unchanged in `summary.json`; `serve-images` answers
 `/v1/models`, a 1024 generation, 512 and 1024 edits with 200, and
 `guidance_scale` or an unsupported size with 400. Done 2026-11-14.
+
+### OPEN-ONBOARD-ONE-COMMAND
+
+**Test category:** manual on Windows and Linux.
+
+A checkpoint with a supported family recipe can be derived, validated, built and registered with one command. Run `python utilities/build-new-spec.py --spec qwen3-4b --dry-run` on Windows to inspect the plan without building. Select a checkpoint via `--repo` or `--gguf`, then run the same tool under the NPU lease.
+
+- `RC=0, spec ready` reports an existing compatible set or a completed gate, build and registration. Decode with the resulting kernel set through Phlegm.
+- If the recipe rejects the shape, the command names the constraint and saves the generated spec in `open_kernels/recipes/candidates/`.
+- `NOT_AUTOMATED` identifies the operation that needs a manual fixture or design change.

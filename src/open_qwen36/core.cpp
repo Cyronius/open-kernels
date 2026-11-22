@@ -285,6 +285,27 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     if (gguf_ && w_ && !want_f32 && w_->chunk_bytes == 6144 && man_.chunk_bytes == 5120) {
         Manifest& m = *man_.gguf;
         const Manifest& b = man_;
+        // A container block can reuse the GGUF pool only if all its GEMM weights come from it.
+        bool has_dense_block = false;
+        std::string block_refusal;
+        for (const auto& [lt, layer] : m.layer_types) {
+            const auto found = b.layer_types.find(lt);
+            if (found == b.layer_types.end()) continue;
+            const auto& gb = found->second.gemm_block;
+            if (!gb.t) continue;
+            if (gb.kind != "dense") {
+                block_refusal = gb.kind;
+                break;
+            }
+            has_dense_block = true;
+            for (const auto* weights : {&gb.weights, &gb.shared_weights, &gb.ffn_weights})
+                for (const auto& [name, weight] : *weights)
+                    if (weight.from != "pool") block_refusal = "GEMM weights outside the layer pool";
+            if (!block_refusal.empty()) break;
+        }
+        const bool enable_gguf_block = has_dense_block && block_refusal.empty();
+        if (!block_refusal.empty())
+            log("GGUF-direct block prefill unavailable (" + block_refusal + "); using step prefill");
         auto merge = [](std::vector<PackOp>& go, const std::vector<PackOp>& bo,
                         const std::string& lt) {
             if (go.size() != bo.size())
@@ -321,7 +342,7 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
             g.state_bytes = bl.state_bytes;
             g.state_row = bl.state_row;
             g.program = bl.program;                  // the base builds' step
-            g.gemm_block = GemmBlockProgram{};       // the q4nx prefill route stays off for a GGUF
+            g.gemm_block = enable_gguf_block ? bl.gemm_block : GemmBlockProgram{};
         }
         m.chunk_bytes = b.chunk_bytes;
         m.pool_bytes = b.pool_bytes;
@@ -334,16 +355,32 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
         // name exists in both sections and its context differs, it drives the
         // pool slot law, so it takes the base section's build.
         std::set<std::string> swap_names;
-        for (const auto& name_step : m.layer_types)
+        for (const auto& name_step : m.layer_types) {
             for (const auto& s : name_step.second.program)
                 swap_names.insert(s.kernel);
+            if (enable_gguf_block) {
+                const auto itb = b.layer_types.find(name_step.first);
+                if (itb != b.layer_types.end()) {
+                    const auto& gb = itb->second.gemm_block;
+                    for (const auto& s : gb.program) swap_names.insert(s.kernel);
+                    for (const auto& s : gb.shared_program) swap_names.insert(s.kernel);
+                    for (const auto& s : gb.ffn_program) swap_names.insert(s.kernel);
+                    for (const auto& [_, k] : gb.attn_block.kernels_shl) swap_names.insert(k);
+                    if (gb.t && gb.kind == "dense") swap_names.insert(gb.attn_kernel);
+                    if (!gb.moe_kernel.empty()) swap_names.insert(gb.moe_kernel);
+                    for (const auto& [_, k] : gb.moe_batch.kernels) swap_names.insert(k);
+                    for (const auto& [_, k] : gb.attn_block.kernels_s) swap_names.insert(k);
+                    for (const auto& [_, k] : gb.attn_block.kernels_pv) swap_names.insert(k);
+                    for (const auto& [_, k] : gb.attn_fa.kernels) swap_names.insert(k);
+                    if (gb.attn_fa.has_prep()) swap_names.insert(gb.attn_fa.prep_kernel);
+                }
+            }
+        }
         for (const std::string& n : swap_names) {
-            const auto kt = m.kernels.find(n);
-            if (kt == m.kernels.end()) continue;
             const auto bt = b.kernels.find(n);
             if (bt == b.kernels.end()) continue;
             m.contexts[bt->second.context] = b.contexts.at(bt->second.context);
-            kt->second = bt->second;             // the base's context and instruction stream
+            m.kernels[n] = bt->second;
         }
         // ---- the HEAD is part of the law too. It stays "lm" in the kernels map but
         // the two sections name different BUILDS there (lm_head_q4_f32 vs lm_head_q4),

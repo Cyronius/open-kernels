@@ -352,8 +352,15 @@ def dequant_pool(raw: np.ndarray, n: int, k: int, rs: int, gguf_type: str) -> np
 _GGUF_MAGIC = 0x46554747  # "GGUF" little-endian
 
 
-def read_gguf(path: str):
-    """-> (metadata dict, {name: {type, dims, offset, nbytes}})."""
+def read_gguf(source):
+    """Read the metadata and tensor inventory from a path or a binary stream."""
+    if hasattr(source, "read"):
+        return _read_gguf(source, getattr(source, "name", "GGUF stream"))
+    with open(source, "rb") as stream:
+        return _read_gguf(stream, source)
+
+
+def _read_gguf(f, path):
     GGUF_T = {0: ("u8", 1), 1: ("i8", 1), 2: ("u16", 2), 3: ("i16", 2),
               4: ("u32", 4), 5: ("i32", 4), 6: ("f32", 4), 7: ("bool", 1),
               8: ("str", None), 9: ("arr", None), 10: ("u64", 8), 11: ("i64", 8),
@@ -377,7 +384,6 @@ def read_gguf(path: str):
              24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M",
              30: "BF16"}
 
-    f = open(path, "rb")
     magic, ver, ntensors, nkv = struct.unpack("<IIQQ", f.read(24))
     if magic != _GGUF_MAGIC:
         raise ValueError(f"{path}: not a GGUF file")
@@ -424,7 +430,6 @@ def read_gguf(path: str):
         align = 32
     data_base = f.tell()
     data_base += (align - data_base % align) % align
-    f.close()
     return meta, tensors, data_base
 
 

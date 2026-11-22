@@ -41,7 +41,7 @@ def derived_model(stem: str) -> str:
 
 
 def update_frozen_hash(path: Path, filename: str, spec_hash: str) -> str:
-    lines = path.read_text().splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     entries = [i for i, ln in enumerate(lines) if HASH_ENTRY.match(ln)]
     if not entries:
         raise SystemExit(f"register-spec: no frozen hash entries found in {path}")
@@ -51,19 +51,19 @@ def update_frozen_hash(path: Path, filename: str, spec_hash: str) -> str:
             if m["hash"] == spec_hash:
                 return "already registered"
             lines[i] = f'{m["indent"]}"{filename}": "{spec_hash}",\n'
-            path.write_text("".join(lines))
+            path.write_text("".join(lines), encoding="utf-8", newline="\n")
             return f"hash updated (was {m['hash'][:19]}...)"
     last = entries[-1]
     indent = HASH_ENTRY.match(lines[last])["indent"]
     lines.insert(last + 1, f'{indent}"{filename}": "{spec_hash}",\n')
-    path.write_text("".join(lines))
+    path.write_text("".join(lines), encoding="utf-8", newline="\n")
     return "registered"
 
 
 def update_expected_name(path: Path, stem: str, model: str) -> str:
     if derived_model(stem) == model:
         return "derived name matches; no EXPECTED entry needed"
-    lines = path.read_text().splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     start = next((i for i, ln in enumerate(lines) if ln.startswith("EXPECTED = {")), None)
     if start is None:
         raise SystemExit(f"register-spec: no EXPECTED dict found in {path}")
@@ -74,11 +74,11 @@ def update_expected_name(path: Path, stem: str, model: str) -> str:
             if m["model"] == model:
                 return "already registered"
             lines[i] = f'{m["indent"]}"{stem}": "{model}",\n'
-            path.write_text("".join(lines))
+            path.write_text("".join(lines), encoding="utf-8", newline="\n")
             return f"name updated (was {m['model']})"
     indent = NAME_ENTRY.match(lines[start + 1])["indent"] if end > start + 1 else "    "
     lines.insert(end, f'{indent}"{stem}": "{model}",\n')
-    path.write_text("".join(lines))
+    path.write_text("".join(lines), encoding="utf-8", newline="\n")
     return "registered"
 
 
@@ -89,6 +89,7 @@ def main() -> int:
 
     sys.path.insert(0, str(ROOT / "open_kernels"))
     from recipes.load import load_spec
+    from recipes.families import family_from_config_dict
 
     for item in a.specs:
         p = Path(item)
@@ -103,7 +104,8 @@ def main() -> int:
             return 1
         h = update_frozen_hash(TEST_LFM2, spec_path.name, spec.spec_hash())
         n = update_expected_name(TEST_NAMES, spec_path.stem, model)
-        print(f"{spec_path.stem}: hash {h}; name {n}")
+        family = family_from_config_dict({"model_type": (spec.extra or {}).get("model_type")}) or spec.family
+        print(f"{spec_path.stem} ({family}): hash {h}, name {n}")
     print("commit: specs/open-engine/tests/test_lfm2.py specs/open-engine/tests/test_spec_model_names.py")
     return 0
 

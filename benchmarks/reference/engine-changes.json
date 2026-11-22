@@ -27,7 +27,7 @@
       "id": "dense-layer-major-rope",
       "origin": "phlegm: dense_layer_major_ok also accepts the plain `rope` attention prep (MiniCPM5-2B: byte-identical logits, ~1.4x prefill)",
       "files": {
-        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830"
+        "src/open_qwen36/core.cpp": "c4e0636302e07c7b6bc18f0ac31fc05e25200a36c8671ac943d419509706a0fb"
       }
     },
     {
@@ -41,7 +41,7 @@
       "id": "gptoss-runtime",
       "origin": "open-kernels: upstream-patches/gptoss-runtime.patch + gptoss-prefill-runtime.patch (GPT-OSS 20B decode route and block prefill; OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS), one hunk re-based over the kvslice 8-row message; OFLM #237's `small` -> `is_small` rename (rpcndr.h defines small on Windows)",
       "files": {
-        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.cpp": "c4e0636302e07c7b6bc18f0ac31fc05e25200a36c8671ac943d419509706a0fb",
         "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
         "src/open_qwen36/engine.cpp": "d8be3f289f8cc215a781bbbc4e6778797eac3bcf91b205e13fb7857509b613ef",
         "src/open_qwen36/gguf_file.cpp": "e76af08ae1099e1729c3f95e0c07b4491908907742f1fc1440dea61b7c1e0813",
@@ -62,7 +62,7 @@
       "id": "gptoss-npu-prefill-attention",
       "origin": "open-kernels: gpt-oss block prefill attention on the NPU (attn_fa_gx: 64 heads, learned sink, runtime sliding window; manifest gptoss_prefill.attn_fa; the KV cache padded to the smallest compiled window past the capacity; OPEN-PREFILL-GPTOSS)",
       "files": {
-        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.cpp": "c4e0636302e07c7b6bc18f0ac31fc05e25200a36c8671ac943d419509706a0fb",
         "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
         "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a",
         "src/open_qwen36/manifest.hpp": "134665a5a94158a487fe7d698e9255bfedc01723cddd1b0d8069d00a08a00602"
@@ -80,7 +80,7 @@
         "src/open_qwen36/block_host_test.cpp": "3e26782e1bdf783c1a20b2ea172d5221cd1f7ea542ddb39d2a3deb79c4fe9efc",
         "src/open_qwen36/build.cmd": "51c82db520377cd68bb383ba377b36f912a8a2daa6417996313ac51ca69f4e3d",
         "src/open_qwen36/cli.cpp": "256949c24651768ae8d3a0a5e384faf2705c648a7e0015de2043edd67f161798",
-        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.cpp": "c4e0636302e07c7b6bc18f0ac31fc05e25200a36c8671ac943d419509706a0fb",
         "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
         "src/open_qwen36/engine.cpp": "d8be3f289f8cc215a781bbbc4e6778797eac3bcf91b205e13fb7857509b613ef",
         "src/open_qwen36/engine.hpp": "9630346c7d6481998813f68670324cfbfea6412113783376561d6e4472ff1b21",
@@ -101,7 +101,7 @@
       "id": "granite-npu-speed",
       "origin": "open-kernels feat/granite-production-bar: OPEN-PREFILL-BFP16-QKV (pack op ksplit 3, step a split3, host::bfp16_pack_a_split3, bfp16_decode_block / bfp16_encode_hilo), a window of OFLM_OPEN_ATTN_FA_MIN (512) rows or fewer takes the host attention, norms by reciprocal multiply",
       "files": {
-        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.cpp": "c4e0636302e07c7b6bc18f0ac31fc05e25200a36c8671ac943d419509706a0fb",
         "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
         "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a",
         "src/open_qwen36/manifest.hpp": "134665a5a94158a487fe7d698e9255bfedc01723cddd1b0d8069d00a08a00602",

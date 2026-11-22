@@ -1006,10 +1006,10 @@
       "local_sha256": "780400bc352748b1d738af7c3e0bfa81da5917bad9c9761c54d3976ba4e65c38"
     },
     "utilities/build-new-spec.py": {
-      "ref": "main",
-      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
-      "upstream_sha256": "57e1d286c0430ba41d903dcb761ba950e5f00c2cc4b9b4a3c60980ae1e12eafb",
-      "local_sha256": "57e1d286c0430ba41d903dcb761ba950e5f00c2cc4b9b4a3c60980ae1e12eafb"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "562f57d1fef57a05615956d22f8e4005735087ef60112c5fcabcf1d18e968d33",
+      "local_sha256": "59d32c9da8dda0f3fd03775277dfd85ec1992b13094b6c58bd8f199cf5359f85"
     },
     "utilities/catalogue-add-point.py": {
       "ref": "main",
@@ -1018,10 +1018,10 @@
       "local_sha256": "59f5a691a75a9eb7d087e6f44ca2f8acf43aa6d77a9b86c71e33a5f19b150a69"
     },
     "utilities/gen-kernel-spec.py": {
-      "ref": "main",
-      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
-      "upstream_sha256": "3da9a9d8bc9d2a643bf59bca2b3245f2330cddc6a1c815696144e22c9a7861e4",
-      "local_sha256": "3da9a9d8bc9d2a643bf59bca2b3245f2330cddc6a1c815696144e22c9a7861e4"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "391ea905276efe0e73462beb96efc8cc5dbe9628685f9f0059644ebc6d372f4f",
+      "local_sha256": "d0c1ed8091b4dfd4fccbcda7c07413813722e66d329dbcb4aaf01bed46c00e7b"
     },
     "utilities/lx-probe.cpp": {
       "ref": "audit-pr223",
@@ -1048,10 +1048,10 @@
       "local_sha256": "c303ba946c3c189036fe942b0747306a15ee0f5698ccd7c2c6dc1aaae5ce05ec"
     },
     "utilities/export-kernels.py": {
-      "ref": "main",
-      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
-      "upstream_sha256": "a97be909c6d096bf04e48b81ee857451eef69ae3af39da3a4139d12e0e0855f5",
-      "local_sha256": "a97be909c6d096bf04e48b81ee857451eef69ae3af39da3a4139d12e0e0855f5"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "9dca3bce2984e8edbfb2d188ca4851f2174898f0cca5bae970cd3b5987bd2f08",
+      "local_sha256": "00dd0b94846137b766873f4f7de1e2c750908c66e3ad134897fea1b6b327622c"
     },
     "utilities/wide_deltanet_reference.py": {
       "ref": "origin/main",
@@ -1066,22 +1066,28 @@
       "local_sha256": "2c49aa49f03de2006008fe83b72e6e5f9263dbe33687c2810282910b6680b505"
     },
     "utilities/op-gate.py": {
-      "ref": "main",
-      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
-      "upstream_sha256": "b6eed29254eb6d5f734bb117b9bab24a196b24de1f3325da362f0d313d858f71",
-      "local_sha256": "07a803c7cd4a7b1c82f6d5d5c969dd258d37fe13be5d4b6d53a9aec7fa971c73"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "8110905edfd8337d65081646a7a5fc764efb5ddd00fb7d74b3cee4316a4994ec",
+      "local_sha256": "44fb9383900eb1e6c855eaaef51733ba3eca4583f51dc71e1ccddb97d5e74375"
     },
     "utilities/register-spec.py": {
       "ref": "main",
       "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
       "upstream_sha256": "1d143d2f44857d2588ff400245003dac0f046f750c99f7d4a300f9e3903ca018",
-      "local_sha256": "1d143d2f44857d2588ff400245003dac0f046f750c99f7d4a300f9e3903ca018"
+      "local_sha256": "81884d970bed05bf5979980816510e0470662a12ca75858f67a2f9c801fea5df"
     },
     "utilities/spec-gaps.py": {
       "ref": "main",
       "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
       "upstream_sha256": "d21e25a85c1a2fd6d3f917255cf19a396715c3a15c528023c70f6be879fb7b1d",
       "local_sha256": "d21e25a85c1a2fd6d3f917255cf19a396715c3a15c528023c70f6be879fb7b1d"
+    },
+    "utilities/probe-family-sizes.py": {
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "594d1dfcf6c368faa0d3edc9b86627fd01b3fa8f365ffeed766aa4017c61f231",
+      "local_sha256": "6914cb8f61e5f6bf1ff84439a9594cac97cd7bf1d24150ea39e834c6d0877518"
     }
   },
   "local_adjustments": {

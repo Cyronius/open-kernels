@@ -42,12 +42,22 @@ TOPS.
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 
 import numpy as np
 from ml_dtypes import bfloat16
 
-from . import gguf_pool
+if __package__:
+    from . import gguf_pool
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import gguf_pool
+
+if __package__ == "open_kernels.gguf_pool":
+    from .. import q4_1_pack
+else:
+    import q4_1_pack
 
 Q8_CH_BF16 = 8704       # q4nx q8 chunk: 256 bf16 scales, then 8192 int8 codes
 Q8_CH_F32 = gguf_pool.CH_Q8  # 9216: pool chunk bytes, 32 rows x 256 k (q8 lm_head, f32 scales)
@@ -162,7 +172,7 @@ def _selftest() -> int:
     for n, k in [(256, 2048), (512, 2048)]:
         ok &= _check_q8(n, k, rng)
     print("\nThe f32 plane holds bits the kernel throws away before its first MAC."
-          if ok else "\nSomething here does not hold — the f32 plane may be earning its bytes.")
+          if ok else "\nSomething here does not hold â€” the f32 plane may be earning its bytes.")
     return 0 if ok else 1
 
 

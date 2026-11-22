@@ -51,10 +51,9 @@ def test_an_unvalidated_hidden_is_refused_by_the_first_template_that_cannot_take
 
 
 def test_an_unvalidated_gemv_k_is_refused():
-    """7168 stopped being the example on 2026-11-07 (Nanbeige4.3-33B, OPEN-FAMILY-NANBEIGE); 13312 is a K
-    nobody has built. Match the refusal, not the whole set, which grows with every validated point."""
-    with pytest.raises(OpRangeError, match=r"gemv_q4: K=13312 is outside the validated set \{1024, 2048, "):
-        require("gemv_q4", K=13312)
+    """PR #245 validated 13312. The catalogue still refuses the unvalidated K=12800."""
+    with pytest.raises(OpRangeError, match=r"gemv_q4: K=12800 is outside the validated set \{768, 1024, "):
+        require("gemv_q4", K=12800)
 
 
 def test_unknown_template_and_parameter():
