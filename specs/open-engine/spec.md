@@ -4279,8 +4279,16 @@ staged head planes once per layer, and used the same 32736-token populated fixtu
 exact key, matched all 8 Vulkan continuation tokens, and returned finite logits after position 32767.
 Measured development prefill was 129.95 tok/s versus 48.35 tok/s in the prior unpaired installed run.
 Fused attention with source-scale projections reached 499/508 and median partial KL 0.000511
-against uncached CPU, still above the Vulkan control median. Production integration, populated 128K
+against uncached CPU, still above the Vulkan control median. Production integration, installed 128K
 quality and matched timing remain open. The installed set is unchanged.
+
+**2026-11-21 populated 128K scratch runtime (measured).** The fused fast route completed a
+131040-token prompt at capacity 131072. It retrieved the exact key and matched all eight
+Vulkan continuation tokens through `<|im_end|>` (ID 130073). First-position partial KL against
+Vulkan was 0.001170. The 33 captured logits rows were finite and matched the CLI argmax trace.
+The diagnostic continued through all 32 consumed decode positions, ending at 131071.
+Development NPU prefill and decode were 34.12 tok/s and 1.81 tok/s under Arbiter.
+The earlier unpaired Vulkan reference prefilled at 378.25 tok/s.
 
 **2026-11-21 KV storage isolation (measured).** Rounding the independent forward's rotated K and
 V to FP16 or BF16, with FP32 attention arithmetic and source GGUF weights, gave 498/508 against
@@ -4323,7 +4331,7 @@ as `kvslice=8`, `rb=1`, with the `attnpos` patch. CLI and HTTP generation have s
 | pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
 | tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
 | llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | FAIL (measured, installed o7d6, strict CPU-only b11393). On 508 tokens Vulkan 497/508 (median top-20 partial KL 0.000463), installed fast 493/508 (0.001523), accurate 491/508 (0.000948). On 18 tokens all scored 18/18. Accurate also exceeded Vulkan KL on the short prompt. |
-| NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Long-context results above. A synthetic seek to position 131071 with the full 42-layer installed set returned finite logits with empty KV history. On a populated 32736-token prompt, installed fast prefill and Vulkan recovered the same exact retrieval key and agreed on all 8 reference continuation tokens. The NPU also returned finite logits at decode position 32767. Development NPU prefill was 48.35 tok/s (97.46% attention and staging) and boundary decode 6.37 tok/s. Vulkan recovered the key at 131040 tokens. Populated 131072-position NPU coverage remains pending. |
+| NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Installed fast matched Vulkan on populated 32K retrieval and returned finite logits at position 32767. A synthetic seek with empty KV history returned finite logits at 131071 with the installed set. The fused scratch route passed the populated 128K Vulkan comparison above. Installed populated 128K and paired timing remain unverified. |
 | greedy vs llama.cpp | Strict CPU-only b11393, installed set (measured): short fast 48/48, accurate 37/48. At token 38, CPU selected ID 350 over 35 by 0.031 logits and accurate NPU selected ID 35 over 350 by 0.053 logits. Both modes matched all 48 tokens on the long prompt. |
 | `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
 | `phlegm serve` | NOT RUN: stopped at the teacher-forced failure |
