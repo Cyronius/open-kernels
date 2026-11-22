@@ -53,6 +53,7 @@ EXPECTED = {
     "qwen3-14b": "Qwen3-14B-NPU2",
     "nanbeige43-33b": "Nanbeige4.3-33B-Q4pure-NPU2",   # our pure Q4_0 GGUF from BF16 (OPEN-FAMILY-NANBEIGE)
     "llama3-8b": "Llama-3-8B-NPU2",
+    "qwen25-it-1.5b": "Qwen2.5-1.5B-Instruct-GGUF-NPU2",
 }
 
 

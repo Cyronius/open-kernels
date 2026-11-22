@@ -63,3 +63,7 @@ open_kernels/harness/out/
 .codegraph/
 .DS_Store
 /.plans/
+
+# export-kernels output and its best-effort mlir-aie clone
+/src/xclbins/
+/third_party/
