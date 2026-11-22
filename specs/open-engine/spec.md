@@ -4290,6 +4290,15 @@ Q8_1 projection and Q8_K head activation quantization with FP16/BF16 storage gav
 496/508 (median partial KL 0.000830 and 0.000834). All cases agreed at 18/18 on the short prompt.
 Cache storage precision alone does not explain the reference gap in this diagnostic.
 
+**2026-11-21 CPU reference audit (measured).** The earlier b11393 replay used `-ngl 0`.
+With that setting, the server logged CPU KV storage, Vulkan-host model storage and a Vulkan
+compute buffer. On eight sampled prefixes of the 508-token fixture, adding `--device none`
+changed the top token at positions 440 and 460 with flash attention set to auto. Explicitly enabling
+flash attention reproduced the CPU-only auto results. Disabling it restored the prior top token
+at 460, with different probabilities. Repeating the original device selection reproduced the
+prior probabilities at both positions. A full CPU-only replay is pending. The gate remains open
+and the table retains the historical measurements with their original device selection.
+
 **Status 2026-11-21: not accepted.**
 
 | criterion | status |
@@ -4297,7 +4306,7 @@ Cache storage precision alone does not explain the reference gap in this diagnos
 | unit | PASS |
 | pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
 | tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
-| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | FAIL (measured, installed o7d6, b11393): on 508 tokens Vulkan agreed with CPU at 498/508 (median top-20 partial KL 0.000328), NPU fast at 495/508 (0.001424), and accurate at 494/508 (0.000873). All three agreed at 18/18 on the short prompt. With prefix reuse disabled, Vulkan scored 496/508 (0.000381), NPU fast and accurate each scored 495/508 (0.001512 and 0.000897), and the sequential diagnostic scored 493/508 (0.001069). |
+| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | OPEN. Strict CPU-only replay pending. Historical failure (measured, installed o7d6, b11393, `-ngl 0` reference with Vulkan compute available): on 508 tokens Vulkan agreed with the reference at 498/508 (median top-20 partial KL 0.000328), NPU fast at 495/508 (0.001424), and accurate at 494/508 (0.000873). All three agreed at 18/18 on the short prompt. With prefix reuse disabled, Vulkan scored 496/508 (0.000381), NPU fast and accurate each scored 495/508 (0.001512 and 0.000897), and the sequential diagnostic scored 493/508 (0.001069). |
 | NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Long-context results above. A synthetic seek to position 131071 with the full 42-layer installed set returned finite logits with empty KV history. On a populated 32736-token prompt, installed fast prefill and Vulkan recovered the same exact retrieval key and agreed on all 8 reference continuation tokens. The NPU also returned finite logits at decode position 32767. Development NPU prefill was 48.35 tok/s (97.46% attention and staging) and boundary decode 6.37 tok/s. Vulkan recovered the key at 131040 tokens. Populated 131072-position NPU coverage remains pending. |
 | greedy vs llama.cpp | Earlier prompts passed on the 2026-11-11 set. Installed set, measured matching prefixes out of 48: short fast/accurate 48/37, long 13/13. At the first mismatch, CPU margins were 0.031 logits (short) and 0.130 (long), with NPU margins 0.053 (short accurate) and 0.095/0.082 (long fast/accurate). |
 | `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
