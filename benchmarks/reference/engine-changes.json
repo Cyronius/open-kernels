@@ -1,98 +1,98 @@
 {
-  "base": "38ae3d2643e87ea34e83ec6c0e72274e0bbd411d",
+  "base": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
   "changes": [
     {
       "id": "pr226-manifest-move-only",
       "origin": "oflm:PR226 f566a1d6f93c43f1f3de5e1b7dccb52177191fcf",
       "files": {
-        "src/open_qwen36/manifest_test.cpp": "f1c569e713baecb2c513df71a8aca1899fb39ed944330b69ccac758f3e68f0b5"
+        "src/open_qwen36/manifest_test.cpp": "8e46cba778dead3190db3302d49db2dd3bd8b23794dd885ca7ba5a04887e4edf"
       }
     },
     {
       "id": "llama-gguf-qk-rows",
       "origin": "phlegm:minicpm5-2b-kv2 (MiniCPM5-2B; undo llama.cpp's paired q/k rows for arch llama)",
       "files": {
-        "src/open_qwen36/pools.cpp": "8d035aa47649f8babe2803eb046eefcc3a2801c9f468fa6f9f4f17cfe2de8d0d",
-        "src/open_qwen36/gguf_pack_test.cpp": "4fa0fd3c9190f2ef824b1b236cea134da2f0bdf6eb257b4fc44b35d5ed876200"
+        "src/open_qwen36/pools.cpp": "3f4062221ae4f8ab6f7ac9d93dc745b7c9c0c2a30dfe8bc236184785b9a50d28",
+        "src/open_qwen36/gguf_pack_test.cpp": "a4bd70d67bed2ab16a2eda511611db9a0ac8874b3f71a521c0e584f48fa14162"
       }
     },
     {
       "id": "gguf-lmhead-q8",
       "origin": "phlegm: the raw-GGUF branch of lmhead_q8, ported from target/npu-dev/nanbeige-runtime (OFLM reference-runtime-next lineage): Q8_0 codes kept, other types requantized to int8 + bf16 scale (MiniCPM5-2B)",
       "files": {
-        "src/open_qwen36/pools.cpp": "8d035aa47649f8babe2803eb046eefcc3a2801c9f468fa6f9f4f17cfe2de8d0d"
+        "src/open_qwen36/pools.cpp": "3f4062221ae4f8ab6f7ac9d93dc745b7c9c0c2a30dfe8bc236184785b9a50d28"
       }
     },
     {
       "id": "dense-layer-major-rope",
       "origin": "phlegm: dense_layer_major_ok also accepts the plain `rope` attention prep (MiniCPM5-2B: byte-identical logits, ~1.4x prefill)",
       "files": {
-        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb"
+        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830"
       }
     },
     {
       "id": "rope-prep-qsplit",
       "origin": "phlegm: manifest.cpp treats attn_block prep `rope` as qsplit (core.cpp already splits Q for rope), so a dense kernel set may carry kernels_shl (DENSE_AG_SHL experiment; logits byte-identical on MiniCPM5-2B)",
       "files": {
-        "src/open_qwen36/manifest.cpp": "25064b5c44d09dcc26023f41385384100e7da2f920a36d402c224a4b154701fc"
+        "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a"
       }
     },
     {
       "id": "gptoss-runtime",
       "origin": "open-kernels: upstream-patches/gptoss-runtime.patch + gptoss-prefill-runtime.patch (GPT-OSS 20B decode route and block prefill; OPEN-FAMILY-GPTOSS, OPEN-PREFILL-GPTOSS), one hunk re-based over the kvslice 8-row message; OFLM #237's `small` -> `is_small` rename (rpcndr.h defines small on Windows)",
       "files": {
-        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
-        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
-        "src/open_qwen36/engine.cpp": "c39bfc034a1c146989aab9d86e8c3c79bdcc482feaf06010b8caf885c76f8272",
-        "src/open_qwen36/gguf_file.cpp": "8d3aa19338a55162aba13836541b1d0312ed67a2439a029730222ec98d572d3f",
-        "src/open_qwen36/gguf_file.hpp": "61c4362f99ee9851efc1200452b6ca95beb2ab9142cba5e681df16c9c1b55c66",
-        "src/open_qwen36/manifest.cpp": "25064b5c44d09dcc26023f41385384100e7da2f920a36d402c224a4b154701fc",
-        "src/open_qwen36/manifest.hpp": "d068a4ad51d9153e15d9d1d1117327310600435186ae27b85467e397e052fcf1",
-        "src/open_qwen36/pools.cpp": "8d035aa47649f8babe2803eb046eefcc3a2801c9f468fa6f9f4f17cfe2de8d0d"
+        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
+        "src/open_qwen36/engine.cpp": "d8be3f289f8cc215a781bbbc4e6778797eac3bcf91b205e13fb7857509b613ef",
+        "src/open_qwen36/gguf_file.cpp": "e76af08ae1099e1729c3f95e0c07b4491908907742f1fc1440dea61b7c1e0813",
+        "src/open_qwen36/gguf_file.hpp": "e605f183fcc00e991b0ac9250107e03961b937a95f25cfcf6d74d8122eb97fc2",
+        "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a",
+        "src/open_qwen36/manifest.hpp": "134665a5a94158a487fe7d698e9255bfedc01723cddd1b0d8069d00a08a00602",
+        "src/open_qwen36/pools.cpp": "3f4062221ae4f8ab6f7ac9d93dc745b7c9c0c2a30dfe8bc236184785b9a50d28"
       }
     },
     {
       "id": "gptoss-mx4-tile-padding",
       "origin": "open-kernels: the experts' mx4 half-tile padded from 2368 to 2560 B (zero pad) so a gx_moe w element is gx_att's 10240 B and one core image serves both streams (OPEN-FAMILY-GPTOSS); recipes/gptoss.py, gptoss_pack.py and gemv_mx4.h carry the same constant",
       "files": {
-        "src/open_qwen36/pools.cpp": "8d035aa47649f8babe2803eb046eefcc3a2801c9f468fa6f9f4f17cfe2de8d0d"
+        "src/open_qwen36/pools.cpp": "3f4062221ae4f8ab6f7ac9d93dc745b7c9c0c2a30dfe8bc236184785b9a50d28"
       }
     },
     {
       "id": "gptoss-npu-prefill-attention",
       "origin": "open-kernels: gpt-oss block prefill attention on the NPU (attn_fa_gx: 64 heads, learned sink, runtime sliding window; manifest gptoss_prefill.attn_fa; the KV cache padded to the smallest compiled window past the capacity; OPEN-PREFILL-GPTOSS)",
       "files": {
-        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
-        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
-        "src/open_qwen36/manifest.cpp": "25064b5c44d09dcc26023f41385384100e7da2f920a36d402c224a4b154701fc",
-        "src/open_qwen36/manifest.hpp": "d068a4ad51d9153e15d9d1d1117327310600435186ae27b85467e397e052fcf1"
+        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
+        "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a",
+        "src/open_qwen36/manifest.hpp": "134665a5a94158a487fe7d698e9255bfedc01723cddd1b0d8069d00a08a00602"
       }
     },
     {
       "id": "pr209-granite-engine",
       "origin": "oflm:PR209 f2957e03 (base e69084285c), ported by hand onto the in-tree lineage: OPEN-PREFILL-ATTN-FA (attn_fa parse, af<L> dispatch per block on the layer-major dense route, OFLM_OPEN_ATTN_FA=0 host attention, host fallback past the widest tier; local change: window tiers may be sparse, a block takes the narrowest tier that covers it), OPEN-PREFILL-GLUE-PREP (afp prep stream on a bfp16 qkv step, manifest_version 6 in the local numbering), OPEN-PREFILL-BFP16-FFN (glu pack halves and the 4-step route, version 5), OPEN-PREFILL-HOST-ATTN (Granite joins host_attention_refusal), OPEN-DXL-HEAD (rows head_fold, mode elements; rows read from the loaded view, attnrows kvslice), OPEN-SPEC-LOOKUP (spec_lookup.hpp, cli --spec / --spec-mode / --spec-ngram / --spec-probe / --spec-dump, engine spec_cycle without Uno), OPEN-DECODE-ROWS (--rows-check block prefill, correlation, ROWS CLOSE), cli --prefill-mode bfp16 / --ids2 / --ids-list. Not ported: run reuse and the tail queue-ahead (OFLM_OPEN_RUN_REUSE), Uno changes. Hashes also cover the uncommitted OPEN-GGUF-GRANITE-FOLD port in gguf_file / pools / core / gguf_pack_test.",
       "files": {
-        "src/open_qwen36/CMakeLists.txt": "9620cd7fb6397d72947ffb42ff2605a7fea36df1a38f7f2a75ae77b52b01dcef",
+        "src/open_qwen36/CMakeLists.txt": "172df84d833c4a5c307e42663ede41e7e0ec7e57789dff379d03d771d9d725ba",
         "src/open_qwen36/README.md": "5485b78a4dfc2e428060ae224995f531033ba3da3bd9dcafc0b5f112f7b78304",
-        "src/open_qwen36/bfp16.hpp": "2cf80c3dc7d5cb3b5cc065f21ed558c2d19f3aa116728da2f93d129328319a23",
-        "src/open_qwen36/block_host.cpp": "8a1ff15e2a62391dcbca5e4171a2b99063e9698a2a1dd487ee5eda90dcc1548f",
-        "src/open_qwen36/block_host.hpp": "795dd158e839bef65d0c9d97e5d2eab1234dfcd1d6ce45702f2eae93302a4901",
-        "src/open_qwen36/block_host_test.cpp": "e5ac438a3936488da28967e3ec2835fd575629edc174739cecca73535f23334d",
-        "src/open_qwen36/build.cmd": "5db5fb5a03083be6126e0d3b510f323abb6ca3fc32081dab05afc485ea018935",
-        "src/open_qwen36/cli.cpp": "8325ab72656a595535db85d01058c38d5cf802efb2dc7be5a584270c8ec5dd0b",
-        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
-        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
-        "src/open_qwen36/engine.cpp": "c39bfc034a1c146989aab9d86e8c3c79bdcc482feaf06010b8caf885c76f8272",
+        "src/open_qwen36/bfp16.hpp": "2b4f3a9308ca0f2c745dc1ac51817e0bdeb480dee47318b19b465328db227792",
+        "src/open_qwen36/block_host.cpp": "9c94055fd56d2703b02cf9c676218850bccb87eeb486e64304cc3e91664ec947",
+        "src/open_qwen36/block_host.hpp": "fd31e13156f252952b7a340aa03efeddaa6cd4ccab380609378193da13c07cc0",
+        "src/open_qwen36/block_host_test.cpp": "3e26782e1bdf783c1a20b2ea172d5221cd1f7ea542ddb39d2a3deb79c4fe9efc",
+        "src/open_qwen36/build.cmd": "51c82db520377cd68bb383ba377b36f912a8a2daa6417996313ac51ca69f4e3d",
+        "src/open_qwen36/cli.cpp": "256949c24651768ae8d3a0a5e384faf2705c648a7e0015de2043edd67f161798",
+        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
+        "src/open_qwen36/engine.cpp": "d8be3f289f8cc215a781bbbc4e6778797eac3bcf91b205e13fb7857509b613ef",
         "src/open_qwen36/engine.hpp": "9630346c7d6481998813f68670324cfbfea6412113783376561d6e4472ff1b21",
-        "src/open_qwen36/gguf_file.cpp": "cc2de29f765a353eb3b08e36be111ae08b6da00abc1697ca6159b902b60fe3e3",
-        "src/open_qwen36/gguf_file.hpp": "5123a7a0b3916f87fc68c0ccb9371505cf4757168de6e2f883e0b145ed5bb236",
-        "src/open_qwen36/gguf_pack_test.cpp": "cb63083fe68c88f4cc1e7e3b2d2f633a6989d5d6a1b787848ca694e2e51b5ef4",
-        "src/open_qwen36/manifest.cpp": "f9653b3d3012ac974db4f6eec97bb98f9d17401451a65d95deca18925a85599a",
-        "src/open_qwen36/manifest.hpp": "95ae3a1940258c85db96f3a5de1f971800f7a42f117b2061914e7b5d0f483504",
-        "src/open_qwen36/manifest_test.cpp": "9400ce73576d16a133ef151c26b69ad39206d070da2c37ea7bd558e95a4bb362",
-        "src/open_qwen36/pools.cpp": "38c247d12ddcf8a309589f15617687582678b9cfa96d6055e8b4cba9bcf5996b",
-        "src/open_qwen36/pools.hpp": "591ffabb7784900ce136cf3cf1302522d82d29c1ccdbc7a2651e6b351e728e49",
-        "src/open_qwen36/pools_test.cpp": "cb3299227a2aeec9ddbcae3490cf32919060c33a6254034569901c9135c7726d",
+        "src/open_qwen36/gguf_file.cpp": "e76af08ae1099e1729c3f95e0c07b4491908907742f1fc1440dea61b7c1e0813",
+        "src/open_qwen36/gguf_file.hpp": "e605f183fcc00e991b0ac9250107e03961b937a95f25cfcf6d74d8122eb97fc2",
+        "src/open_qwen36/gguf_pack_test.cpp": "a4bd70d67bed2ab16a2eda511611db9a0ac8874b3f71a521c0e584f48fa14162",
+        "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a",
+        "src/open_qwen36/manifest.hpp": "134665a5a94158a487fe7d698e9255bfedc01723cddd1b0d8069d00a08a00602",
+        "src/open_qwen36/manifest_test.cpp": "8e46cba778dead3190db3302d49db2dd3bd8b23794dd885ca7ba5a04887e4edf",
+        "src/open_qwen36/pools.cpp": "3f4062221ae4f8ab6f7ac9d93dc745b7c9c0c2a30dfe8bc236184785b9a50d28",
+        "src/open_qwen36/pools.hpp": "63543d1f3b3fc0a819ace637a0433fe121de7fba5b2fd610072dd27b839a8ed7",
+        "src/open_qwen36/pools_test.cpp": "bc8c6531341606c23986d0c3c7b6f32f5f5562a81582844603a782d57983ecca",
         "src/open_qwen36/spec_lookup.hpp": "ceadff3f6c05ab26c142d96d093e5c80ba2ad95ca74ce2e3d7f7e05ac2165767",
         "src/open_qwen36/spec_lookup_test.cpp": "af666f6e1d9f89b1363b686c5b08c0da29da9d72129e6be57de89bd0ed0c999c"
       }
@@ -101,18 +101,28 @@
       "id": "granite-npu-speed",
       "origin": "open-kernels feat/granite-production-bar: OPEN-PREFILL-BFP16-QKV (pack op ksplit 3, step a split3, host::bfp16_pack_a_split3, bfp16_decode_block / bfp16_encode_hilo), a window of OFLM_OPEN_ATTN_FA_MIN (512) rows or fewer takes the host attention, norms by reciprocal multiply",
       "files": {
-        "src/open_qwen36/core.cpp": "7b8f33bf1f5bf22acd308ffe4fdf514765ceee5981c7dd27e8d73606e53b2dcb",
-        "src/open_qwen36/core.hpp": "f4a79428327ac18b4cda39a0f20036028df46dd86b16aa3f548e602afe6e42cb",
-        "src/open_qwen36/manifest.cpp": "165582a375cbfd3e3af3cf6b1b825d566c53e7f223c1df9839f0cfd1da2dd8fb",
-        "src/open_qwen36/manifest.hpp": "2bdc68fd7918e2544262b4c0072096bce2e181e7177e981fc5884975716cfc40",
-        "src/open_qwen36/pools.cpp": "f24f7960e567d46e3f0d308218d17abf6224bdc32f45a3741e4c4fd7a1de7c93",
-        "src/open_qwen36/pools.hpp": "8532f9439bcc869001d9d99a61eaedfe1aff653b0befb816afc471e0ada79d3e",
-        "src/open_qwen36/block_host.cpp": "8a1ff15e2a62391dcbca5e4171a2b99063e9698a2a1dd487ee5eda90dcc1548f",
-        "src/open_qwen36/block_host.hpp": "795dd158e839bef65d0c9d97e5d2eab1234dfcd1d6ce45702f2eae93302a4901",
+        "src/open_qwen36/core.cpp": "fa8bc14e3527eddad4b7241cb50e66d31ab2700c65779ba7ff980d08be164830",
+        "src/open_qwen36/core.hpp": "1fa3269ca9061503475a8adf16b9d700c7f7d439240993555f24629a5a303551",
+        "src/open_qwen36/manifest.cpp": "a1c19d08645c705e9728ef706382d9ea7558b7b0bd71d6dbf7190d723c3a6c9a",
+        "src/open_qwen36/manifest.hpp": "134665a5a94158a487fe7d698e9255bfedc01723cddd1b0d8069d00a08a00602",
+        "src/open_qwen36/pools.cpp": "3f4062221ae4f8ab6f7ac9d93dc745b7c9c0c2a30dfe8bc236184785b9a50d28",
+        "src/open_qwen36/pools.hpp": "63543d1f3b3fc0a819ace637a0433fe121de7fba5b2fd610072dd27b839a8ed7",
+        "src/open_qwen36/block_host.cpp": "9c94055fd56d2703b02cf9c676218850bccb87eeb486e64304cc3e91664ec947",
+        "src/open_qwen36/block_host.hpp": "fd31e13156f252952b7a340aa03efeddaa6cd4ccab380609378193da13c07cc0",
         "src/open_qwen36/bfp16.hpp": "2b4f3a9308ca0f2c745dc1ac51817e0bdeb480dee47318b19b465328db227792",
-        "src/open_qwen36/manifest_test.cpp": "495acccbc5d7f2114bd37bccfacd3650b468d6da150be4ec5975ad84a1b97ba8",
+        "src/open_qwen36/manifest_test.cpp": "8e46cba778dead3190db3302d49db2dd3bd8b23794dd885ca7ba5a04887e4edf",
         "src/open_qwen36/pools_test.cpp": "bc8c6531341606c23986d0c3c7b6f32f5f5562a81582844603a782d57983ecca",
-        "src/open_qwen36/block_host_test.cpp": "e5ac438a3936488da28967e3ec2835fd575629edc174739cecca73535f23334d"
+        "src/open_qwen36/block_host_test.cpp": "3e26782e1bdf783c1a20b2ea172d5221cd1f7ea542ddb39d2a3deb79c4fe9efc"
+      }
+    },
+    {
+      "id": "oflm-main-sync",
+      "origin": "open-kernels: replay local manifest versions, model packers, attention routes and Windows phlegm build compatibility across OFLM main",
+      "files": {
+        "src/gguf/gguf_file.cpp": "767ec3073aafd6563dff780aa382dc839fa3df93e62187d35a266c4c998d69d6",
+        "src/gguf/gguf_file.hpp": "fa4f63b24e3f460b7b3774e0cd4183fa144ca3cf12ed9b1f2d49e3367bb09b0e",
+        "src/open_qwen36/attn_window_test.cpp": "82df3625213d99b47e3d4c0b4ea8a440e85c4b122a43ac67541f6d2a2aad189e",
+        "src/open_qwen36/kvslice_patch_test.cpp": "4fcaea953646fd065348499283e2721cfa6d6623352e636d0110f2a0f7fa5c04"
       }
     }
   ]

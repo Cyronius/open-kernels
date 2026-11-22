@@ -1765,11 +1765,11 @@ def _gguf_op(spec: ModelSpec, op: dict) -> dict:
     o = op["op"]
     hd, kd, vd, kh = spec.head_dim, spec.lin_key_dim, spec.lin_value_dim, spec.lin_key_heads
     if o == "expert_stripes":
-        return {"op": "q35_stripes", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
+        return {"op": "expert_stripes_gguf", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
                 "dst": op["dst"], "experts": op["experts"], "stripes": op["stripes"],
                 "stripe_bytes": op["stripe_bytes"], "in_dim": op["in_dim"]}
     if o == "expert_down":
-        return {"op": "q35_down", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
+        return {"op": "expert_down_gguf", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
                 "experts": op["experts"], "expert_bytes": op["expert_bytes"]}
     if o == "lmhead_q8":
         return {"op": "q35_lmhead", "tensor": GGUF_GLOBALS[t], "dst": op["dst"], "in_dim": op["in_dim"]}

@@ -43,10 +43,23 @@ struct PackOp {
     uint64_t taps = 0, groups = 0, width = 0;                           ///< conv_transpose
     uint64_t chunk_bytes = 0;                                           ///< lmhead_q8 (the SOURCE chunk)
     uint64_t rows = 0, cols = 0, elem = 0;                              ///< transpose
+    uint64_t qgate_rows = 0;                                            ///< std_perm_gguf: rows per
+                                                                        ///< head-half of a FUSED q|gate
+                                                                        ///< tensor (0 = not fused). The
+                                                                        ///< GGUF orders it per head
+                                                                        ///< [q_h|gate_h|...], the pool
+                                                                        ///< [all q|all gate]
+    bool qgate_gate = false;                                            ///< ... and which half this op takes
     std::string split;                                                  ///< std_perm of a q8 source: "hi" |
                                                                         ///< "lo", one half of its exact q4_1
                                                                         ///< split ("" = the whole tensor)
     std::string via;                                                    ///< bf16_gemm: "q4_1" reads a q8 source as the q4 ops do
+    double fold = 1.0;                                                  ///< std_perm_gguf: multiply the
+                                                                        ///< dequantized values before
+                                                                        ///< requantizing (Granite's
+                                                                        ///< attention_multiplier, which a
+                                                                        ///< container bakes in and a raw
+                                                                        ///< GGUF has not folded)
     uint64_t row0 = 0, n_total = 0;                                     ///< bfp16_gemm: this tensor's first row in the stacked
                                                                         ///< weight, and the weight's padded row count
     std::string glu;                                                    ///< bfp16_gemm: "gate" | "up" half of OPEN-PREFILL-BFP16-FFN's gate|up
@@ -55,7 +68,12 @@ struct PackOp {
     std::string div_running;                                            ///< put: divide the values by the product,
                                                                         ///< over the layers BEFORE this one, of this
                                                                         ///< one-value tensor ("{j}" = that layer) --
-                                                                        ///< Gemma 4's layer_output_scale, folded
+                                                                        ///< Gemma 4's layer_output_scale, folded:
+                                                                        ///< the residual is carried divided by the
+                                                                        ///< running product (see recipes/gemma4.py);
+                                                                        ///< direction-exact under RMSNorm, not what
+                                                                        ///< llama.cpp computes (it multiplies instead)
+    uint64_t period = 0, take = 0, offset = 0, kheads = 0, vperk = 0, vdim = 0, v0 = 0, vaxis = 0;
     uint64_t dst_rows = 0;                                              ///< transpose: pad the
                                                                         ///< destination row to this
                                                                         ///< many values, tail zeroed
@@ -175,6 +193,7 @@ struct AttnFa {
 
 struct GemmBlockProgram {
     uint64_t t = 0;               ///< 0 = no route for this layer type
+    std::string gemm = "q4";
     std::string kind;             ///< dense | linear | full
     std::vector<Step> program;
     std::map<std::string, GemmWeight> weights;
@@ -202,6 +221,8 @@ struct GemmBlockProgram {
     uint64_t norm_groups = 1;
     // linear: the fused qkv width, the value width, the DeltaNet geometry, the state layout
     uint64_t qkv_dim = 0, vw = 0, key_heads = 0, value_heads = 0, head_dim = 0, conv_kernel = 0;
+    bool conv_f32 = false;
+    bool key_head_tiled = false;  ///< absent mapping preserves pre-GGUF grouped kernel exports
     // linear: the out projection's GEMM returns 2 x hidden rows, the hi and lo halves of a q8
     // weight's exact q4_1 split, and the host adds them (OPEN-PREFILL-BATCH)
     bool out_split = false;
@@ -351,6 +372,11 @@ struct Manifest {
     size_t kv_row = 0, ptab_row = 0, rotary_dim = 0, rout_idx_off = 1024;
     double rope_theta = 0;
     std::vector<double> rope_inv_freq;       ///< per rotary pair (rotary_dim / 2 values; Llama 3's scaling is in here)
+    bool linear_conv_f32 = false;
+    bool attn_kv_pair = false;
+    bool rope_interleaved = false;           ///< layout.rope_pairing: the RoPE pairs ADJACENT dims
+                                             ///< (2i, 2i + 1), llama.cpp's NORM layout for the llama
+                                             ///< archs -- vs the default half-split (i, i + rot/2)
     double final_logit_softcapping = 0;      ///< logits = c * tanh(logits / c) on the host (Gemma 4: 30); 0 = none
     bool has_moe = false;                    ///< layout.moe present (a family with routed experts)
     stream_patch::MoeGeometry moe;
@@ -385,7 +411,8 @@ struct Manifest {
     /// Throws naming the first key of config.json that disagrees with the manifest. A key
     /// config.json lacks takes its hf_config_defaults value when there is one, and is
     /// refused as lacking otherwise.
-    void check_model(const nlohmann::json& config, const std::string& where) const;
+    void check_model(const nlohmann::json& config, const std::string& where,
+                   bool model_type = true) const;
     const LayerType& layer_type(size_t layer) const;
     /// Why the host attention (OPEN-HOST-ATTN-GUARD) cannot compute this model, or "" when it can.
     /// It implements K2's and Granite's attention only; any other family is refused by name.

@@ -67,13 +67,23 @@ void rope_pairs_cs(float* x, size_t pairs, size_t dist, const float* c, const fl
 }
 
 // the partial rotation over the first 2 * half dims, half-split (Qwen's layout)
-void rope(float* x, size_t half, const double* inv_freq, double pos) {
+void rope(float* x, size_t half, const double* inv_freq, double pos, bool il) {
+    if (!il) {
+        for (size_t i = 0; i < half; ++i) {
+            const double a = pos * inv_freq[i];
+            const float c = static_cast<float>(std::cos(a)), s = static_cast<float>(std::sin(a));
+            const float x1 = x[i], x2 = x[half + i];
+            x[i] = x1 * c - x2 * s;
+            x[half + i] = x2 * c + x1 * s;
+        }
+        return;
+    }
     for (size_t i = 0; i < half; ++i) {
         const double a = pos * inv_freq[i];
         const float c = static_cast<float>(std::cos(a)), s = static_cast<float>(std::sin(a));
-        const float x1 = x[i], x2 = x[half + i];
-        x[i] = x1 * c - x2 * s;
-        x[half + i] = x2 * c + x1 * s;
+        const float x1 = x[2 * i], x2 = x[2 * i + 1];
+        x[2 * i] = x1 * c - x2 * s;
+        x[2 * i + 1] = x2 * c + x1 * s;
     }
 }
 
@@ -81,14 +91,23 @@ void rope(float* x, size_t half, const double* inv_freq, double pos) {
 // with the carried state standing in where that runs before the block (a run shorter than the
 // window keeps what the shift would have left in front of it). In place over the state rows,
 // and every s < 0 read is at an index above the one being written, so the order is safe.
-void conv_state_tail(size_t pre, size_t nch, const float* qkv, size_t R, uint16_t* conv_state) {
+void conv_state_tail(size_t pre, size_t nch, const float* qkv, size_t R, void* history, bool conv_f32) {
+    if (R == 0) return;  // accepting no tokens preserves the restored window
+    auto* conv_state = static_cast<uint16_t*>(history);
+    auto* conv_fp32 = static_cast<float*>(history);
     for (size_t r = 0; r < pre; ++r) {
         const long long s = static_cast<long long>(R) - static_cast<long long>(pre) + static_cast<long long>(r);
         if (s < 0) {
-            std::copy(conv_state + (R + r) * nch, conv_state + (R + r + 1) * nch, conv_state + r * nch);
+            if (conv_f32)
+                std::copy(conv_fp32 + (R + r) * nch, conv_fp32 + (R + r + 1) * nch, conv_fp32 + r * nch);
+            else
+                std::copy(conv_state + (R + r) * nch, conv_state + (R + r + 1) * nch, conv_state + r * nch);
         } else {
             const float* row = qkv + static_cast<size_t>(s) * nch;
-            for (size_t j = 0; j < nch; ++j) conv_state[r * nch + j] = f32_to_bf16(row[j]);
+            for (size_t j = 0; j < nch; ++j) {
+                if (conv_f32) conv_fp32[r * nch + j] = row[j];
+                else conv_state[r * nch + j] = f32_to_bf16(row[j]);
+            }
         }
     }
 }
@@ -452,28 +471,35 @@ void sandwich_rows(const float* y, const double* x, size_t T, size_t hid, size_t
 
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
-                    uint16_t* conv_state, float* S, float* og, double* phase_ms, DeltaTape* tape) {
+                    void* history, float* S, float* og, double* phase_ms, DeltaTape* tape) {
+    auto* conv_state = static_cast<uint16_t*>(history);
+    auto* conv_fp32 = static_cast<float*>(history);
     const auto tp0 = std::chrono::steady_clock::now();
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim, nch = 2 * key_w + vw;
-    if (g.value_heads % g.key_heads || g.t_real > g.T || g.s_rows < dim || g.lanes < g.value_heads)
+    if (!g.key_heads || !g.value_heads || g.value_heads % g.key_heads || g.t_real > g.T || g.s_rows < dim || g.lanes < g.value_heads)
         throw std::runtime_error("open_qwen36: deltanet_block: inconsistent geometry");
-    const size_t grp = g.value_heads / g.key_heads, R = g.t_real;
+    const size_t R = g.t_real;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(dim));
     std::fill(og, og + g.T * vw, 0.f);
 
     // ---- phase 1, per token: the conv (state rows carried), q / k normalised, alpha / beta
-    // The conv is a fixed taps-wide window over the bf16-rounded rows, not a recurrence, so
+    // The conv is a fixed taps-wide window (FP32 or BF16 according to conv_f32), not a recurrence, so
     // every token's work is independent: row r of token t's window is qkv row t - pre + r,
     // and the carried state stands in where that runs before the block.
     const size_t pre = g.taps - 1;
     if (tape) {
         tape->t_real = R;
-        tape->conv_state0.assign(conv_state, conv_state + pre * nch);
+        tape->conv_f32 = g.conv_f32;
+        tape->conv_state0.clear();
+        tape->conv_state0_f32.clear();
+        if (g.conv_f32) tape->conv_state0_f32.assign(conv_fp32, conv_fp32 + pre * nch);
+        else tape->conv_state0.assign(conv_state, conv_state + pre * nch);
         tape->S0.assign(S, S + g.value_heads * g.s_rows * dim);
+        tape->key_head_tiled = g.key_head_tiled;
     }
     std::vector<float> carry(pre * nch);
     for (size_t r = 0; r < pre; ++r)
-        for (size_t j = 0; j < nch; ++j) carry[r * nch + j] = bf16_to_f32(conv_state[r * nch + j]);
+        for (size_t j = 0; j < nch; ++j) carry[r * nch + j] = g.conv_f32 ? conv_fp32[r * nch + j] : bf16_to_f32(conv_state[r * nch + j]);
     std::vector<float> Q(R * key_w), Kk(R * key_w), V(R * vw), decay(R * g.value_heads), beta(R * g.value_heads);
 #pragma omp parallel
     {
@@ -501,8 +527,8 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     size_t j = 0;
                     for (; j + 8 <= nch; j += 8)
                         _mm256_storeu_ps(c.data() + j, _mm256_add_ps(_mm256_loadu_ps(c.data() + j),
-                                                                     _mm256_mul_ps(_mm256_loadu_ps(cw + j), bf16r8(v + j))));
-                    for (; j < nch; ++j) c[j] += cw[j] * bf16r(v[j]);
+                                                                     _mm256_mul_ps(_mm256_loadu_ps(cw + j), (g.conv_f32 ? _mm256_loadu_ps(v + j) : bf16r8(v + j)))));
+                    for (; j < nch; ++j) c[j] += cw[j] * (g.conv_f32 ? v[j] : bf16r(v[j]));
                 }
             }
             for (size_t j = 0; j < nch; ++j) c[j] = silu(c[j]);
@@ -557,7 +583,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         tape->decay = decay;
         tape->beta = beta;
     }
-    conv_state_tail(pre, nch, qkv, R, conv_state);
+    conv_state_tail(pre, nch, qkv, R, history, g.conv_f32);
 
     // ---- phase 2, per head over every token: the gated delta rule on S (in place), the gated norm
     const auto tp1 = std::chrono::steady_clock::now();
@@ -565,8 +591,9 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
     for (long long h = 0; h < static_cast<long long>(g.value_heads); ++h) {
         std::vector<float> tv(dim), delta(dim), o(dim), on(dim);
         float* Sh = S + h * g.s_rows * dim;
+        const size_t kh = g.key_head_tiled ? h % g.key_heads : h / (g.value_heads / g.key_heads);
         for (size_t t = 0; t < R; ++t) {
-            delta_token(dim, Sh, Kk.data() + t * key_w + (h / grp) * dim, Q.data() + t * key_w + (h / grp) * dim,
+            delta_token(dim, Sh, Kk.data() + t * key_w + kh * dim, Q.data() + t * key_w + kh * dim,
                         V.data() + t * vw + h * dim, decay[t * g.value_heads + h], beta[t * g.value_heads + h],
                         tv.data(), delta.data(), o.data());
             for (size_t j = 0; j < dim; ++j) o[j] *= inv_sqrt;
@@ -585,27 +612,33 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
 }
 
 void deltanet_rollback(const DeltaGeom& g, const DeltaTape& tape, size_t k, const float* qkv,
-                       uint16_t* conv_state, float* S) {
+                       void* history, float* S) {
     const size_t dim = g.head_dim, key_w = g.key_heads * dim, vw = g.value_heads * dim, nch = 2 * key_w + vw;
     const size_t pre = g.taps - 1;
-    if (!g.key_heads || g.value_heads % g.key_heads || g.s_rows < dim || g.t_real != tape.t_real ||
-        k > tape.t_real || tape.conv_state0.size() != pre * nch ||
+    if (!g.key_heads || !g.value_heads || g.value_heads % g.key_heads || g.s_rows < dim || g.t_real != tape.t_real ||
+        g.key_head_tiled != tape.key_head_tiled ||
+        k > tape.t_real || g.conv_f32 != tape.conv_f32 ||
+        (g.conv_f32 ? (tape.conv_state0_f32.size() != pre * nch || !tape.conv_state0.empty())
+                    : (tape.conv_state0.size() != pre * nch || !tape.conv_state0_f32.empty())) ||
         tape.S0.size() != g.value_heads * g.s_rows * dim || tape.key.size() != tape.t_real * key_w ||
         tape.val.size() != tape.t_real * vw || tape.decay.size() != tape.t_real * g.value_heads ||
         tape.beta.size() != tape.t_real * g.value_heads)
         throw std::runtime_error("open_qwen36: deltanet_rollback: the tape does not match the geometry");
-    const size_t grp = g.value_heads / g.key_heads;
 
-    std::copy(tape.conv_state0.begin(), tape.conv_state0.end(), conv_state);
-    conv_state_tail(pre, nch, qkv, k, conv_state);
+    if (g.conv_f32)
+        std::copy(tape.conv_state0_f32.begin(), tape.conv_state0_f32.end(), static_cast<float*>(history));
+    else
+        std::copy(tape.conv_state0.begin(), tape.conv_state0.end(), static_cast<uint16_t*>(history));
+    conv_state_tail(pre, nch, qkv, k, history, g.conv_f32);
     std::copy(tape.S0.begin(), tape.S0.end(), S);
 #pragma omp parallel for
     for (long long hh = 0; hh < static_cast<long long>(g.value_heads); ++hh) {
         const size_t h = static_cast<size_t>(hh);
+        const size_t kh = g.key_head_tiled ? h % g.key_heads : h / (g.value_heads / g.key_heads);
         std::vector<float> tv(dim), delta(dim);
         float* Sh = S + h * g.s_rows * dim;
         for (size_t t = 0; t < k; ++t)
-            delta_token(dim, Sh, tape.key.data() + t * key_w + (h / grp) * dim, nullptr,
+            delta_token(dim, Sh, tape.key.data() + t * key_w + kh * dim, nullptr,
                         tape.val.data() + t * vw + h * dim, tape.decay[t * g.value_heads + h],
                         tape.beta[t * g.value_heads + h], tv.data(), delta.data(), nullptr);
     }
@@ -731,8 +764,9 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
                      const float* qn, const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
                      float* og) {
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, rows = g.pos0 + g.t_real;
-    if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw)
+    if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < (g.kv_pair ? 4 : 2) * kvw)
         throw std::runtime_error("open_qwen36: attention_block: inconsistent geometry");
+    const size_t v_off = (g.kv_pair ? 2 : 1) * kvw;
     const size_t grp = g.nh / g.kvh, R = g.t_real;
     const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
     std::fill(og, og + g.T * qw, 0.f);
@@ -743,26 +777,38 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     for (size_t r = 0; r < g.pos0; ++r)
         for (size_t j = 0; j < kvw; ++j) {
             K[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + j]);
-            V[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + kvw + j]);
+            V[r * kvw + j] = bf16_to_f32(kv[r * kv_row_elems + v_off + j]);
+            if (g.kv_pair) {
+                K[r * kvw + j] += bf16_to_f32(kv[r * kv_row_elems + kvw + j]);
+                V[r * kvw + j] += bf16_to_f32(kv[r * kv_row_elems + v_off + kvw + j]);
+            }
         }
     for (size_t t = 0; t < R; ++t) {
         const size_t p = g.pos0 + t;
         for (size_t h = 0; h < g.nh; ++h) {
             float* dst = Q.data() + t * qw + h * g.hd;
             rms_vec(q + t * qw + h * g.hd, g.hd, qn, g.eps, dst);
-            rope(dst, half, inv_freq, static_cast<double>(p));
+            rope(dst, half, inv_freq, static_cast<double>(p), g.rope_il);
         }
         std::vector<float> kh(kvw);
         for (size_t h = 0; h < g.kvh; ++h) {
             rms_vec(k + t * kvw + h * g.hd, g.hd, kn, g.eps, kh.data() + h * g.hd);
-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
+            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p), g.rope_il);
         }
         for (size_t j = 0; j < kvw; ++j) {
             const uint16_t kb = f32_to_bf16(kh[j]), vb = f32_to_bf16(v[t * kvw + j]);
             kv[p * kv_row_elems + j] = kb;
-            kv[p * kv_row_elems + kvw + j] = vb;
+            kv[p * kv_row_elems + v_off + j] = vb;
             K[p * kvw + j] = bf16_to_f32(kb);
             V[p * kvw + j] = bf16_to_f32(vb);
+            if (g.kv_pair) {
+                const uint16_t kl = f32_to_bf16(kh[j] - K[p * kvw + j]);
+                const uint16_t vl = f32_to_bf16(v[t * kvw + j] - V[p * kvw + j]);
+                kv[p * kv_row_elems + kvw + j] = kl;
+                kv[p * kv_row_elems + v_off + kvw + j] = vl;
+                K[p * kvw + j] += bf16_to_f32(kl);
+                V[p * kvw + j] += bf16_to_f32(vl);
+            }
         }
     }
 
@@ -802,6 +848,8 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
 
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
                     const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q) {
+    if (g.kv_pair)
+        throw std::runtime_error("open_qwen36: paired-KV block attention requires the host route");
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, R = g.t_real;
     const size_t dist = g.pair ? g.pair : half;
     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw || dist < half || dist + half > g.hd)
@@ -820,7 +868,8 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
             const float* src = q + t * qw + h * g.hd;
             if (qn) rms_vec(src, g.hd, qn, g.eps, dst);
             else std::copy(src, src + g.hd, dst);
-            rope_pairs_cs(dst, half, dist, cs.data(), cs.data() + half);
+            if (g.rope_il) rope(dst, half, inv_freq, static_cast<double>(p), true);
+            else rope_pairs_cs(dst, half, dist, cs.data(), cs.data() + half);
             if (scale != 1.0f)
                 for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
         }
@@ -828,7 +877,9 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
             const float* src = k + t * kvw + h * g.hd;
             if (kn) rms_vec(src, g.hd, kn, g.eps, kh.data() + h * g.hd);
             else std::copy(src, src + g.hd, kh.data() + h * g.hd);
-            rope_pairs_cs(kh.data() + h * g.hd, half, dist, cs.data(), cs.data() + half);
+            float* dst = kh.data() + h * g.hd;
+            if (g.rope_il) rope(dst, half, inv_freq, static_cast<double>(p), true);
+            else rope_pairs_cs(dst, half, dist, cs.data(), cs.data() + half);
         }
         for (size_t j = 0; j < kvw; ++j) kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);
         for (size_t h = 0; h < g.kvh; ++h) {

@@ -30,7 +30,7 @@ the same paths, so a sync is a plain diff of these directories and the matching 
 | 2026-10-23 | PR #223 GGUF-direct, dense split shapes and Qwen3 size specs | `0c22864a5258019b7a885fb4be962ec62e3cc276` |
 | 2026-10-28 | PR #225 Gemma 4 12B text decoder on two dense geometries (open, not merged upstream): its five `open_kernels/`/`specs/open-engine/` commits, cherry-picked with `-x` | `beccd4699d812642b63741255322d19a0c1dd738` |
 | 2026-11-18 | PR #237 GPT-OSS 20B (draft): its Strix Point result (OPEN-PREFILL-GPTOSS) and the Windows `small` -> `is_small` rename. Its kernel side was already here; the in-tree engine takes the GPT-OSS runtime from `gptoss-runtime.patch` + `gptoss-prefill-runtime.patch` (`engine-changes.json` `gptoss-runtime`) | `ca1196cafdb98aea881931c6bd64ed7ad623bb7b` |
-| 2026-11-22 | Main through #234 (#228, #230, #231, #232, #234, #239), Phase 1 padded-tail engine fix and Phase 2 Python tools, catalogue and GGUF code | `d7c145f55028c34321ccc78a4db35c026f2bc4dc` |
+| 2026-11-22 | Main through #234 (#228, #230, #231, #232, #234, #239), Phase 1 padded-tail fix, Phase 2 Python tools and recipes, Phase 3 native engine and ViT GGUF reader | `d7c145f55028c34321ccc78a4db35c026f2bc4dc` |
 
 ## Not pulled in yet
 
@@ -40,6 +40,8 @@ the same paths, so a sync is a plain diff of these directories and the matching 
 
 ## Changes made here that upstream does not have
 
+- Phase 3 keeps manifest versions 4/5/6/7 as BFP16 GEMM, GLU, attention prep and DIT. The existing bridge build entry point forwards to the shared GGUF reader.
+- The Qwen MoE GGUF recipe writes expert_stripes_gguf and expert_down_gguf. The reader keeps q35_stripes and q35_down for installed manifests.
 - Gemma 4 attention catalogue tuples remain refused pending a local NPU attention gate. The local refusal regression stays enabled.
 - Qwen2.5-3B keeps the shipped FF width of 11264 and refuses K=11008. To validate and promote the candidate point, write the proposed spec with only `intermediate` changed to 11008 and run `dibs run npu -- python utilities/op-gate.py --spec <candidate.json> --op gemv_q4` from the repository root.
 - The shipped Nanbeige4.3-33B catalogue gate checks its GGUF Q8 head at K=7168.

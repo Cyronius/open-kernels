@@ -2342,7 +2342,7 @@
     "pack": {
      "pool": [
       {
-       "op": "q35_stripes",
+       "op": "expert_stripes_gguf",
        "up": "blk.{l}.ffn_up_exps.weight",
        "gate": "blk.{l}.ffn_gate_exps.weight",
        "dst": 0,
@@ -2352,7 +2352,7 @@
        "in_dim": 2048
       },
       {
-       "op": "q35_down",
+       "op": "expert_down_gguf",
        "tensor": "blk.{l}.ffn_down_exps.weight",
        "dst": 335544320,
        "experts": 256,
@@ -2715,7 +2715,7 @@
     "pack": {
      "pool": [
       {
-       "op": "q35_stripes",
+       "op": "expert_stripes_gguf",
        "up": "blk.{l}.ffn_up_exps.weight",
        "gate": "blk.{l}.ffn_gate_exps.weight",
        "dst": 0,
@@ -2725,7 +2725,7 @@
        "in_dim": 2048
       },
       {
-       "op": "q35_down",
+       "op": "expert_down_gguf",
        "tensor": "blk.{l}.ffn_down_exps.weight",
        "dst": 335544320,
        "experts": 256,
