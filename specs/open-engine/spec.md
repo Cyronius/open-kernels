@@ -4114,7 +4114,16 @@ The native parser and model check from open-kernels `977e546` accepted the insta
 with the model's config in a CPU-only check. Both the base and raw GGUF `dx` entries parsed
 as `kvslice=8`, `rb=1`, with the `attnpos` patch. CLI and HTTP generation have separate gates.
 
-**Status 2026-11-21: not accepted.**
+**2026-11-22 matched final-tail ablation (measured, experimental).** Captured the pre-tail
+residual at every position and replayed final RMSNorm and the original GGUF Q6_K head in
+FP32 on the same residual. On 508 tokens against strict CPU, installed fast moved from
+493/508 and median partial KL 0.001523 to 494/508 and 0.001452. Installed accurate moved from
+491/508 and 0.000948 to 491/508 and 0.000822. The source-scale projection probe moved from
+496/508 and 0.000680 to 497/508 and 0.000568. All short-prompt runs were 18/18. Accurate
+with the FP32 tail still exceeded the short Vulkan KL (0.000893 vs 0.000783). A higher
+precision tail helps the source-scale candidate, with residual differences remaining before it.
+
+**Status 2026-11-22: not accepted.**
 
 | criterion | status |
 | --- | --- |
