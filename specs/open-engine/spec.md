@@ -4262,7 +4262,12 @@ accurate mode agrees with the rounded-projection/repacked-head FP32 diagnostic a
 (median partial KL 2.73e-7). The 6144-byte f32-scale NPU view produced identical prefill logits to the
 installed accurate view at every position of both prompts. In the GEMM producer, `gqd_scale` narrows the
 f32 planes to BF16 before dequantization, so changing carriage alone does not correct the arithmetic.
-Gate 3 remains failed. The local handoff records the reproduction and artifact hashes.
+A scratch producer used an FP32 offset and two BF16 scale limbs before rounding the dequantized
+operand to BF16. All four NPU projection shapes passed the independent operator gate (at most 8.44e-7
+relative Frobenius error against the BF16 operand product). On 508 tokens the candidate scored 498/508
+and median partial KL 0.000589 against uncached CPU, and 506/508 and 0.000021 against FP32. The uncached
+Vulkan control still has the lower median against CPU (0.000381). Gate 3 remains failed. The local
+handoff records the reproduction and artifact hashes. The installed set is unchanged.
 
 **Status 2026-11-21: not accepted.**
 
