@@ -106,7 +106,7 @@ def probe_env() -> dict[str, str]:
 # ---- the q4_1 / q8 pool chunk formats (gemv_q4.h, lm_head_q8.h): format constants, not model ones
 CHUNK = 5120                 # q4_1: 32 rows x 256 K (8192 values) + bf16 d, m per 32-block
 CHUNK_F32 = 6144             # GGUF-direct (spec.quant "q4_1_f32"): the same tile, the fp16
-                             # block scales/mins widened EXACTLY to f32 (open_kernels/gguf_pool.py)
+                             # block scales/mins widened EXACTLY to f32 (open_kernels/gguf_pool/gguf_pool.py)
 CHUNK_Q40 = 4608             # GGUF-direct Q4_0 (spec.quant "q4_0"): the same codes and the bf16 d
                              # plane alone; the cores take m = -8 d (gemv_q4.h GEMV_Q4_0_NATIVE)
 # The quants a GGUF-direct view (the manifest's "gguf" section) is built at: its pools are

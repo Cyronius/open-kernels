@@ -3,7 +3,7 @@
 A GGUF-direct model (one that ships a model.gguf instead of a q4nx container)
 is read by the engine through the manifest's "gguf" section: the same program
 against the f32-scale pool layout (the q4_1 codes with f32 block scales, see
-open_kernels/gguf_pool.py). The section names the kernels it needs, and the
+open_kernels/gguf_pool/gguf_pool.py). The section names the kernels it needs, and the
 export builds them as the *_f32 twins.
 
 The two must agree. A recipe that emits the section without building the

@@ -1006,22 +1006,22 @@
       "local_sha256": "780400bc352748b1d738af7c3e0bfa81da5917bad9c9761c54d3976ba4e65c38"
     },
     "utilities/build-new-spec.py": {
-      "ref": "audit-pr223",
-      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
-      "upstream_sha256": "30d3916b37fc4c69941d63423936f2ee3c2ce88c036a53f7e0d434feafaa4c9d",
-      "local_sha256": "30d3916b37fc4c69941d63423936f2ee3c2ce88c036a53f7e0d434feafaa4c9d"
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "57e1d286c0430ba41d903dcb761ba950e5f00c2cc4b9b4a3c60980ae1e12eafb",
+      "local_sha256": "57e1d286c0430ba41d903dcb761ba950e5f00c2cc4b9b4a3c60980ae1e12eafb"
     },
     "utilities/catalogue-add-point.py": {
-      "ref": "audit-pr223",
-      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
-      "upstream_sha256": "1e96f8dd665ca8e6cc3d71b4d9af335d62c6517fea5c1b2ddaa09976d631e98a",
-      "local_sha256": "1e96f8dd665ca8e6cc3d71b4d9af335d62c6517fea5c1b2ddaa09976d631e98a"
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "59f5a691a75a9eb7d087e6f44ca2f8acf43aa6d77a9b86c71e33a5f19b150a69",
+      "local_sha256": "59f5a691a75a9eb7d087e6f44ca2f8acf43aa6d77a9b86c71e33a5f19b150a69"
     },
     "utilities/gen-kernel-spec.py": {
-      "ref": "audit-pr223",
-      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
-      "upstream_sha256": "fb6ec523d409d01cbc3fb4437122c85535ad38e8b06ac34761ef30749685368a",
-      "local_sha256": "fb6ec523d409d01cbc3fb4437122c85535ad38e8b06ac34761ef30749685368a"
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "3da9a9d8bc9d2a643bf59bca2b3245f2330cddc6a1c815696144e22c9a7861e4",
+      "local_sha256": "3da9a9d8bc9d2a643bf59bca2b3245f2330cddc6a1c815696144e22c9a7861e4"
     },
     "utilities/lx-probe.cpp": {
       "ref": "audit-pr223",
@@ -1048,16 +1048,40 @@
       "local_sha256": "c303ba946c3c189036fe942b0747306a15ee0f5698ccd7c2c6dc1aaae5ce05ec"
     },
     "utilities/export-kernels.py": {
-      "ref": "origin/main",
-      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
-      "upstream_sha256": "d069e28d7ba00922f31070e112f8e01a98737e03c749aed7a3544e72a632b513",
-      "local_sha256": "d069e28d7ba00922f31070e112f8e01a98737e03c749aed7a3544e72a632b513"
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "a97be909c6d096bf04e48b81ee857451eef69ae3af39da3a4139d12e0e0855f5",
+      "local_sha256": "a97be909c6d096bf04e48b81ee857451eef69ae3af39da3a4139d12e0e0855f5"
     },
     "utilities/wide_deltanet_reference.py": {
       "ref": "origin/main",
       "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
       "upstream_sha256": "978e7b97fdeaccdeb9b628a17ec451764848dc57716336c0e24fa3ac2b3a1916",
       "local_sha256": "978e7b97fdeaccdeb9b628a17ec451764848dc57716336c0e24fa3ac2b3a1916"
+    },
+    "utilities/clean-kernels.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "2c49aa49f03de2006008fe83b72e6e5f9263dbe33687c2810282910b6680b505",
+      "local_sha256": "2c49aa49f03de2006008fe83b72e6e5f9263dbe33687c2810282910b6680b505"
+    },
+    "utilities/op-gate.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "b6eed29254eb6d5f734bb117b9bab24a196b24de1f3325da362f0d313d858f71",
+      "local_sha256": "07a803c7cd4a7b1c82f6d5d5c969dd258d37fe13be5d4b6d53a9aec7fa971c73"
+    },
+    "utilities/register-spec.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "1d143d2f44857d2588ff400245003dac0f046f750c99f7d4a300f9e3903ca018",
+      "local_sha256": "1d143d2f44857d2588ff400245003dac0f046f750c99f7d4a300f9e3903ca018"
+    },
+    "utilities/spec-gaps.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "d21e25a85c1a2fd6d3f917255cf19a396715c3a15c528023c70f6be879fb7b1d",
+      "local_sha256": "d21e25a85c1a2fd6d3f917255cf19a396715c3a15c528023c70f6be879fb7b1d"
     }
   },
   "local_adjustments": {
