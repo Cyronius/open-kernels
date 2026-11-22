@@ -4255,7 +4255,16 @@ Plan and handoff: `.plans/minicpm5-2b.md`.
 - llama.cpp b11393 Vulkan on the same GGUF, measured on the same host: decode about 128 tok/s. Prefill with flash attention is
   4406 / 3512 / 2810 / 1965 tok/s at 1k / 4k / 8k / 16k, against about 610 tok/s for the NPU at 1k.
 
-**Status 2026-11-20: not accepted.**
+**2026-11-21 precision isolation (measured).** On the same 508-token fixture, the FP32 median partial KL
+against uncached llama.cpp CPU was 0.000564 with source GGUF projections and head, 0.000921 after projection
+scale/norm rounding, 0.000453 with only the simulated Q8/BF16 head, and 0.000969 with both. Installed
+accurate mode agrees with the rounded-projection/repacked-head FP32 diagnostic at 505/508 positions
+(median partial KL 2.73e-7). The 6144-byte f32-scale NPU view produced identical prefill logits to the
+installed accurate view at every position of both prompts. In the GEMM producer, `gqd_scale` narrows the
+f32 planes to BF16 before dequantization, so changing carriage alone does not correct the arithmetic.
+Gate 3 remains failed. The local handoff records the reproduction and artifact hashes.
+
+**Status 2026-11-21: not accepted.**
 
 | criterion | status |
 | --- | --- |
