@@ -4060,6 +4060,14 @@ and median partial KL 0.000589 against uncached CPU, and 506/508 and 0.000021 ag
 Vulkan control still has the lower median against CPU (0.000381). Gate 3 remains failed. The local
 handoff records the reproduction and artifact hashes. The installed set is unchanged.
 
+**2026-11-21 fused-attention operator (measured, experimental).** A scratch 128-wide flash producer
+keeps Q/P high and low limbs and online softmax/PV on the NPU. On 16 query heads and 2 KV heads,
+256-query operator comparisons to independent FP64 passed at 512, 4096 and 8192 keys. A contiguous
+per-head KV stream preserved the 8192-row output byte-for-byte and passed at 131072 keys with relative
+Frobenius error 2.12e-5. The three core-image CDO payloads match across both stream layouts. This is a
+synthetic operator result. Whole-model integration, populated 128K quality and production rates
+remain open. The installed set is unchanged.
+
 **Status 2026-11-21: not accepted.**
 
 | criterion | status |
