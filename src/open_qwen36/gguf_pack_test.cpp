@@ -8,6 +8,7 @@
 /// Also covers GgufFile::embed_row (Q8_0) and pack_norm's f32 -> bf16.
 ///
 ///     cmake -S . -B build && cmake --build build && ctest --test-dir build
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -428,6 +429,60 @@ int main() {
     const fs::path dir = fs::temp_directory_path() / "gguf_pack_test";
     fs::create_directories(dir);
     GgufFile g(write_gguf(dir, mm, emb, norm));
+
+    {
+        const size_t rows = 35, padded_rows = 64, cols = 256, chunk_bytes = 6144;
+        const uint32_t q8 = static_cast<uint32_t>(GgufFile::Type::Q8_0);
+        const Blocks head = make_blocks(rows, cols, "Q8_0", rng);
+        auto padded = head.bytes;
+        padded.resize(padded_rows * cols / 32 * 34);
+        GgufFile tied(write_gguf_tensors(dir, "tied-head.gguf", {{"token_embd.weight", {cols, rows}, q8, head.bytes}}));
+        GgufFile explicit_head(write_gguf_tensors(
+            dir, "padded-head.gguf", {{"output.weight", {cols, padded_rows}, q8, padded}}));
+        PackOp op;
+        op.op = "std_perm_gguf";
+        op.tensor = "lm_head.weight";
+        op.nch = padded_rows / 32 * (cols / 256);
+        op.in_dim = cols;
+        Manifest m;
+        m.vocab = padded_rows;
+        m.real_vocab = rows;
+        m.chunk_bytes = chunk_bytes;
+        m.lmhead_pool_bytes = op.nch * chunk_bytes;
+        m.lmhead_ops = {op};
+
+        std::vector<uint8_t> out(m.lmhead_pool_bytes, 0xff), want(out.size());
+        pools::pack_lmhead(m, tied, out.data());
+        pools::apply(op, explicit_head, 0, want.data(), want.size(), chunk_bytes);
+        if (out != want || std::all_of(out.begin(), out.end(), [](uint8_t byte) { return byte == 0; })) {
+            std::printf("FAIL zero padding for a tied GGUF head\n");
+            return 1;
+        }
+
+        m.real_vocab = rows + 1;
+        bool short_head_refused = false;
+        try {
+            pools::pack_lmhead(m, tied, out.data());
+        } catch (const std::runtime_error& e) {
+            short_head_refused = std::string(e.what()).find("real vocabulary rows") != std::string::npos;
+        }
+        if (!short_head_refused) {
+            std::printf("FAIL short GGUF head must refuse missing real rows\n");
+            return 1;
+        }
+
+        bool worker_error_rethrown = false;
+        try {
+            pools::apply(op, tied, 0, out.data(), out.size(), chunk_bytes);
+        } catch (const std::runtime_error& e) {
+            worker_error_rethrown = std::string(e.what()) == "gguf: row 35 past lm_head.weight";
+        }
+        if (!worker_error_rethrown) {
+            std::printf("FAIL GGUF pack worker error was not rethrown\n");
+            return 1;
+        }
+        std::printf("ok    GGUF head padding and OpenMP exception propagation\n");
+    }
 
     // ---- header sanity
     if (g.kv_str("general.architecture") != "llama" || g.kv_u64("llama.embedding_length") != 512 ||

@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -138,32 +139,35 @@ def harness_binary(work: Path, env: dict | None = None) -> Path:
     raise RuntimeError(f"the harness build produced no {name} under {build}")
 
 
-def npu_present() -> bool:
+def npu_present(env: dict | None = None) -> bool:
     if not WINDOWS:
         return any(Path("/dev/accel").glob("accel*"))
-    command = ("Get-PnpDevice -PresentOnly | "
-               "Where-Object { $_.FriendlyName -match 'AMD.*(IPU|NPU|XDNA)' } | "
-               "Select-Object -First 1 -ExpandProperty FriendlyName")
+    env = toolchain_env(pyxrt=False) if env is None else env
+    smi = shutil.which("xrt-smi", path=env["PATH"])
+    if not smi:
+        return False
     try:
-        result = subprocess.run(["powershell", "-NoProfile", "-Command", command],
-                                capture_output=True, text=True, timeout=10)
+        result = subprocess.run([smi, "examine"], env=env, capture_output=True,
+                                text=True, errors="replace", timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+    return result.returncode == 0 and bool(re.search(
+        r"^\s*\|?\s*\[?(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\]?[ \t:|]+[^\r\n]*\bnpu\d*\b",
+        result.stdout, flags=re.IGNORECASE | re.MULTILINE))
 
 
 def check() -> int:
     env = toolchain_env(pyxrt=False)
     xrt = directory(XRT_ROOT) or shutil.which("xrt-smi", path=env["PATH"])
     mlir, peano = mlir_aie_bin(), llvm_aie_bin()
-    npu = npu_present()
+    npu = npu_present(env)
     script = Path(r"C:\dev\mlir-aie\iron_env.ps1") if WINDOWS else ROOT / "utilities" / "env.sh"
     print(f"repo:      {ROOT}")
     print(f"python:    {venv_python() if venv_python().is_file() else sys.executable}")
     print(f"XRT:       {f'ok ({XRT_ROOT})' if xrt else 'missing'}")
     for label, path in (("mlir-aie", mlir), ("Peano", peano)):
         print(f"{label + ':':11}{f'ok ({path})' if path.is_dir() else 'missing (ironvenv)'}")
-    location = "Windows Plug and Play" if WINDOWS else "/dev/accel*"
+    location = "XRT" if WINDOWS else "/dev/accel*"
     print(f"NPU dev:   {f'present ({location})' if npu else 'not detected'}")
     print(f"{script.name + ':':11}{script if script.is_file() else 'not found'}")
     return 0 if xrt and mlir.is_dir() and peano.is_dir() else 1

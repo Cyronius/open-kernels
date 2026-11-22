@@ -23,7 +23,7 @@ set "WHICH=manifest_test"
 out\manifest_test.exe ..\..\specs\open-engine\tests\fixtures\manifest_qwen36.json ..\..\specs\open-engine\tests\fixtures\manifest_qwen3_4b.json ..\..\specs\open-engine\tests\fixtures\manifest_gemma3_4b.json ..\..\specs\open-engine\tests\fixtures\manifest_hy_mt2_7b.json ..\..\specs\open-engine\tests\fixtures\manifest_qwen35_9b.json ..\..\specs\open-engine\tests\fixtures\manifest_phi4_mini_4b.json
 if %errorlevel% neq 0 goto :testfail
 echo [open_qwen36] pools_test
-cl /nologo /EHsc /O2 /MD /std:c++17 /Zc:__cplusplus /D_CRT_SECURE_NO_WARNINGS /bigobj ^
+cl /nologo /EHsc /O2 /MD /std:c++17 /Zc:__cplusplus /D_CRT_SECURE_NO_WARNINGS /bigobj /openmp ^
    /I ".." /I "..\include" /I "..\..\open_kernels\harness" ^
    pools_test.cpp pools.cpp manifest.cpp q4nx_file.cpp gguf_file.cpp /Fe:out\pools_test.exe /Fo:out\
 if errorlevel 1 goto :clfail
@@ -40,7 +40,7 @@ set "WHICH=block_host_test"
 out\block_host_test.exe out\blockfix
 if %errorlevel% neq 0 goto :testfail
 echo [open_qwen36] gguf_pack_test
-cl /nologo /EHsc /O2 /MD /std:c++17 /Zc:__cplusplus /D_CRT_SECURE_NO_WARNINGS /bigobj ^
+cl /nologo /EHsc /O2 /MD /std:c++17 /Zc:__cplusplus /D_CRT_SECURE_NO_WARNINGS /bigobj /openmp ^
    /I ".." /I "..\include" /I "..\..\open_kernels\harness" ^
    gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp /Fe:out\gguf_pack_test.exe /Fo:out\
 if errorlevel 1 goto :clfail

@@ -60,6 +60,8 @@ add_executable(vit_gguf_test vision/vit_gguf_test.cpp vision/vit.cpp q4nx_file.c
 target_include_directories(vit_gguf_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" ${_inc})
 find_package(OpenMP REQUIRED)
 if(OpenMP_CXX_FOUND)
+    target_link_libraries(gguf_pack_test PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(pools_test PRIVATE OpenMP::OpenMP_CXX)
     target_link_libraries(vit_test PRIVATE OpenMP::OpenMP_CXX)
     target_link_libraries(vit_gguf_test PRIVATE OpenMP::OpenMP_CXX)
 endif()

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -27,6 +28,38 @@ std::string with_layer(const std::string& name, int layer) {
 }
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("pools: " + what); }
+
+// OpenMP requires exceptions to be caught by the worker that threw them.
+class PackErrors {
+public:
+    template <class Work>
+    void run(Work work) noexcept {
+        try {
+            work();
+        } catch (...) {
+#pragma omp critical(open_qwen36_pack_error)
+            {
+                if (!error_) error_ = std::current_exception();
+            }
+        }
+    }
+
+    void rethrow() const {
+        if (error_) std::rethrow_exception(error_);
+    }
+
+private:
+    std::exception_ptr error_;
+};
+
+template <class Work>
+void pack_dynamic(size_t count, Work work, bool parallel = true) {
+    PackErrors errors;
+#pragma omp parallel for schedule(dynamic) if (parallel)
+    for (long long i = 0; i < static_cast<long long>(count); ++i)
+        errors.run([&] { work(static_cast<size_t>(i)); });
+    errors.rethrow();
+}
 
 void bounds(const PackOp& op, uint64_t nbytes, size_t dst_bytes) {
     if (op.dst + nbytes > dst_bytes)
@@ -537,14 +570,18 @@ void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, 
                      const std::string& glu, size_t ksplit) {
     const Bfp16Tiling t;
     const size_t ncol = cols / 256;
+    PackErrors errors;
 #pragma omp parallel for
     for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
-        const size_t r = static_cast<size_t>(rr);
-        const size_t br = bfp16_dst_row(r, row0, n_total, glu);
-        std::vector<float> w(cols);
-        for (size_t k = 0; k < cols; ++k) w[k] = q4_1_value(src, ncol, r, k);
-        bfp16_put_row(w.data(), cols, ksplit, dst + bfp16_b_offset(br, 0, n_total, ksplit * cols, t), t);
+        errors.run([&] {
+            const size_t r = static_cast<size_t>(rr);
+            const size_t br = bfp16_dst_row(r, row0, n_total, glu);
+            std::vector<float> w(cols);
+            for (size_t k = 0; k < cols; ++k) w[k] = q4_1_value(src, ncol, r, k);
+            bfp16_put_row(w.data(), cols, ksplit, dst + bfp16_b_offset(br, 0, n_total, ksplit * cols, t), t);
+        });
     }
+    errors.rethrow();
 }
 
 std::vector<std::pair<size_t, size_t>> unwritten(const std::vector<PackOp>& ops, size_t bytes) {
@@ -1112,12 +1149,18 @@ std::vector<float> q35_values(const PackOp& op, const WeightFile& m, int layer) 
                  std::to_string(op.rows) + ", " + std::to_string(op.cols) + "]");
         const size_t dr = op.dst_rows ? op.dst_rows : op.rows;
         out.assign(op.cols * dr, 0.f);
+        PackErrors errors;
 #pragma omp parallel for
         for (long long rr = 0; rr < static_cast<long long>(op.rows); ++rr) {
-            const size_t r = static_cast<size_t>(rr);
-            const uint8_t* row = t.row(0, rmap(r));
-            for (size_t c = 0; c < op.cols; ++c) out[c * dr + r] = q35_value(t.type, row, c);
+            errors.run([&] {
+                const size_t r = static_cast<size_t>(rr);
+                const size_t sr = rmap(r);
+                if (sr >= t.rows) fail("q35_t " + name + ": source row " + std::to_string(sr) + " past " + std::to_string(t.rows));
+                const uint8_t* row = t.row(0, sr);
+                for (size_t c = 0; c < op.cols; ++c) out[c * dr + r] = q35_value(t.type, row, c);
+            });
         }
+        errors.rethrow();
     } else if (op.op == "q35_vec") {
         const size_t n = t.cols * t.rows, slots = op.cap / op.elem;
         if (n > slots) fail("q35_vec " + name + " has " + std::to_string(n) + " values, its slot " + std::to_string(slots));
@@ -1290,7 +1333,8 @@ QkRows llama_qk_rows(const GgufFile& g, const std::string& name, const GgufFile:
 
 }  // namespace
 
-void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t ch) {
+static void apply_op(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t ch,
+                     size_t real_vocab) {
     if (const auto* g = dynamic_cast<const GgufFile*>(&m);
         g && op.op != "std_perm_gguf" && op.op != "bfp16_gemm" && !op.tensor.empty() &&
         g->fold(with_layer(op.tensor, layer)) != 1.0f)
@@ -1378,7 +1422,8 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         // (gemv_q4.h load_scale, gemm_q4_dequant.h gqd_scale), so both views
         // compute the same products.
         const std::string name = with_layer(op.tensor, layer);
-        if (op.nch == 0 || op.in_dim == 0) fail("std_perm_gguf " + name + " without nch / in_dim");
+        if (!op.nch || !op.in_dim || op.in_dim % 256)
+            fail("std_perm_gguf " + name + ": expected nonzero chunks and a width in 256-column tiles");
         const GgufFile& g = dynamic_cast<const GgufFile&>(m);
         const GgufFile::TensorInfo& t = g.tensor(name);
         const QkRows qk = g.rope_interleaved ? QkRows{} : llama_qk_rows(g, name, t);
@@ -1436,8 +1481,18 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             else if (name.find(".mlp.up_proj.") != std::string::npos && rows == 2 * op_rows)
                 chunk0 = op.nch;
         }
-        const uint64_t out_dim = chunk0 || op.qgate_rows ? rows : op_rows;
+        uint64_t out_dim = chunk0 || op.qgate_rows ? rows : op_rows;
+        if (real_vocab) {
+            if (t.dims.size() != 2 || rows < real_vocab || op_rows < real_vocab || chunk0 || op.qgate_rows)
+                fail("std_perm_gguf " + name + ": expected a head covering " + std::to_string(real_vocab) +
+                     " real vocabulary rows, tensor has " + std::to_string(rows) +
+                     " and the pool has " + std::to_string(op_rows));
+            // The kernel rounds up its vocabulary to whole tiles.
+            out_dim = std::min(rows, op_rows);
+        }
         const size_t src_blk = t.type == GgufFile::Type::Q4_1 ? 20 : 18;
+        if (!kq && (t.dims.empty() || t.dims[0] != op.in_dim))
+            fail("std_perm_gguf " + name + ": expected " + std::to_string(op.in_dim) + " source columns");
         if (!kq && n < static_cast<size_t>(out_dim) * nb * src_blk)
             fail(name + " is " + std::to_string(n) + " B, the plan needs " +
                  std::to_string(static_cast<uint64_t>(out_dim) * nb * src_blk));
@@ -1447,9 +1502,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         std::memset(dst + op.dst, 0, op.nch * ch);
         const float fold = g.fold(name);
         const size_t qgate_hpb = op.qgate_rows ? op.qgate_rows / 32 : 0;
-#pragma omp parallel for schedule(dynamic) if (kq)
-        for (int64_t cc = 0; cc < static_cast<int64_t>(op.nch); ++cc) {
-            const size_t c = static_cast<size_t>(cc);
+        pack_dynamic(op.nch, [&](size_t c) {
             std::vector<float> rd(kq ? op.in_dim : 0);
             uint8_t* d = dst + op.dst + c * ch;
             size_t fc = chunk0 + perm[c];
@@ -1522,7 +1575,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                     }
                 }
             }
-        }
+        }, kq);
     } else if (op.op == "bf16_gemm") {
         // `nch` SOURCE chunks from `chunk0`: q8 read exactly unless `via` q4_1 asks for the q4 ops' reading
         const std::string name = with_layer(op.tensor, layer);
@@ -1576,18 +1629,23 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
             if (ti.dims.empty() || ti.dims[0] != op.in_dim || src_row0 + rows > nrows)
                 fail("bfp16_gemm " + name + ": rows [" + std::to_string(src_row0) + ", " + std::to_string(src_row0 + rows) +
                      ") of " + std::to_string(op.in_dim) + " columns are not in the GGUF tensor");
+            PackErrors errors;
 #pragma omp parallel
             {
-                std::vector<float> w(op.in_dim);
+                std::vector<float> w;
 #pragma omp for
                 for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
-                    const size_t r = static_cast<size_t>(rr);
-                    g->embed_row(name, qk(src_row0 + r), op.in_dim, w.data());
-                    bfp16_put_row(w.data(), op.in_dim, op.ksplit,
-                                  out + bfp16_b_offset(bfp16_dst_row(r, op.row0, op.n_total, op.glu), 0, op.n_total,
-                                                       op.ksplit * op.in_dim, t), t);
+                    errors.run([&] {
+                        w.resize(op.in_dim);
+                        const size_t r = static_cast<size_t>(rr);
+                        g->embed_row(name, qk(src_row0 + r), op.in_dim, w.data());
+                        bfp16_put_row(w.data(), op.in_dim, op.ksplit,
+                                      out + bfp16_b_offset(bfp16_dst_row(r, op.row0, op.n_total, op.glu), 0, op.n_total,
+                                                           op.ksplit * op.in_dim, t), t);
+                    });
                 }
             }
+            errors.rethrow();
         } else {
             const auto* q4 = dynamic_cast<const Q4nxFile*>(&m);
             if (!q4) fail("bfp16_gemm " + name + " is in neither a q4nx container nor a GGUF");
@@ -1621,12 +1679,10 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                                       std::to_string(op.in_dim));
         bounds(op, op.nch * ch, dst_bytes);
         const auto perm = std_perm(op.nch, op.in_dim);
-#pragma omp parallel for schedule(dynamic)
-        for (long long cc = 0; cc < static_cast<long long>(op.nch); ++cc) {
-            const size_t c = static_cast<size_t>(cc);
+        pack_dynamic(op.nch, [&](size_t c) {
             q35_chunk(t, 0, rmap, cmap, 32 * (perm[c] / ncol), perm[c] % ncol, out_dim, op.in_dim,
                       dst + op.dst + c * ch);
-        }
+        });
     } else if (op.op == "q35_stripes" || op.op == "q35_down") {
         // the routed experts, GGUF [E, rows, cols], in expert_stripes' / expert_down's chunk orders:
         // stripes  per expert 2 * stripes stripes of [up_k | gate_k], stripe chunk c = rows
@@ -1655,9 +1711,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         bounds(op, E * per, dst_bytes);
         const Q35Map id;
         const size_t nchs = per / ch;
-#pragma omp parallel for schedule(dynamic)
-        for (long long ee = 0; ee < static_cast<long long>(E); ++ee) {
-            const size_t e = static_cast<size_t>(ee);
+        pack_dynamic(E, [&](size_t e) {
             uint8_t* d = dst + op.dst + e * per;
             for (size_t c = 0; c < nchs; ++c) {
                 if (ug) {
@@ -1668,7 +1722,7 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                               d + c * ch);
                 }
             }
-        }
+        });
     } else if (op.op == "q35_lmhead") {
         // the head, [vocab, hidden] -> lm_head_q8's 8704-B chunks (bf16 scale[kb*32 + r], then int8
         // code_index(r, kb, i)) in the 128-row supertile order lmhead_q8 writes. A Q8_0 block keeps its
@@ -2185,27 +2239,32 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
                  std::to_string(op.in_dim) + "] operand");
         bounds(op, op_bytes(op, ch), dst_bytes);
         uint8_t* out = dst + op.dst;
+        PackErrors errors;
 #pragma omp parallel
         {
-            std::vector<float> w(op.in_dim);
+            std::vector<float> w;
 #pragma omp for
             for (long long rr = 0; rr < static_cast<long long>(rows); ++rr) {
-                const size_t r = static_cast<size_t>(rr);
-                g->embed_row(name, r, op.in_dim, w.data());
-                uint8_t* row = out + bfp16_b_offset(op.row0 + r, 0, op.n_total, op.in_dim, t);
-                for (size_t cb = 0; cb < op.in_dim / 8; ++cb) {
-                    float* b = w.data() + cb * 8;
-                    if (op.split == "lo") {
-                        // what bfp16 leaves of the block: the hi half's remainder, encoded in its own block
-                        uint8_t hi[BFP16_BLOCK_BYTES];
-                        bfp16_encode_block(b, hi);
-                        const float sc = std::ldexp(1.0f, static_cast<int>(hi[0]) - 133);
-                        for (size_t i = 0; i < 8; ++i) b[i] -= static_cast<float>(static_cast<int8_t>(hi[1 + i])) * sc;
+                errors.run([&] {
+                    w.resize(op.in_dim);
+                    const size_t r = static_cast<size_t>(rr);
+                    g->embed_row(name, r, op.in_dim, w.data());
+                    uint8_t* row = out + bfp16_b_offset(op.row0 + r, 0, op.n_total, op.in_dim, t);
+                    for (size_t cb = 0; cb < op.in_dim / 8; ++cb) {
+                        float* b = w.data() + cb * 8;
+                        if (op.split == "lo") {
+                            // what bfp16 leaves of the block: the hi half's remainder, encoded in its own block
+                            uint8_t hi[BFP16_BLOCK_BYTES];
+                            bfp16_encode_block(b, hi);
+                            const float sc = std::ldexp(1.0f, static_cast<int>(hi[0]) - 133);
+                            for (size_t i = 0; i < 8; ++i) b[i] -= static_cast<float>(static_cast<int8_t>(hi[1 + i])) * sc;
+                        }
+                        bfp16_encode_block(b, row + bfp16_b_row_block(0, cb, t));
                     }
-                    bfp16_encode_block(b, row + bfp16_b_row_block(0, cb, t));
-                }
+                });
             }
         }
+        errors.rethrow();
     } else if (op.op == "gp_mx4") {
         // the block prefill's routed experts (OPEN-PREFILL-GPTOSS): MXFP4 [E, rows, cols] as gemm_bfp16 GB_B=mx4
         // operands of n_total x in_dim, expert e at dst + e * expert_bytes. gate | up: B rows [0, rows) are the
@@ -2287,6 +2346,10 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
     }
 }
 
+void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_t dst_bytes, size_t ch) {
+    apply_op(op, m, layer, dst, dst_bytes, ch, 0);
+}
+
 void pack_pool(const Manifest& m, const LayerType& lt, const WeightFile& f, int layer, uint8_t* dst) {
     std::memset(dst, 0, m.pool_bytes);
     for (const auto& op : lt.pool) apply(op, f, layer, dst, m.pool_bytes, m.chunk_bytes);
@@ -2299,7 +2362,7 @@ void pack_consts(const Manifest& m, const LayerType& lt, const WeightFile& f, in
 
 void pack_lmhead(const Manifest& m, const WeightFile& f, uint8_t* out) {
     std::memset(out, 0, m.lmhead_pool_bytes);
-    for (const auto& op : m.lmhead_ops) apply(op, f, 0, out, m.lmhead_pool_bytes, m.chunk_bytes);
+    for (const auto& op : m.lmhead_ops) apply_op(op, f, 0, out, m.lmhead_pool_bytes, m.chunk_bytes, m.real_vocab);
 }
 
 // Which of (t, h, w) rotary pair i takes. transformers' apply_interleaved_mrope: every pair
