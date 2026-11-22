@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+from native_compiler import executable_path, find_cxx
 from types import SimpleNamespace
 import numpy as np
 import pytest
@@ -23,7 +24,7 @@ int main(int argc,char**argv){
  try{rows("xn",34,0,20,2,x);return 1;}catch(const std::runtime_error&){}
  try{rows("og",34,16,4,2,x);return 2;}catch(const std::runtime_error&){}
 }
-''');exe=tmp_path/'probe';subprocess.run(['c++','-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
+''');exe=executable_path(tmp_path/'probe');subprocess.run([find_cxx(),'-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
  subprocess.run([str(exe),str(tmp_path/'run')],check=True)
  assert {p.name for p in tmp_path.glob('*.bin')}=={'run_L34_P17_xn.bin','run_L37_P7_res.bin','run_L53_P17_res.bin'}
  np.testing.assert_array_equal(np.fromfile(tmp_path/'run_L34_P17_xn.bin','<f4'),np.arange(40))

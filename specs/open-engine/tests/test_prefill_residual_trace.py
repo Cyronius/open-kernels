@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+from native_compiler import executable_path, find_cxx
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,8 +37,8 @@ int main(int argc, char** argv) {
     w.finish(2,4,2);
 }
 ''')
-    exe = tmp_path / 'writer'
-    subprocess.run(['c++', '-std=c++17', '-O2', '-I', str(TOOL), str(cpp), '-o', str(exe)], check=True)
+    exe = executable_path(tmp_path / 'writer')
+    subprocess.run([find_cxx(), '-std=c++17', '-O2', '-I', str(TOOL), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe), str(tmp_path / 'run')], check=True)
     expected = np.array([1,2,3,4,5,6,1,2], dtype='<f4').tobytes()
     assert (tmp_path / 'run_res0.bin').read_bytes() == expected
@@ -65,8 +66,8 @@ int main(int argc, char** argv) {
  try { ''' + actions[bad] + ''' } catch(const std::runtime_error&) { return 0; }
  return 1;
 }''')
-    exe = tmp_path / 'invalid'
-    subprocess.run(['c++', '-std=c++17', '-I', str(TOOL), str(cpp), '-o', str(exe)], check=True)
+    exe = executable_path(tmp_path / 'invalid')
+    subprocess.run([find_cxx(), '-std=c++17', '-I', str(TOOL), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe), str(tmp_path / 'run')], check=True)
 
 
@@ -209,8 +210,8 @@ int main(int argc,char** argv) {
  }
 }
 ''')
-    exe=tmp_path/'boundary'
-    subprocess.run(['c++','-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
+    exe=executable_path(tmp_path/'boundary')
+    subprocess.run([find_cxx(),'-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe),str(tmp_path),str(n)],check=True)
     expected=np.concatenate((np.arange(n*3,dtype='<f4')-1.5,np.arange(3,dtype='<f4')-1.5)).tobytes()
     for route in ('sequential','hybrid','block_major'):

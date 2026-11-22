@@ -1,8 +1,10 @@
 """Private weighted CLI must preserve control arithmetic and output ownership."""
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
+from native_compiler import executable_path, find_cxx
 import pytest
 ROOT = Path(__file__).resolve().parents[3]
 TOOL = ROOT/'utilities/prefill-weighted-cli'
@@ -12,17 +14,19 @@ def load():
     m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
 
 
-def test_patch_preserves_single_dispatch_and_scopes_weight_correction():
+def test_patch_preserves_single_dispatch_and_scopes_weight_correction(tmp_path):
     m=load();cpp=(ROOT/'src/open_qwen36/core.cpp').read_text();hpp=(ROOT/'src/open_qwen36/core.hpp').read_text()
-    c,h=m.patch(cpp,hpp,Path('/tmp/low'))
+    low = tmp_path / 'low'
+    c,h=m.patch(cpp,hpp,low)
     start=cpp.index('const float* Core::gemm_run(');end=cpp.index('\nvoid Core::gemm(',start)
     assert cpp[start:end].replace('Core::gemm_run(', 'Core::gemm_run_once(',1) in c
     assert 'T != 256 || K != 5120 || N != 34816 || s.split' in c
     assert 'gb.ffn_program[0].args != s.args' in c
     assert 'stage-major is not supported' in c
     assert 'weighted_gemm::Workspace' in h
-    assert '/tmp/low/final.xclbin' in c
-    with pytest.raises(ValueError):m.patch(c,h,Path('/tmp/low'))
+    assert json.dumps(str(low / 'final.xclbin')) in c
+    assert json.dumps(str(low / 'insts.bin')) in c
+    with pytest.raises(ValueError):m.patch(c,h,low)
 
 
 def test_existing_build_is_never_overwritten(tmp_path):
@@ -32,7 +36,7 @@ def test_existing_build_is_never_overwritten(tmp_path):
 
 
 def test_pair_weight_sum_order_and_device_ownership(tmp_path):
-    cpp=tmp_path/'test.cpp';exe=tmp_path/'test'
+    cpp=tmp_path/'test.cpp';exe=executable_path(tmp_path/'test')
     cpp.write_text(r'''
 #include "weighted_gemm.hpp"
 #include <array>
@@ -48,7 +52,7 @@ int main() {
  y=w.run(2,high,low);require(calls==4 && y[1]==7);
 }
 ''')
-    subprocess.run(['c++','-std=c++17','-O2','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
+    subprocess.run([find_cxx(),'-std=c++17','-O2','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
 
 
@@ -70,7 +74,6 @@ def test_trace_inventory_rejects_missing_and_extra(tmp_path):
 
 
 def test_audit_failure_clears_stale_success(tmp_path):
-    import json
     out=tmp_path/'comparison.json';out.write_text('{"passed":true}')
     with pytest.raises(FileNotFoundError):auditor().audit(SimpleNamespace(out=tmp_path,baseline=tmp_path/'missing'))
     r=json.loads(out.read_text());assert not r['passed'] and not r['capture_valid'] and not r['model_acceptance']

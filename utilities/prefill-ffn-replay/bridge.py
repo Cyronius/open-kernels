@@ -5,10 +5,19 @@ import ctypes
 import hashlib
 import json
 from pathlib import Path
-import shlex
+import os
+import re
+import sys
 import subprocess
 import numpy as np
 ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'utilities'))
+from native_compiler import find_cxx
+
+
+def library_path(out):
+    return out / ('bridge.dll' if os.name == 'nt' else 'bridge.so')
+
 
 def digest(p):
  with Path(p).open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
@@ -22,8 +31,14 @@ def source(core,host):
  if host.count(anchor)!=1:raise ValueError('RMSNorm source anchor changed')
  start=host.index(anchor);end=host.index('\n}',start)+2
  norm=host[start:end]
- return '#include <cmath>\n#include <cstddef>\n'+norm+'''\nextern "C" void norm(const float* x,const float* w,float* out,size_t d,double eps) { rms_vec(x,d,w,eps,out); }
-extern "C" void activation(const float* ug,float* ho,size_t ff) {
+ return '#include <cmath>\n#include <cstddef>\n'+norm+'''
+#ifdef _WIN32
+#define BRIDGE_EXPORT __declspec(dllexport)
+#else
+#define BRIDGE_EXPORT
+#endif
+extern "C" BRIDGE_EXPORT void norm(const float* x,const float* w,float* out,size_t d,double eps) { rms_vec(x,d,w,eps,out); }
+extern "C" BRIDGE_EXPORT void activation(const float* ug,float* ho,size_t ff) {
  const float* u=ug; const float* g=u+ff;
  '''+expression+'\n}\n'
 
@@ -35,22 +50,29 @@ def build(out):
   paths=[ROOT/'src/open_qwen36/core.cpp',ROOT/'src/open_qwen36/block_host.cpp',Path(__file__).resolve()]
   r['sources']={str(p):digest(p) for p in paths}
   cpp=out/'bridge.cpp';cpp.write_text(source(paths[0].read_text(),paths[1].read_text()))
-  flags=['c++','-std=c++17','-O3','-mavx2','-mfma','-ffp-contract=off','-fPIC']
-  cmds=[flags+['-MD','-MF',str(out/'bridge.d'),'-c',str(cpp),'-o',str(out/'bridge.o')],
-        ['c++','-shared',str(out/'bridge.o'),'-o',str(out/'bridge.so')]]
+  cxx = find_cxx()
+  if cxx is None:
+   raise RuntimeError('set CXX or put c++ or clang++ on PATH')
+  flags=[cxx,'-std=c++17','-O3','-mavx2','-mfma','-ffp-contract=off']
+  if os.name != 'nt':
+   flags.append('-fPIC')
+  cmds=[flags+['-MD','-MF',str(out/'bridge.d'),'-MT','bridge','-c',str(cpp),'-o',str(out/'bridge.o')],
+        [cxx,'-shared',str(out/'bridge.o'),'-o',str(library_path(out))]]
   for cmd in cmds:r['commands'].append(cmd);subprocess.run(cmd,check=True)
-  names=shlex.split((out/'bridge.d').read_text().replace('\\\n',' ').split(':',1)[1])
+  dependencies = (out/'bridge.d').read_text().replace('\\\n', ' ').partition(':')[2]
+  names = re.findall(r'(?:\\ |[^\s])+', dependencies)
+  names = [name.replace(r'\ ', ' ') for name in names]
   r.update(complete=True,dependencies={str(Path(p).resolve()):digest(p) for p in names},
-           binary_sha256=digest(out/'bridge.so'),compiler=subprocess.check_output(['c++','--version'],text=True))
+           binary_sha256=digest(library_path(out)),compiler=subprocess.check_output([cxx,'--version'],text=True))
  finally:(out/'build.json').write_text(json.dumps(r,indent=2)+'\n')
 
 class Host:
  def __init__(self,out):
   out=Path(out).resolve();r=json.loads((out/'build.json').read_text())
   if not r['complete']:raise ValueError('incomplete host bridge')
-  for p,h in (r['sources']|r['dependencies']|{str(out/'bridge.so'):r['binary_sha256']}).items():
+  for p,h in (r['sources']|r['dependencies']|{str(library_path(out)):r['binary_sha256']}).items():
    if digest(p)!=h:raise ValueError('host bridge provenance differs: '+p)
-  self.lib=ctypes.CDLL(str(out/'bridge.so'))
+  self.lib=ctypes.CDLL(str(library_path(out)))
   pointer=np.ctypeslib.ndpointer(dtype=np.float32,ndim=1,flags='C_CONTIGUOUS')
   self.lib.norm.argtypes=[pointer,pointer,pointer,ctypes.c_size_t,ctypes.c_double];self.lib.norm.restype=None
   self.lib.activation.argtypes=[pointer,pointer,ctypes.c_size_t];self.lib.activation.restype=None
