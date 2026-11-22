@@ -4376,6 +4376,11 @@ partial KL 0.000835, 0.001108 and 0.001291. The BF16 baseline was 496/508 and 0.
 The simulating forward keeps attention and the output tail fixed. The result isolates
 an effect from projection operand precision within the simulation.
 
+Repeating the activation-only comparison with the original Q6_K tail (CPU simulation)
+gave 18/18 with median partial KL 0.001838 for one activation limb and 0.001387 for two.
+On 508 tokens both scored 497/508, with medians 0.000530 and 0.000534 respectively.
+The revised KL limit is 0.000791 on the short prompt and 0.000511 on the long prompt.
+
 **Status 2026-11-22: not accepted.**
 
 | criterion | status |
