@@ -4296,14 +4296,20 @@ compute buffer. On eight sampled prefixes of the 508-token fixture, adding `--de
 changed the top token at positions 440 and 460 with flash attention set to auto. Explicitly enabling
 flash attention reproduced the CPU-only auto results. Disabling it restored the prior top token
 at 460, with different probabilities. Repeating the original device selection reproduced the
-prior probabilities at both positions. A full CPU-only replay is pending. The gate remains open
-and the table retains the historical measurements with their original device selection.
+prior probabilities at both positions. The completed strict CPU replay used `--device none`,
+`--cache-ram 0` and disabled per-request prefix reuse.
 
 The strict CPU-only 18-token replay completed. Vulkan, installed NPU fast and accurate, and
 the independent FP32 forward each agreed at 18/18. Their median top-20 partial KL values
 against strict CPU were 0.000783, 0.000482, 0.001083 and 0.000791 respectively. Installed fast
-meets both short-prompt comparisons. Installed accurate exceeds the Vulkan KL. The 508-token
-strict replay was still running when those numbers were recorded.
+meets both short-prompt comparisons. Installed accurate exceeds the Vulkan KL. On 508 tokens,
+Vulkan agreed at 497/508 (median partial KL 0.000463), installed fast at 493/508 (0.001523),
+installed accurate at 491/508 (0.000948) and independent FP32 at 496/508 (0.000511).
+At position 420, the recorded Vulkan top 256 omitted two of CPU's top 20. Their probabilities
+are bounded above by the last recorded log probability, giving a partial KL lower bound of
+1.525 at that position. Substituting either that bound or positive infinity gives the same
+508-row median. All 508 argmax comparisons use observed tokens. The fused source-scale probe
+scored 495/508 (0.000647) and the fused fast probe scored 499/508 (0.001486).
 
 The native parser and model check from open-kernels `977e546` accepted the installed manifest
 with the model's config in a CPU-only check. Both the base and raw GGUF `dx` entries parsed
@@ -4316,9 +4322,9 @@ as `kvslice=8`, `rb=1`, with the `attnpos` patch. CLI and HTTP generation have s
 | unit | PASS |
 | pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
 | tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
-| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | OPEN. Strict CPU-only replay pending. Historical failure (measured, installed o7d6, b11393, `-ngl 0` reference with Vulkan compute available): on 508 tokens Vulkan agreed with the reference at 498/508 (median top-20 partial KL 0.000328), NPU fast at 495/508 (0.001424), and accurate at 494/508 (0.000873). All three agreed at 18/18 on the short prompt. With prefix reuse disabled, Vulkan scored 496/508 (0.000381), NPU fast and accurate each scored 495/508 (0.001512 and 0.000897), and the sequential diagnostic scored 493/508 (0.001069). |
+| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | FAIL (measured, installed o7d6, strict CPU-only b11393). On 508 tokens Vulkan 497/508 (median top-20 partial KL 0.000463), installed fast 493/508 (0.001523), accurate 491/508 (0.000948). On 18 tokens all scored 18/18. Accurate also exceeded Vulkan KL on the short prompt. |
 | NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Long-context results above. A synthetic seek to position 131071 with the full 42-layer installed set returned finite logits with empty KV history. On a populated 32736-token prompt, installed fast prefill and Vulkan recovered the same exact retrieval key and agreed on all 8 reference continuation tokens. The NPU also returned finite logits at decode position 32767. Development NPU prefill was 48.35 tok/s (97.46% attention and staging) and boundary decode 6.37 tok/s. Vulkan recovered the key at 131040 tokens. Populated 131072-position NPU coverage remains pending. |
-| greedy vs llama.cpp | Earlier prompts passed on the 2026-11-11 set. Installed set, measured matching prefixes out of 48: short fast/accurate 48/37, long 13/13. At the first mismatch, CPU margins were 0.031 logits (short) and 0.130 (long), with NPU margins 0.053 (short accurate) and 0.095/0.082 (long fast/accurate). |
+| greedy vs llama.cpp | Strict CPU-only b11393, installed set: short fast 48/48, accurate 37/48, with an NPU margin of 0.053 logits at the first divergence. The strict CPU margin is pending. Both modes matched all 48 tokens on the long prompt. |
 | `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
 | `phlegm serve` | NOT RUN: stopped at the teacher-forced failure |
 | decode-attention changes gated | PASS (`decgate.py` on each non-identical step) |
