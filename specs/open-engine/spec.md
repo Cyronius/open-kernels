@@ -4381,6 +4381,34 @@ gave 18/18 with median partial KL 0.001838 for one activation limb and 0.001387 
 On 508 tokens both scored 497/508, with medians 0.000530 and 0.000534 respectively.
 The revised KL limit is 0.000791 on the short prompt and 0.000511 on the long prompt.
 
+**2026-11-22 compensated projection and attention diagnostic (measured, scratch).**
+Using two BF16 limbs for each projection operand and adding the high product and
+both cross products passed the revised comparison in the CPU simulation with
+the original Q6_K head. With BF16 KV storage the 18/508-token scores were
+18/18 and 496/508 with median partial KL 0.000596 and 0.000510. With FP16 KV
+storage they were 18/18 and 496/508 with 0.000755 and 0.000496.
+
+All four T256 NPU projection shapes passed a synthetic check of the three
+products. Relative Frobenius error against the source product dropped from
+0.00231–0.00243 to 3.66e-6–3.95e-6. In the scratch runtime, storing the summed
+projection results in separate host buffers produced byte-identical residuals
+across two model runs at each length. The initial attempt to write the sum into
+the mapped DMA output produced nonrepeatable logits and was rejected.
+
+| Compensated NPU projections | 18-token argmax / median KL | 508-token argmax / median KL |
+| --- | --- | --- |
+| NPU attention, installed head | 18/18 / 0.000764 | 497/508 / 0.000685 |
+| NPU attention, offline source Q6_K head | 18/18 / 0.000772 | 497/508 / 0.000559 |
+| Host attention, installed head | 18/18 / 0.000810 | 496/508 / 0.000677 |
+| Host attention, offline source Q6_K head | 18/18 / 0.000723 | 496/508 / 0.000501 |
+| Revised limits | 18/18 / 0.000791 | 496/508 / 0.000511 |
+
+Host attention used BF16 KV storage. The hybrid diagnostic meets both revised
+limits on both fixtures. With NPU attention the diagnostic still misses long
+KL. The three-dispatch scratch route with NPU attention measured 31.83–32.13 tok/s
+for 508-token prefill with every-position logit dumps. End-to-end device projection,
+attention and head quality within the accepted limits remains open.
+
 **Status 2026-11-22: not accepted.**
 
 | criterion | status |
