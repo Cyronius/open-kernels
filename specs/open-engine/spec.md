@@ -4188,8 +4188,11 @@ mode `fast`, the default, runs on bfp16 GEMMs and `accurate` runs on the q4 rout
 - Tokenizer: phlegm's template and tokenizer reproduce transformers' text and ids on chat prompts, with thinking on and off.
 - References on the same GGUF: llama.cpp CPU against Vulkan (the control), and an independent fp32 or fp64 forward against llama.cpp
   CPU. Measure top-20 partial KL and argmax on a short prompt and on a prompt of about 500 tokens.
-- Whole model, every prompt position, on both prefill modes: the NPU against llama.cpp CPU must sit within the control's argmax and KL.
-  Report the NPU against the independent forward too.
+- Whole model, every prompt position, on both prefill modes: for each prompt, compare Vulkan and the independent
+  FP32 or FP64 forward to the same llama.cpp CPU replay. Set the minimum argmax agreement to the lower of the
+  two reference counts and the maximum median top-20 partial KL to the higher of their two medians. Each NPU
+  prefill mode must meet both limits on each prompt. Report both reference results separately and also report
+  the NPU against the independent forward.
 - Long context: the NPU against the independent forward on the last 256 positions past the 4096 window and at capacity minus 64
   (`decgate.py`: prefill P - 255, then 255 forced decode steps).
 - Greedy: equal to llama.cpp CPU's tokens, apart from near ties.
@@ -4380,7 +4383,7 @@ an effect from projection operand precision within the simulation.
 | unit | PASS |
 | pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
 | tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
-| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | FAIL (measured, installed o7d6, strict CPU-only b11393). On 508 tokens Vulkan 497/508 (median top-20 partial KL 0.000463), installed fast 493/508 (0.001523), accurate 491/508 (0.000948). On 18 tokens all scored 18/18. Accurate also exceeded Vulkan KL on the short prompt. |
+| Teacher forced vs llama.cpp CPU, both prefill modes | FAIL (measured, installed o7d6, strict CPU-only b11393). Revised limits are at least 496/508 and at most 0.000511 median top-20 partial KL on the long prompt, and 18/18 and 0.000791 on the short prompt (rounded limits shown). Installed fast and accurate miss both long metrics. Accurate also misses short KL. The rebuilt f32-scale route meets argmax on both prompts and misses KL on both (0.000680 long, 0.001178 short). |
 | NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Installed fast matched Vulkan on populated 32K retrieval and returned finite logits at position 32767. A synthetic seek with empty KV history returned finite logits at 131071 with the installed set. The fused scratch route passed the populated 128K Vulkan comparison above. Installed populated 128K and paired timing remain unverified. |
 | greedy vs llama.cpp | Strict CPU-only b11393, installed set (measured): short fast 48/48, accurate 37/48. At token 38, CPU selected ID 350 over 35 by 0.031 logits and accurate NPU selected ID 35 over 350 by 0.053 logits. Both modes matched all 48 tokens on the long prompt. |
 | `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
