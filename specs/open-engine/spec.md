@@ -4299,6 +4299,12 @@ at 460, with different probabilities. Repeating the original device selection re
 prior probabilities at both positions. A full CPU-only replay is pending. The gate remains open
 and the table retains the historical measurements with their original device selection.
 
+The strict CPU-only 18-token replay completed. Vulkan, installed NPU fast and accurate, and
+the independent FP32 forward each agreed at 18/18. Their median top-20 partial KL values
+against strict CPU were 0.000783, 0.000482, 0.001083 and 0.000791 respectively. Installed fast
+meets both short-prompt comparisons. Installed accurate exceeds the Vulkan KL. The 508-token
+strict replay was still running when those numbers were recorded.
+
 **Status 2026-11-21: not accepted.**
 
 | criterion | status |
