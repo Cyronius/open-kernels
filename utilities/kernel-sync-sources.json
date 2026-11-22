@@ -1006,22 +1006,22 @@
       "local_sha256": "780400bc352748b1d738af7c3e0bfa81da5917bad9c9761c54d3976ba4e65c38"
     },
     "utilities/build-new-spec.py": {
-      "ref": "audit-pr223",
-      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
-      "upstream_sha256": "30d3916b37fc4c69941d63423936f2ee3c2ce88c036a53f7e0d434feafaa4c9d",
-      "local_sha256": "30d3916b37fc4c69941d63423936f2ee3c2ce88c036a53f7e0d434feafaa4c9d"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "562f57d1fef57a05615956d22f8e4005735087ef60112c5fcabcf1d18e968d33",
+      "local_sha256": "59d32c9da8dda0f3fd03775277dfd85ec1992b13094b6c58bd8f199cf5359f85"
     },
     "utilities/catalogue-add-point.py": {
-      "ref": "audit-pr223",
-      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
-      "upstream_sha256": "1e96f8dd665ca8e6cc3d71b4d9af335d62c6517fea5c1b2ddaa09976d631e98a",
-      "local_sha256": "1e96f8dd665ca8e6cc3d71b4d9af335d62c6517fea5c1b2ddaa09976d631e98a"
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "59f5a691a75a9eb7d087e6f44ca2f8acf43aa6d77a9b86c71e33a5f19b150a69",
+      "local_sha256": "59f5a691a75a9eb7d087e6f44ca2f8acf43aa6d77a9b86c71e33a5f19b150a69"
     },
     "utilities/gen-kernel-spec.py": {
-      "ref": "audit-pr223",
-      "commit": "0c22864a5258019b7a885fb4be962ec62e3cc276",
-      "upstream_sha256": "fb6ec523d409d01cbc3fb4437122c85535ad38e8b06ac34761ef30749685368a",
-      "local_sha256": "fb6ec523d409d01cbc3fb4437122c85535ad38e8b06ac34761ef30749685368a"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "391ea905276efe0e73462beb96efc8cc5dbe9628685f9f0059644ebc6d372f4f",
+      "local_sha256": "d0c1ed8091b4dfd4fccbcda7c07413813722e66d329dbcb4aaf01bed46c00e7b"
     },
     "utilities/lx-probe.cpp": {
       "ref": "audit-pr223",
@@ -1048,16 +1048,46 @@
       "local_sha256": "c303ba946c3c189036fe942b0747306a15ee0f5698ccd7c2c6dc1aaae5ce05ec"
     },
     "utilities/export-kernels.py": {
-      "ref": "origin/main",
-      "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
-      "upstream_sha256": "d069e28d7ba00922f31070e112f8e01a98737e03c749aed7a3544e72a632b513",
-      "local_sha256": "d069e28d7ba00922f31070e112f8e01a98737e03c749aed7a3544e72a632b513"
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "9dca3bce2984e8edbfb2d188ca4851f2174898f0cca5bae970cd3b5987bd2f08",
+      "local_sha256": "00dd0b94846137b766873f4f7de1e2c750908c66e3ad134897fea1b6b327622c"
     },
     "utilities/wide_deltanet_reference.py": {
       "ref": "origin/main",
       "commit": "478dbea3f00f868ac58205803cc537b402c6cad5",
       "upstream_sha256": "978e7b97fdeaccdeb9b628a17ec451764848dc57716336c0e24fa3ac2b3a1916",
       "local_sha256": "978e7b97fdeaccdeb9b628a17ec451764848dc57716336c0e24fa3ac2b3a1916"
+    },
+    "utilities/clean-kernels.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "2c49aa49f03de2006008fe83b72e6e5f9263dbe33687c2810282910b6680b505",
+      "local_sha256": "2c49aa49f03de2006008fe83b72e6e5f9263dbe33687c2810282910b6680b505"
+    },
+    "utilities/op-gate.py": {
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "8110905edfd8337d65081646a7a5fc764efb5ddd00fb7d74b3cee4316a4994ec",
+      "local_sha256": "44fb9383900eb1e6c855eaaef51733ba3eca4583f51dc71e1ccddb97d5e74375"
+    },
+    "utilities/register-spec.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "1d143d2f44857d2588ff400245003dac0f046f750c99f7d4a300f9e3903ca018",
+      "local_sha256": "81884d970bed05bf5979980816510e0470662a12ca75858f67a2f9c801fea5df"
+    },
+    "utilities/spec-gaps.py": {
+      "ref": "main",
+      "commit": "d7c145f55028c34321ccc78a4db35c026f2bc4dc",
+      "upstream_sha256": "d21e25a85c1a2fd6d3f917255cf19a396715c3a15c528023c70f6be879fb7b1d",
+      "local_sha256": "d21e25a85c1a2fd6d3f917255cf19a396715c3a15c528023c70f6be879fb7b1d"
+    },
+    "utilities/probe-family-sizes.py": {
+      "ref": "pr-245",
+      "commit": "8410c965315c6f38754c8adea446cd989faa3b53",
+      "upstream_sha256": "594d1dfcf6c368faa0d3edc9b86627fd01b3fa8f365ffeed766aa4017c61f231",
+      "local_sha256": "6914cb8f61e5f6bf1ff84439a9594cac97cd7bf1d24150ea39e834c6d0877518"
     }
   },
   "local_adjustments": {

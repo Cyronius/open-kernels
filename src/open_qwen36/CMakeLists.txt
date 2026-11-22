@@ -1,4 +1,4 @@
-# open_qwen36_cli — the open Qwen3.6-MoE engine driven without the OFLM app
+# open_qwen36_cli â€” the open Qwen3.6-MoE engine driven without the OFLM app
 # (see cli.cpp). The engine's core (core.cpp, pools.cpp, manifest.cpp,
 # q4nx_file.cpp) is also compiled into oflm by src/CMakeLists.txt; engine.cpp
 # (the causal_lm adapter) only there. manifest_test (no XRT) is the
@@ -34,12 +34,19 @@ set(_inc
     "${CMAKE_CURRENT_SOURCE_DIR}/../../open_kernels/harness"  # stream_patch.hpp
 )
 
-add_executable(open_qwen36_cli cli.cpp core.cpp block_host.cpp pools.cpp manifest.cpp q4nx_file.cpp gguf_file.cpp)
+add_executable(open_qwen36_cli cli.cpp core.cpp block_host.cpp pools.cpp manifest.cpp q4nx_file.cpp gguf_file.cpp omp_policy.cpp)
 target_include_directories(open_qwen36_cli PRIVATE "${XRT_INCLUDE_DIR}" ${_inc})
 target_link_directories(open_qwen36_cli PRIVATE "${XRT_LIB_DIR}")
 target_link_libraries(open_qwen36_cli PRIVATE xrt_coreutil)
+target_compile_definitions(open_qwen36_cli PRIVATE DISABLE_ABI_CHECK=1)
+if(MSVC)
+    target_link_options(open_qwen36_cli PRIVATE /DELAYLOAD:VCOMP140.DLL)
+    target_link_libraries(open_qwen36_cli PRIVATE delayimp)
+endif()
 
 add_executable(manifest_test manifest_test.cpp manifest.cpp gguf_file.cpp q4nx_file.cpp)
+add_executable(pools_test pools_test.cpp pools.cpp manifest.cpp q4nx_file.cpp gguf_file.cpp)
+target_include_directories(pools_test PRIVATE ${_inc})
 add_executable(gguf_pack_test gguf_pack_test.cpp gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
 foreach(t gguf_pack_test)
     target_include_directories(${t} PRIVATE ${_inc})
@@ -47,11 +54,16 @@ endforeach()
 target_include_directories(manifest_test PRIVATE ${_inc})
 
 # vit_test (no XRT): the host vision tower against open_kernels/model/replica_vit.py's fixture
-add_executable(vit_test vision/vit_test.cpp vision/vit.cpp q4nx_file.cpp)
+add_executable(vit_test vision/vit_test.cpp vision/vit.cpp q4nx_file.cpp gguf_file.cpp)
 target_include_directories(vit_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" ${_inc})
+add_executable(vit_gguf_test vision/vit_gguf_test.cpp vision/vit.cpp q4nx_file.cpp gguf_file.cpp)
+target_include_directories(vit_gguf_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" ${_inc})
 find_package(OpenMP REQUIRED)
 if(OpenMP_CXX_FOUND)
+    target_link_libraries(gguf_pack_test PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(pools_test PRIVATE OpenMP::OpenMP_CXX)
     target_link_libraries(vit_test PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(vit_gguf_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # block_host_test (no XRT): the block prefill's host stages against replica_block.py's fixture
@@ -63,6 +75,10 @@ target_include_directories(attn_window_test PRIVATE ${_inc})
 # kvslice_patch_test (no XRT): attnpos over per-core window fills (OPEN-ATTN-KVSLICE)
 add_executable(kvslice_patch_test kvslice_patch_test.cpp)
 target_include_directories(kvslice_patch_test PRIVATE ${_inc})
+add_executable(omp_policy_test omp_policy_test.cpp omp_policy.cpp)
+target_include_directories(omp_policy_test PRIVATE ${_inc})
+target_link_libraries(omp_policy_test PRIVATE OpenMP::OpenMP_CXX)
+
 # spec_lookup_test (no XRT): the lookup drafter against tests/fixtures/spec_lookup_cases.json
 add_executable(spec_lookup_test spec_lookup_test.cpp)
 target_include_directories(spec_lookup_test PRIVATE ${_inc})
@@ -79,7 +95,7 @@ foreach(t open_qwen36_cli block_host_test attn_window_test)
 endforeach()
 
 foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test
-          kvslice_patch_test spec_lookup_test)
+          kvslice_patch_test spec_lookup_test omp_policy_test pools_test vit_gguf_test)
     if(MSVC)
         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -90,6 +106,9 @@ enable_testing()
 add_test(NAME OPEN-VISION-VIT-CONFIG COMMAND vit_test --configs
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures")
 add_test(NAME OPEN-VISION-VIT-WINDOWED COMMAND vit_test --window-index)
+add_test(NAME OMP-POLICY COMMAND omp_policy_test model)
+add_test(NAME POOLS COMMAND pools_test)
+add_test(NAME VIT-GGUF COMMAND vit_gguf_test)
 add_test(NAME GGUF-PACK COMMAND gguf_pack_test)
 add_test(NAME OPEN-PREFILL-ATTN-WINDOW COMMAND attn_window_test)
 add_test(NAME OPEN-ATTN-KVSLICE-PATCH COMMAND kvslice_patch_test)

@@ -302,11 +302,11 @@ def _check(spec: ModelSpec) -> None:
     for what, v in (("hidden", spec.hidden), ("intermediate", spec.intermediate), ("q width", spec.attn_q_width),
                     ("kv width", spec.attn_kv_width)):
         if v % (BAND_ROWS * n):
-            raise OpRangeError(f"qwen3: {what} {v} is not a multiple of {BAND_ROWS * n} (64-row bands over {n} cores)")
+            raise OpRangeError(f"dense: {what} {v} is not a multiple of {BAND_ROWS * n} (64-row bands over {n} cores)")
     if spec.hidden % 256 or spec.intermediate % 256:
-        raise OpRangeError("qwen3: hidden and intermediate must be multiples of 256 (one q4 k-tile)")
+        raise OpRangeError("dense: hidden and intermediate must be multiples of 256 (one q4 k-tile)")
     if spec.num_kv_heads % 2:
-        raise OpRangeError("qwen3: an odd kv-head count does not split into ain elements")
+        raise OpRangeError("dense: an odd kv-head count does not split into ain elements")
     require("ln", width=spec.hidden, groups=spec.norm_groups)
     require("attn", head_dim=spec.head_dim, num_heads=spec.num_heads, num_kv_heads=spec.num_kv_heads,
             rotary_dim=spec.rotary_dim, rope_theta=spec.rope_theta, qk_norm=spec.qk_norm, attn_gate=spec.attn_gate,
@@ -319,7 +319,8 @@ def _check(spec: ModelSpec) -> None:
     # K piece, and each piece is the width the core actually runs -- not the whole FF.
     for k in _ffn_split(spec) or (spec.intermediate,):
         require_gemv(spec, "ffn", k, spec.hidden // n, pc)
-    require("lm_head_q4", K=spec.hidden, vocab=lm_rows(spec))
+    head = "lm_head_q8" if gguf_q41_view(spec) or gguf_q8_head(spec) else "lm_head_q4"
+    require(head, K=spec.hidden, vocab=lm_rows(spec))
 
 
 L1_BUDGET = 60 * 1024      # a main core's 64 KB data memory less IRON's own bookkeeping
@@ -1204,7 +1205,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     if sec:
         # the export also builds the f32-scale twins (dx_f32, lm_head_q4_f32); the engine
         # swaps this section in for GGUF-direct models (same weight file family, f32-scale
-        # pool chunks, open_kernels/gguf_pool.py)
+        # pool chunks, open_kernels/gguf_pool/gguf_pool.py)
         out["gguf"] = sec
     return out
 

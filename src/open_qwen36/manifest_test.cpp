@@ -129,8 +129,8 @@ void attn_fa_checks(const char* dense_path) {
                  [](json& e) { e["layer_types"]["dense"]["gemm_block"]["attn_fa"]["prep"]["kernel"] = "nope"; });
     refused_json(pj, "whole number of 1024", "attn_fa prep: a width that is not a whole number of 1024 columns is refused",
                  [](json& e) { e["layer_types"]["dense"]["gemm_block"]["attn_fa"]["prep"]["n_pad"] = 3584; });
-    refused_json(fj, "this engine reads 1 to 6", "manifest_version 7 (bfp16_dit) is refused by this engine",
-                 [](json& e) { e["manifest_version"] = 7; });
+    refused_json(fj, "this engine reads 1 to 7", "manifest_version 8 is refused by this engine",
+                 [](json& e) { e["manifest_version"] = 8; });
     // OPEN-PREFILL-BFP16-FFN: a dense route of 4 bfp16 steps, gate|up through the glu epilogue and down reading its H
     auto glu_route = [](json& j, int version, bool down_reads_h) {
         j["manifest_version"] = version;
@@ -320,6 +320,23 @@ int main(int argc, char** argv) {
     // the block prefill route (OPEN-PREFILL-BATCH)
     const auto& lg = lin.gemm_block;
     const auto& fg = full.gemm_block;
+    {
+        json j; std::ifstream(argv[1]) >> j;
+        j["layer_types"]["linear_attention"]["gemm_block"].erase("key_head_mapping");
+        check(!Manifest::parse(j, "legacy DeltaNet").layer_types.at("linear_attention").gemm_block.key_head_tiled,
+              "unmarked DeltaNet export retains grouped key heads");
+    }
+    for (const char* mapping : {"grouped", "tiled"}) {
+        json j; std::ifstream(argv[1]) >> j;
+        j["layer_types"]["linear_attention"]["gemm_block"]["key_head_mapping"] = mapping;
+        const auto parsed = Manifest::parse(j, "DeltaNet head mapping");
+        check(parsed.layer_types.at("linear_attention").gemm_block.key_head_tiled ==
+                  (std::string(mapping) == "tiled"), std::string("DeltaNet mapping: ") + mapping);
+    }
+    refused_manifest(argv[1], "key_head_mapping", "unknown DeltaNet mapping refused",
+                     [](json& j) { j["layer_types"]["linear_attention"]["gemm_block"]["key_head_mapping"] = "unknown"; });
+    refused_manifest(argv[1], "key_heads", "zero DeltaNet key heads refused",
+                     [](json& j) { j["layer_types"]["linear_attention"]["gemm_block"]["key_heads"] = 0; });
     check(lg.t == 256 && lg.kind == "linear" && lg.program.size() == 2 && lg.program[0].kernel == "gemm_n12288_k2048" &&
           lg.program[1].kernel == "gemm_n2048_k4096" && lg.program[0].args[0] == "gqkvz_w" && lg.program[1].args[2] == "gemm_y_n2048",
           "linear route: two GEMM steps");
@@ -625,6 +642,49 @@ int main(int argc, char** argv) {
             refused(d, bad, "intermediate_size", "qwen3: an 8B config is refused by name");
             // attnpos alone does not make a kernel the attention-only dispatch: the sequential
             // dx is attnpos-patched too, and would run the whole layer per token of the block
+            // OPEN-PREFILL-GEMM8: the fixture's route made an 8-bit one at t 1024, the q4 route kept as lean
+            auto with_dit = [](json& j) {
+                j["manifest_version"] = 7;
+                json& lt = j["layer_types"]["dense"];
+                json q4 = lt["gemm_block"], d = q4;
+                d["t"] = 1024;
+                d["gemm"] = "dit";
+                for (auto& [name, w] : d["weights"].items())
+                    w = {{"from", "pack"}, {"pack", json::array({{{"op", "bfp16_dit"}, {"tensor", "model.layers.{l}.mlp.up_proj.weight"},
+                                                                  {"nch", 4}, {"in_dim", 256}, {"dst", 0}}})}};
+                for (auto& s : d["program"]) s["args"] = {"g8" + s["args"][0].get<std::string>().substr(1), "g8_a", "g8_c"};
+                json w8 = json::object();
+                for (auto& [name, w] : d["weights"].items()) w8["g8" + name.substr(1)] = w;
+                d["weights"] = w8;
+                j["globals"]["g8_a"] = 4096;
+                j["globals"]["g8_c"] = 4096;
+                lt["gemm_block"] = d;
+                lt["gemm_block_variants"]["lean"] = q4;
+            };
+            {
+                std::ifstream f(argv[2]);
+                json g = json::parse(f);
+                with_dit(g);
+                Manifest fast = Manifest::parse(g, "dit"), lean = Manifest::parse(g, "dit");
+                fast.select_prefill_route("");
+                lean.select_prefill_route("lean");
+                const auto& fg = fast.layer_types.at("dense").gemm_block;
+                const auto& lg = lean.layer_types.at("dense").gemm_block;
+                check(fg.gemm == "dit" && fg.t == 1024 && lg.gemm == "q4" && lg.t == 256 &&
+                          fast.globals.count("g8_a") && !lean.globals.count("g8_a"),
+                      "qwen3: an 8-bit route at t 1024 parses beside a q4 lean at 256; each mode keeps its own route and globals");
+            }
+            refused_manifest(argv[2], "needs version 7", "qwen3: a bfp16_dit weight in a version 6 manifest is refused at load",
+                             [&](json& j) { with_dit(j); j["manifest_version"] = 6; });
+            refused_manifest(argv[2], "only a dense route", "qwen3: a bfp16_dit weight on a q4 dense route is refused",
+                             [&](json& j) { with_dit(j); j["layer_types"]["dense"]["gemm_block"].erase("gemm"); });
+            refused_manifest(argv[2], "needs the attention products", "qwen3: an 8-bit route without the products' prep is refused",
+                             [&](json& j) { with_dit(j); j["layer_types"]["dense"]["gemm_block"]["attn_block"].erase("prep"); });
+            refused_manifest(argv[2], "is not packed by bfp16_dit", "qwen3: an 8-bit step reading the q4 pool is refused",
+                             [&](json& j) {
+                                 with_dit(j);
+                                 j["layer_types"]["dense"]["gemm_block"]["weights"]["g8o_w"] = {{"from", "pool"}, {"ops", {3}}};
+                             });
             refused_manifest(argv[2], "not the attention-only", "qwen3: a route whose attn_kernel is the sequential dx is refused",
                              [](json& j) { j["layer_types"]["dense"]["gemm_block"]["attn_kernel"] = "dx"; });
             // the dense route runs its GEMMs through its own dispatch, which adds no split halves
@@ -667,6 +727,22 @@ int main(int argc, char** argv) {
                   g.kernels.at("dxB").context == g.kernels.at("dxB_local").context,
                   "gemma3: dxB / dxB_local share a stream and context, own windows");
             check(g.contexts.size() == 5, "gemma3: kernels (dx/ln/lm plus the route's dxa and gemm)");
+            {
+                // The vocabulary is a PACKING fact, not geometry: the head is compiled for
+                // the set's 262208 padded rows and the pack zero-fills the rest, so the
+                // same model's GGUF (llama.cpp writes its own 262144) must load -- and a
+                // head wider than the set's rows must not.
+                json ok = matching_config(g);
+                g.check_model(ok, "gemma3");
+                json narrow = ok;
+                narrow["vocab_size"] = 262144;
+                g.check_model(narrow, "gemma3");
+                check(true, "gemma3: a head narrower than the set's padded rows is accepted");
+                json wide = ok;
+                wide["vocab_size"] = 262272;
+                refused(g, wide, "wider than the kernel set's head",
+                        "gemma3: a head wider than the set's rows is refused");
+            }
             refused_manifest(argv[3], "not the attention-only", "gemma3: an attn_kernel sharing dx's stream (dx_local) is refused",
                              [](json& j) { j["layer_types"]["dense_local"]["gemm_block"]["attn_kernel"] = "dx_local"; });
             uint64_t s0, n0, s1, n1;
@@ -839,7 +915,7 @@ int main(int argc, char** argv) {
                 check(false, std::string("qwen35: a split out projection parses: ") + e.what());
             }
         }
-        refused_manifest(argv[5], "std_perm or bf16_gemm ops", "qwen35: a packed weight that is not std_perm is refused",
+        refused_manifest(argv[5], "not q8_perm", "qwen35: q8_perm is refused in a packed GEMM weight",
                          [&](json& j) {
                              split_out(j);
                              json& o = j["layer_types"]["linear_attention"]["gemm_block"]["weights"]["gout_w"]["pack"][1];

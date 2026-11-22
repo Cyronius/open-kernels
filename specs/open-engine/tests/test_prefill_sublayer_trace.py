@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+from native_compiler import executable_path, find_cxx
 import numpy as np
 import pytest
 ROOT=Path(__file__).resolve().parents[3]
@@ -22,7 +23,7 @@ int main(int argc,char**argv){
  try{row("res",63,7,1,2,x);return 1;}catch(const std::runtime_error&){}
  try{row("bad",63,7,1,2,x+4);return 2;}catch(const std::runtime_error&){}
 }
-''');exe=tmp_path/'test';subprocess.run(['c++','-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True);subprocess.run([str(exe),str(tmp_path/'run')],check=True)
+''');exe=executable_path(tmp_path/'test');subprocess.run([find_cxx(),'-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True);subprocess.run([str(exe),str(tmp_path/'run')],check=True)
  assert (tmp_path/'run_L63_P7_res.bin').read_bytes()==np.array([3,4],dtype='<f4').tobytes()
  assert len(list(tmp_path.glob('*.bin')))==1
 

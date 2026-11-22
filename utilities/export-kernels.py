@@ -18,9 +18,17 @@ Two kernel families share the one toolchain venv:
     npu_offload/gemm_rtp/check_design_sets.py. This one allocates NPU tensors
     (device="npu"), so it needs pyxrt and an installed NPU.
 
+  * the diffusion family (FLUX.2 [klein] 4B) -- built by
+    open_kernels/export_dit_kernels.py: the dit_gemm/dit_fa/dit_ew streams and the
+    VAE's conv/ew ones, composed into one full ELF per resolution. One family, one
+    command, and it ships like the rest: `oflm image` finds it under the xclbins
+    root, so a user never builds it. Its model is a bundle rather than a q4nx
+    container, which is why it is a third family here and not a spec.
+
 Requirements (assumed present, or set up here):
   * XRT installed at /opt/xilinx/xrt, or wherever XILINX_XRT points
-    (xclbinutil/aiebu-asm on PATH, pyxrt under <prefix>/python).
+    (xclbinutil/aiebu-asm on PATH, pyxrt under <prefix>/python), or a distro
+    XRT under /usr whose pyxrt is in the system site-packages.
   * ironvenv/ created here from ironvenv-requirements.txt (mlir-aie + Peano).
   * third_party/mlir-aie cloned here (best-effort; only used for toolchain.json
     version metadata).
@@ -53,10 +61,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+from devenv import ROOT as REPO, llvm_aie_bin, toolchain
+
 SPECS_DIR = REPO / "open_kernels" / "recipes" / "specs"
-VENV = Path(os.environ.get("OFLM_VENV_DIR", str(REPO / "ironvenv")))
-REQS = REPO / "ironvenv-requirements.txt"
 EXPORT = REPO / "open_kernels" / "export_qwen36_kernels.py"
 
 GEMM_RTP = REPO / "npu_offload" / "gemm_rtp"
@@ -65,58 +72,14 @@ BERT_SPEC = GEMM_RTP / "families.json"
 BERT_CHECK = GEMM_RTP / "check_design_sets.py"
 XCLBINS = REPO / "src" / "xclbins"
 
-# XILINX_XRT is honoured when set so a relocated XRT (the Nix builds combine
-# XRT with the amdxdna plugin in their own prefix) supplies pyxrt too.
-XRT_ROOT = Path(os.environ.get("XILINX_XRT") or "/opt/xilinx/xrt")
-XRT_BIN = XRT_ROOT / "bin"
-XRT_PY = XRT_ROOT / "python"
-
-# Build the venv for the same Python minor version as the interpreter running
-# this script when the IRON wheels ship for it (cp311..cp314 today): the
-# open_npue export needs pyxrt, and pyxrt is built for one specific Python. A
-# newer interpreter than that (3.15) has no wheel, so fall back to 3.11.
-PY_MIN, PY_MAX = 11, 14
-PY = f"{sys.version_info.major}.{sys.version_info.minor}"
-PYTHON = PY if PY_MIN <= sys.version_info.minor <= PY_MAX else "3.11"
+# One entry per export attempt so the closing line can name WHICH sets worked
+# and which did not, instead of only counting them. Specs/exports run in
+# parallel; appends under the GIL are safe and ordering is not significant.
+RESULTS: dict[str, list[str]] = {"ok": [], "failed": []}
 
 
-def venv_python() -> Path:
-    return VENV / "bin" / "python3"
-
-
-def llvm_aie_bin() -> Path | None:
-    matches = sorted(VENV.glob("lib/python*/site-packages/llvm-aie/bin"))
-    return matches[-1] if matches else None
-
-
-def ensure_venv() -> Path:
-    py = venv_python()
-    # Nix builds provide a pre-assembled IRON venv with the correct wheels.
-    # Skip the network/pip-based setup when requested.
-    if os.environ.get("OFLM_SKIP_VENV_SETUP") == "1" and py.is_file():
-        return py
-    if py.is_file():
-        # If the existing venv can import the IRON "aie" package, trust it
-        # (e.g. the Nix dev shell materialized it). Otherwise fall through and
-        # recreate it.
-        try:
-            subprocess.run([str(py), "-c", "import aie"], check=True, capture_output=True)
-            return py
-        except subprocess.CalledProcessError:
-            pass
-    print("-- creating ironvenv (mlir-aie + Peano toolchain)", flush=True)
-    if shutil.which("uv"):
-        subprocess.run(["uv", "venv", "--python", PYTHON, str(VENV)], check=True)
-        subprocess.run(["uv", "pip", "install", "--python", str(py), "-r", str(REQS)], check=True)
-    else:
-        subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
-        # Ensure the venv has a python3 symlink; the nix-provided venv only
-        # guarantees bin/python3, and export scripts below call python3.
-        if not (VENV / "bin" / "python3").exists() and (VENV / "bin" / "python").exists():
-            os.symlink("python", VENV / "bin" / "python3")
-        subprocess.run([str(py), "-m", "pip", "install", "-r", str(REQS)], check=True)
-    return py
-
+def record(name: str, ok: bool) -> None:
+    RESULTS["ok" if ok else "failed"].append(name)
 
 def spec_list(names: str) -> list[Path]:
     if names:
@@ -156,6 +119,7 @@ def export_open_kernels(py: Path, specs: list[Path], force: bool, jobs: int) -> 
             futures = {ex.submit(build_spec, spec): spec for spec in specs}
             for fut in as_completed(futures):
                 name, ok = fut.result()
+                record(name, ok)
                 if ok:
                     print(f"   ok: {name}", flush=True)
                 else:
@@ -164,6 +128,7 @@ def export_open_kernels(py: Path, specs: list[Path], force: bool, jobs: int) -> 
     else:
         for spec in specs:
             name, ok = build_spec(spec)
+            record(name, ok)
             if ok:
                 print(f"   ok: {name}", flush=True)
             else:
@@ -171,6 +136,80 @@ def export_open_kernels(py: Path, specs: list[Path], force: bool, jobs: int) -> 
                 print(f"   FAILED: {name}", flush=True)
 
     return len(failed)
+
+
+# The sizes the schedules carry, and the edits: both sides of a bundle must name the same
+# ones (q4nx/open_diffusion.py's RESOLUTIONS/EDITS), and the layout hash is computed from
+# them, so a mismatch is refused at load rather than running the wrong streams.
+DIT_RESOLUTIONS = "512,1024"
+DIT_EDITS = "512,1024"
+
+
+def diffusion_families(py: Path) -> list[str]:
+    """The families the exporter can build, asked of the exporter itself.
+
+    A hard-coded list here would ship whichever families someone remembered (it shipped only
+    the 4B for a day); `--list-families` is the exporter's own answer.
+    """
+    out = subprocess.run([str(py), str(REPO / "open_kernels" / "export_dit_kernels.py"),
+                          "--list-families"], capture_output=True, text=True)
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def export_diffusion_sets(py: Path, force: bool, jobs: int = 4,
+                          families: list[str] | None = None) -> int:
+    """The diffusion kernel sets (FLUX.2 [klein], one per family). Failures count.
+
+    Each is built in `build/dit-kernels/<family>` and INSTALLED into
+    `src/xclbins/<family>/open_kernels`: the build directory carries every stream's xclbin
+    (hundreds of MiB), the installed form is the full ELFs and their manifest (tens of MiB),
+    and that is what ships and what the engine reads. The exporter keeps its own cache, so a
+    second run is seconds.
+    """
+    script = REPO / "open_kernels" / "export_dit_kernels.py"
+    failed = 0
+    for fam in (families or diffusion_families(py)):
+        scratch = REPO / "build" / "dit-kernels" / fam
+        shipped = REPO / "src" / "xclbins" / fam / "open_kernels"
+        print(f"-- diffusion: {fam} (resolutions {DIT_RESOLUTIONS}, edits {DIT_EDITS})", flush=True)
+        cmd = [str(py), str(script), "--family", fam, "--resolutions", DIT_RESOLUTIONS,
+               "--edits", DIT_EDITS, "--out", str(scratch), "--jobs", str(jobs)]
+        if force:
+            cmd.append("--force")
+        if subprocess.run(cmd).returncode:
+            failed += 1
+            record(f"diffusion:{fam}", False)
+            continue
+        # --install copies the runtime files only; src/ must not carry the build tree
+        if subprocess.run([str(py), str(script), "--family", fam, "--resolutions", DIT_RESOLUTIONS,
+                           "--edits", DIT_EDITS, "--out", str(scratch),
+                           "--install", str(shipped)]).returncode:
+            failed += 1
+            record(f"diffusion:{fam}", False)
+        else:
+            record(f"diffusion:{fam}", True)
+    return failed
+
+
+WHISPER_EXPORT = REPO / "open_kernels" / "export_whisper_kernels.py"
+WHISPER_DEFAULT_NAME = "Whisper-V3-Turbo-NPU2"
+
+
+def export_whisper_set(py: Path, force: bool, no_fa: bool = False) -> int:
+    """The open whisper_gemm kernel set (+ fa/ by default). Failures count."""
+    script = WHISPER_EXPORT
+    if not script.is_file():
+        print(f"-- whisper: exporter not found at {script}", flush=True)
+        return 1
+    print(f"-- whisper: {WHISPER_DEFAULT_NAME}", flush=True)
+    cmd = [str(py), str(script), "--model-name", WHISPER_DEFAULT_NAME]
+    if force:
+        cmd.append("--force")
+    if no_fa:
+        cmd.append("--no-fa")
+    ok = subprocess.run(cmd).returncode == 0
+    record(WHISPER_DEFAULT_NAME, ok)
+    return 0 if ok else 1
 
 
 def export_bert_sets(py: Path, force: bool, jobs: int = 1) -> int:
@@ -212,6 +251,7 @@ def export_bert_sets(py: Path, force: bool, jobs: int = 1) -> int:
         for fam in group:
             name, ok = build_family(fam)
             results.append((name, ok))
+            record(name, ok)
             if ok:
                 print(f"   ok: {name}", flush=True)
             else:
@@ -233,6 +273,7 @@ def export_bert_sets(py: Path, force: bool, jobs: int = 1) -> int:
 
     # The built sets and the spec they were built from must agree.
     rc = subprocess.run([str(py), str(BERT_CHECK), "--xclbins", str(XCLBINS)]).returncode
+    record("check_design_sets", rc == 0)
     if rc != 0:
         failed.append("check_design_sets")
         print("   FAILED: check_design_sets (sets disagree with families.json)", flush=True)
@@ -249,6 +290,21 @@ def main() -> int:
                     help="skip open_npue BERT embedding sets (they need an NPU at build time)")
     ap.add_argument("--bert-only", action="store_true",
                     help="only build open_npue BERT embedding sets, skip open_kernels dense specs")
+    ap.add_argument("--skip-diffusion", action="store_true",
+                    help="skip the FLUX.2 [klein] diffusion kernel set")
+    ap.add_argument("--diffusion-only", action="store_true",
+                    help="only build the diffusion kernel sets")
+    ap.add_argument("--diffusion-family", default="",
+                    help="comma-separated diffusion families (default: every family the "
+                         "exporter can build -- FLUX.2-klein-4B-NPU2, -9B-NPU2, ...)")
+    ap.add_argument("--whisper", action="store_true",
+                    help="also build the open whisper_gemm kernel set (Whisper-V3-Turbo-NPU2)")
+    ap.add_argument("--whisper-only", action="store_true",
+                    help="only build the open whisper_gemm kernel set")
+    ap.add_argument("--skip-whisper", action="store_true",
+                    help="skip the open whisper_gemm kernel set")
+    ap.add_argument("--whisper-no-fa", action="store_true",
+                    help="when building whisper, skip fa/ (host attention fallback)")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                    help="parallel kernel builds (default: 0 = auto-detect CPU count)")
     a = ap.parse_args()
@@ -259,28 +315,30 @@ def main() -> int:
     if a.skip_bert and a.bert_only:
         print("FATAL: --skip-bert and --bert-only are mutually exclusive", file=sys.stderr)
         return 1
+    if a.diffusion_only:
+        # --diffusion-only is the narrow run: no dense specs, no BERT, no whisper unless requested
+        a.skip_bert = True
+    if a.whisper_only:
+        # --whisper-only is the narrow run
+        a.skip_bert = True
+        a.skip_diffusion = True
+
+    only_modes = sum([bool(a.bert_only), bool(a.diffusion_only), bool(a.whisper_only)])
+    if only_modes > 1:
+        print("FATAL: --bert-only, --diffusion-only, and --whisper-only are mutually exclusive", file=sys.stderr)
+        return 1
+
+    # Whisper is built only when explicitly requested (--whisper/--whisper-only)
+    # to avoid surprising long builds in existing export flows.
+    do_whisper = (a.whisper or a.whisper_only) and not a.skip_whisper
 
     skip_set = {n.strip() for n in a.skip_specs.split(",") if n.strip()}
 
-    py = ensure_venv()
+    py, env = toolchain()
+    os.environ.update(env)
 
-    # ---- toolchain on PATH: Peano (llvm-aie wheel) first, then XRT ----------
-    aie_bin = llvm_aie_bin()
-    path_parts = []
-    if aie_bin:
-        path_parts.append(str(aie_bin))
-    path_parts.append(str(XRT_BIN))
-    path_parts.append(os.environ.get("PATH", ""))
-    os.environ["PATH"] = os.pathsep.join(path_parts)
-
-    # pyxrt (XRT's Python binding) lives beside the runtime, not in the venv.
-    if XRT_PY.is_dir():
-        os.environ["PYTHONPATH"] = os.pathsep.join(
-            [str(XRT_PY)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
-        )
-
-    for tool in ("clang", "xclbinutil", "aiebu-asm"):
-        if not shutil.which(tool):
+    for tool in ("clang", "aiecc", "xclbinutil", "aiebu-asm"):
+        if not shutil.which(tool) and not (tool == "clang" and shutil.which(tool, path=str(llvm_aie_bin()))):
             print(f"FATAL: {tool} not on PATH (Peano/XRT)", file=sys.stderr)
             return 1
 
@@ -294,26 +352,51 @@ def main() -> int:
     if mlir_aie.is_dir():
         os.environ["MLIR_AIE_ROOT"] = str(mlir_aie)
 
-    # ---- the two kernel families ---------------------------------------------
+    # ---- kernel families -----------------------------------------------------
     n_failed = 0
-    if not a.bert_only:
+    specs = []
+    run_specs = not a.bert_only and not a.diffusion_only and not a.whisper_only
+    if run_specs:
         specs = [s for s in spec_list(a.specs) if s.stem not in skip_set]
         if not specs:
             print("FATAL: no kernel specs found", file=sys.stderr)
             return 1
         n_failed += export_open_kernels(py, specs, a.force, a.jobs)
 
-    if not a.skip_bert:
+    if not a.skip_bert and not a.diffusion_only and not a.whisper_only:
         n_failed += export_bert_sets(py, a.force, a.jobs)
 
+    if not a.skip_diffusion and not a.whisper_only:
+        fams = [f.strip() for f in a.diffusion_family.split(",") if f.strip()] or None
+        n_failed += export_diffusion_sets(py, a.force, a.jobs, fams)
+
+    if do_whisper:
+        n_failed += export_whisper_set(py, a.force, a.whisper_no_fa)
+
     print(flush=True)
-    if n_failed:
-        print(f"kernel export failed: {n_failed} item(s)", flush=True)
+    ok_names, failed_names = RESULTS["ok"], RESULTS["failed"]
+    if failed_names or n_failed:
+        # Name both sides: a dev can decide in one glance whether to fix the
+        # few failures or drop them, without re-reading the interleaved log.
+        print(f"kernel export: {len(ok_names)} succeeded, "
+              f"{len(failed_names) or n_failed} failed", flush=True)
+        if failed_names:
+            print(f"  FAILED: {', '.join(failed_names)}", flush=True)
+        if ok_names:
+            print(f"  ok:     {', '.join(ok_names)}", flush=True)
         return 1
     if a.bert_only:
         print("kernel export ok: BERT design sets", flush=True)
+    elif a.diffusion_only:
+        print("kernel export ok: diffusion sets", flush=True)
+    elif a.whisper_only:
+        print("kernel export ok: whisper kernel set", flush=True)
     else:
         suffix = " + BERT design sets" if not a.skip_bert else ""
+        if not a.skip_diffusion:
+            suffix += " + diffusion sets"
+        if do_whisper:
+            suffix += " + whisper kernel set"
         print(f"kernel export ok: {len(specs)} open_kernels spec(s){suffix}", flush=True)
     return 0
 

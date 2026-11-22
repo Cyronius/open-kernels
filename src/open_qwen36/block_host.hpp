@@ -86,6 +86,8 @@ void act_bfp16_a(const double* act, const float* up, size_t T, size_t K, const B
 void gelu_bfp16_a(const float* gate, const float* up, size_t T, size_t K, const Bfp16Tiling& t, uint8_t* out);
 
 struct DeltaGeom {
+    bool conv_f32 = false; ///< FP32 history; legacy BF16 is the default
+    bool key_head_tiled = false; ///< modulo mapping; manifests select grouped for legacy exports
     size_t T = 0, t_real = 0, hid = 0;
     size_t key_heads = 0, value_heads = 0, head_dim = 0, taps = 0;
     size_t lanes = 0;       ///< columns of the packed alpha / beta projection (the value heads, padded)
@@ -97,6 +99,9 @@ struct DeltaGeom {
 /// to any prefix of it (OPEN-SPEC-VERIFY). The block-start state is in here too: a rollback
 /// replays forwards from it, so it is the tape's business to keep it rather than the caller's.
 struct DeltaTape {
+    bool conv_f32 = false;             ///< the history format of the recorded block
+    bool key_head_tiled = false;        ///< must match the mapping used to record the block
+    std::vector<float> conv_state0_f32;
     std::vector<uint16_t> conv_state0;  ///< [taps-1, nch] bf16: the conv state the block started from
     std::vector<float> S0;              ///< [value_heads, s_rows, head_dim]: the S it started from
     std::vector<float> key;             ///< [t_real, key_heads * head_dim], normed (phase 1's k)
@@ -114,7 +119,7 @@ struct DeltaTape {
 /// per-token one then the delta rule. tape, if given, records what deltanet_rollback needs.
 void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const float* xn, const float* convw,
                     const float* Wa, const float* Wb, const float* A, const float* dtb, const float* nw,
-                    uint16_t* conv_state, float* S, float* og, double* phase_ms = nullptr,
+                    void* history, float* S, float* og, double* phase_ms = nullptr,
                     DeltaTape* tape = nullptr);
 
 /// The layer's DeltaNet state after the first `k` tokens of the block `tape` came from: what
@@ -129,7 +134,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
 /// tokens would have written and rolling back is moving the position; and the rows past them are
 /// read by nothing until a later block overwrites them.
 void deltanet_rollback(const DeltaGeom& g, const DeltaTape& tape, size_t k, const float* qkv,
-                       uint16_t* conv_state, float* S);
+                       void* history, float* S);
 
 struct AttnGeom {
     size_t T = 0, t_real = 0, nh = 0, kvh = 0, hd = 0, rot = 0;
@@ -140,6 +145,9 @@ struct AttnGeom {
     size_t pair = 0;        ///< the rotation's pair distance (dim i turns with i + pair); 0 = rot / 2
     size_t window = 0;      ///< a sliding window's rows: position p reads rows (p - window, p]; 0 = all
     bool vnorm = false;     ///< a weightless RMSNorm on V before it is cached
+    bool rope_il = false;   ///< interleaved rope pairs (2i, 2i + 1) -- llama.cpp's NORM layout;
+                            ///< false = half-split (i, i + rot/2), everything before this shipped
+    bool kv_pair = false;   ///< cache planes [K hi, K lo, V hi, V lo]
 };
 
 /// The first cached row any query of the block reads: 0, or pos0 + 1 - window under a window.
@@ -200,6 +208,11 @@ void softmax_chunk_sum(size_t M, size_t L, size_t hd, size_t c0, const float* hi
 /// idx [T, topk], renormalised into w [T, topk].
 void router_block(size_t T, size_t hid, size_t E, size_t topk, const float* xm, const float* Wr, float* probs,
                   int32_t* idx, float* w);
+
+/// How many of the n prompt tokens at `pos` run as gt-wide blocks; the rest prefill one token
+/// at a time. A block whose padding writes KV rows (`pads_cache`) must fit whole in max_ctx, so
+/// a padded tail that would pass it is left to the sequential path; otherwise all n run as blocks.
+size_t block_prefill_tokens(size_t pos, size_t n, size_t gt, size_t max_ctx, bool pads_cache);
 
 }  // namespace host
 }  // namespace open_qwen36

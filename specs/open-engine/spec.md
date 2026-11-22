@@ -3675,7 +3675,7 @@ layout `glue_ab` reads. Images are refused as on the other VLM families.
 - The 9B layout: `PER_CALL 1` (a 12288-wide activation table leaves no room for two 10 KB weight elements beside the streams), `DN_ROWS 10 / DN_SLICES 13 / DN_PAD 130`, `S_ROWS 130`, `ELN 8192` (so the split `ln_y` / `ln_xn` norm entries), `E_A 2048` with 2 f32 heads per attention element and 4 og heads, `KV_ROW 4096`, `PTAB_ROW 2048`; the pool holds q4-sized `up | gate | down` first, at the same offsets for both layer types.
 - No `moe` block, no `rout_idx_off`, no router or shared-expert tensor anywhere in the manifest; each layer type's program is one `run`, with `attnpos` on the full-attention kernel only.
 - The manifest fixture parses in `manifest_test.cpp` (a linear-attention layer type with a one-step program and no `moe`); `ssm_out_proj` is a plain `std_perm` with no source-format field, and the two `transpose` ops carry the sizes `pools::apply` needs.
-- **One record per value head.** The glue core emits `(NT - VALUE_TILE0) * HEADS_PER_TILE` records and the host drains one per value head; the two are equal only at 32 value heads (4 value conv tiles), so a 16-head model has 2 value tiles against its 4 key tiles. The value head's key head is `h / (lin_value_heads / lin_key_heads)` -- 2 value heads per key head at 32, one at 16.
+- **One record per value head.** The glue core emits `(NT - VALUE_TILE0) * HEADS_PER_TILE` records and the host drains one per value head; the two are equal only at 32 value heads (4 value conv tiles), so a 16-head model has 2 value tiles against its 4 key tiles. Local grouped exports map value head `h` to `h / (lin_value_heads / lin_key_heads)`. Tiled exports map it to `h % lin_key_heads` and declare `key_head_mapping` in the block route.
 - **The alpha / beta projection is padded to the accumulator's 32 lanes**, not narrowed: a W element stays 64 rows x 32 bf16 = 4 KB, `AB_ELEMS` is `hidden / 64` whatever the head count, and a 16-head model's `transpose` op carries `dst_rows` so columns 16..31 are zero. `dt_bias` sits at `lin_value_heads` floats inside `small`, not at a fixed 32.
 - **The projection is walked in 4 KB halves.** The glue core holds ONE element of the layer-entry norm output, so the alpha and beta projections are re-streamed per half with the accumulator reset passed in (`glue_ab_e.cc`); a half carries `min(2048, hidden - h*2048)` rows, one 4 KB weight tile per 64 of them, which is 32 and 8 tiles at HID 2560. Walked accumulator-outer, the side channel's fills are `2 + 4 * halves`; a width whose count would exceed `LIMITS["shim_fills"]` (three halves: 14) walks half-outer instead -- each half carried once, then both accumulators' tiles for it -- for `2 + 3 * halves` (11 at the 27B's 5120). The recipe refuses a width whose count still exceeds the budget (four halves: 14), naming the number. Every published size keeps its accumulator-outer walk.
 - **More than 32 value heads widen the alpha / beta accumulator** to the next multiple of 32 lanes rather than narrowing anything: at 48 heads the projection is packed `[hidden, 64]` (`transpose` with `dst_rows 64`, columns 48..63 zero), a 4 KB tile is 32 rows of it, and `glue_ab_w.cc` carries two 32-lane halves. 48 value heads over 16 key heads is 3 value heads per key head (`h / 3`), 6 value conv tiles against 4 key tiles, and one record per value head.
@@ -4831,9 +4831,9 @@ before it, both misread the container identically and every comparison passed.
 ### OPEN-ATTN-QKV-BIAS: a per-channel bias on the q, k and v projections
 **Applies to:** openflowlm-next (`open_kernels/designs/attn/attn.h`, `designs/dense/dx.py`,
 `recipes/dense.py`, `model/replica_dense.py`)
-**Test category:** unit (`tests/test_qwen2.py`, `tests/test_op_range.py`) for the layout and
-the refusal; manual (the procedure below, needs the NPU and a Qwen2.5 container) for the
-numbers
+**Test category:** unit (layout and catalogue refusal), manual on the NPU.
+The attention gate in `designs/attn/probe_dense.py` streams the production bias FIFO.
+Use `python utilities/build-new-spec.py` to validate a new tuple. The whole-layer procedure below remains available for model-level checks.
 
 A family whose q, k and v projections carry a per-channel bias shall have it added to
 each projection's output before the q/k norm and the rotation -- `q = q + b_q`, and the
@@ -10372,3 +10372,13 @@ dispatch is one hardware context from the configuration's full ELF.
 `&` and `%PATH%` arrives unchanged in `summary.json`; `serve-images` answers
 `/v1/models`, a 1024 generation, 512 and 1024 edits with 200, and
 `guidance_scale` or an unsupported size with 400. Done 2026-11-14.
+
+### OPEN-ONBOARD-ONE-COMMAND
+
+**Test category:** manual on Windows and Linux.
+
+A checkpoint with a supported family recipe can be derived, validated, built and registered with one command. Run `python utilities/build-new-spec.py --spec qwen3-4b --dry-run` on Windows to inspect the plan without building. Select a checkpoint via `--repo` or `--gguf`, then run the same tool under the NPU lease.
+
+- `RC=0, spec ready` reports an existing compatible set or a completed gate, build and registration. Decode with the resulting kernel set through Phlegm.
+- If the recipe rejects the shape, the command names the constraint and saves the generated spec in `open_kernels/recipes/candidates/`.
+- `NOT_AUTOMATED` identifies the operation that needs a manual fixture or design change.

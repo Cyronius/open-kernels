@@ -1,13 +1,13 @@
 """The host patch header must compile without XRT and retain KV-slice offsets."""
 from pathlib import Path
-import shutil
 import subprocess
+from native_compiler import executable_path, find_cxx
 
 import pytest
 
 
 def test_row_patches_compile_and_preserve_slice_geometry(tmp_path):
-    compiler = shutil.which('c++')
+    compiler = find_cxx()
     if compiler is None:
         pytest.skip('requires a GNU-style C++ compiler')
     source = tmp_path / 'rows.cpp'
@@ -40,7 +40,7 @@ int main() {
 }
 ''')
     harness = Path(__file__).resolve().parents[3] / 'open_kernels/harness'
-    binary = tmp_path / 'rows'
+    binary = executable_path(tmp_path / 'rows')
     subprocess.run([compiler, '-std=c++17', '-I', str(harness), str(source),
                     '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

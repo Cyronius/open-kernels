@@ -154,12 +154,9 @@ void Engine::ensure_vit() {
     if (vit_) return;
     auto t0 = std::chrono::steady_clock::now();
     vcfg_ = vision::VitConfig::for_model_dir(cfg_.model_dir);
-    std::string file = "vision_weight.q4nx";
-    {
-        std::ifstream cf(cfg_.model_dir + "/config.json");
-        auto j = nlohmann::json::parse(cf, nullptr, false);
-        if (j.is_object()) file = j.value("vision_model_weight", file);
-    }
+    // `vision_weight.q4nx` for a container, `mmproj*.gguf` for a GGUF install; the
+    // config's own `vision_model_weight` wins when it names one. See vision_weights_path.
+    const std::string file = vision::vision_weights_path(cfg_.model_dir);
     vit_ = std::make_unique<vision::VitWeights>(vision::load_vit(cfg_.model_dir + "/" + file, vcfg_));
     std::fprintf(stderr, "open_qwen36: vision tower resident (%s, %d blocks) in %.1f s\n", file.c_str(), vcfg_.depth,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -170,17 +167,7 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
     if (payload == nullptr) {
         // Decode-as-prefill: exact for this architecture, one step per token, the
         // lm_head only for the last one (whose logits pick the first sampled token).
-        //
-        // 0167/#32: when the kernel set carries a GEMM-route prefill block
-        // (Core::step_gemm_block(), manifest.hpp's GemmBlockProgram) the prompt
-        // runs on it -- T tokens through every layer as whole-array bf16 GEMM
-        // dispatches (q4_1 dequantised on-core) instead of T sequential step()
-        // calls. On by default (#109); OFLM_OPEN_GEMM_BLOCK=0 turns it off. The
-        // whole prompt runs in GT-wide blocks, the tail padded with a repeated
-        // in-range id (hardware-proven exact: the real columns' output does not
-        // depend on the padding), never falling back to step(). A kernel set with
-        // no gemm_block program (GT == 0) runs exactly the sequential path this
-        // engine always has.
+        // A tail whose padding would write past the cache capacity runs sequentially.
         return guarded([&] {
             // Only =0 turns it off: unset, =1 or anything else leaves it on.
             // getenv_oflm, not getenv, so a pre-rename FLM_* export still works (#41).
@@ -205,14 +192,18 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
                 }
                 const size_t GT = core_->gemm_block_t();
                 if (GT > 0) {
+                    const size_t n_block = host::block_prefill_tokens(static_cast<size_t>(core_->position()),
+                                                                      ids.size(), GT, core_->max_ctx(),
+                                                                      core_->gemm_block_pads_cache());
                     size_t i = 0;
-                    while (i < ids.size()) {
-                        const size_t t_real = std::min(GT, ids.size() - i);
+                    while (i < n_block) {
+                        const size_t t_real = std::min(GT, n_block - i);
                         std::vector<int> block(ids.begin() + static_cast<long>(i), ids.begin() + static_cast<long>(i + t_real));
                         block.resize(GT, block.empty() ? 0 : block.back());  // pad the tail with a repeated in-range id
                         core_->step_gemm_block(block, t_real, i + t_real == ids.size());
                         i += t_real;
                     }
+                    for (; i < ids.size(); ++i) core_->step(ids[i], i + 1 == ids.size());
                     return logits_view();
                 }
                 // no route in this kernel set: fall through to the sequential path below
@@ -229,7 +220,8 @@ buffer<bf16> Engine::prefill(std::vector<int>& ids, void* payload) {
     // same counter (Core::mrope_*), and later chunks / generated tokens inherit it.
     if (!core_->has_mrope() || core_->image_token_id() < 0)
         throw std::runtime_error("open_qwen36: config.json carries no image_token_id / mrope_section for this model; "
-                                 "images need the closed engine (OFLM_QWEN36_ENGINE=closed)");
+                                 "images need the closed engine -- set this family's engine switch "
+                                 "OFLM_<FAMILY>_ENGINE=closed (e.g. OFLM_GEMMA_ENGINE=closed)");
     // The app hands its own family's payload struct (qwen3_6_moe_image_payload_t /
     // qwen3_5vl_image_payload_t -- the same fields); read it through the one matching the
     // kernel set's family.

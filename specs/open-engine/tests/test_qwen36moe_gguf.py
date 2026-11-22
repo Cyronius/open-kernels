@@ -29,9 +29,13 @@ def test_view_is_the_q4_1_manifest_with_gguf_pack_ops():
             ops, bops = lt["pack"][key], base["pack"][key]
             # same order and offsets: the block route's weights name these ops by index
             assert [o["dst"] for o in ops] == [o["dst"] for o in bops]
-            assert all(o["op"] in ("put",) or o["op"].startswith("q35_") for o in ops)
             assert all("model.layer" not in o.get("tensor", "") + o.get("up", "") for o in ops)
+            expert_ops = {"expert_stripes": "expert_stripes_gguf", "expert_down": "expert_down_gguf"}
             for o, b in zip(ops, bops):
+                if b["op"] in expert_ops:
+                    assert o["op"] == expert_ops[b["op"]]
+                else:
+                    assert o["op"] == "put" or o["op"].startswith("q35_")
                 if "nch" in b:
                     assert o["nch"] == b["nch"] and o["in_dim"] == b["in_dim"]
                 if "cap" in b and o["op"] in ("put", "q35_vec"):

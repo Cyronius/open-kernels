@@ -94,6 +94,8 @@ void bf16_gemm_pack(const uint8_t* src, bool q8, size_t rows, size_t cols, uint1
 void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, size_t n_total, uint8_t* dst,
                      const std::string& glu = "", size_t ksplit = 1);
 /// Bytes `op` writes at its dst: `nch` chunks of the pool's format, or of the GEMM pool it builds.
+void bfp16_dit_pack(const uint8_t* src, size_t rows, size_t cols, uint8_t* dst);
+
 uint64_t op_bytes(const PackOp& op, size_t chunk_bytes);
 /// `nch` Q4_K chunks (4736 B each) -> `nch` q4_1 chunks (5120 B each), in the SAME chunk
 /// order. Both formats hold a 32-row x 256-column tile with one (scale, min) pair per

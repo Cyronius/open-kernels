@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -87,6 +88,31 @@ def combination(*points, defaults: dict | None = None, keys: tuple[str, ...]) ->
     return Combination(keys=keys, points=frozenset(points), defaults=defaults or {})
 
 
+_COLLECTING: list | None = None          # set by collecting(): the missing points seen so far
+
+
+@contextmanager
+def collecting():
+    """Record every missing point in this block instead of raising on the first.
+
+        with catalogue.collecting() as missing:
+            recipe(spec)                  # runs to completion
+        for op, kw in missing: ...        # every point the spec needs
+
+    A recipe validates many ops in a row (gemv K, ln width, the attention
+    tuple, the head); raising at the first one means a caller has to re-run the
+    recipe once per missing point to discover them. utilities/op-gate.py and
+    utilities/build-new-spec.py use this to gate them all in one pass.
+    """
+    global _COLLECTING
+    prev = _COLLECTING
+    _COLLECTING = []
+    try:
+        yield _COLLECTING
+    finally:
+        _COLLECTING = prev
+
+
 @dataclass(frozen=True)
 class Template:
     name: str
@@ -95,8 +121,15 @@ class Template:
     note: str = ""
     combos: tuple[Combination, ...] = ()  # groups checked as a whole, not one key at a time
 
-    def _refuse(self, msg: str) -> None:
+    def _refuse(self, msg: str, op: str = "", kw: dict | None = None) -> None:
         msg = msg + (f" ({self.note})" if self.note else "")
+        if _COLLECTING is not None:
+            # A caller enumerating what a spec needs (utilities/op-gate.py): record
+            # the point and keep going, so ONE recipe() pass yields every missing
+            # point instead of only the first.
+            if kw is not None:
+                _COLLECTING.append((op or self.name, dict(kw)))
+            return
         if os.environ.get("OPEN_KERNELS_UNVALIDATED"):
             # the way a new point gets validated: build it, run its fixture, then add it here
             if msg not in _WARNED:
@@ -115,7 +148,8 @@ class Template:
                                    f"(has {sorted(set(self.params) | grouped)})")
             p = self.params[k]
             if not p.ok(v):
-                self._refuse(f"{self.name}: {k}={v!r} is outside the validated set {p.expected()}")
+                self._refuse(f"{self.name}: {k}={v!r} is outside the validated set {p.expected()}",
+                             self.name, kw)
         for c in self.combos:
             missing = [k for k in c.keys if k not in kw and k not in c.defaults]
             if missing:
@@ -124,13 +158,13 @@ class Template:
             v = c.value(kw)
             if v not in c.points:
                 self._refuse(f"{self.name}: {tuple(c.keys)} = {v} is outside the validated "
-                             f"combinations {c.expected()}")
+                             f"combinations {c.expected()}", self.name, kw)
 
 
 CATALOGUE: dict[str, Template] = {t.name: t for t in [
     Template("gemv_q4", "designs/gemv_q4/gemv_q4.h",
              {"K": values(1024, 2048, 3072, 3584, 3840, 4096, 2560, 5120, 6144, 8192, 9216, 9728, 10240,
-                          10752, 11264, 12288, 14336, 15360, 7168, 11776),
+                          10752, 11264, 12288, 14336, 15360, 7168, 11776, 10496, 1536, 8960, 5376, 13824, 11520, 13312, 6912, 4608, 768),
                                                  # 2048 / 4096: the 27B layers; 2560 / 9728: Qwen3-4B;
                                                  # 14336: Llama 3.1 8B; 10240: Gemma 3 4B; 12288: Qwen3-8B;
                                                  # 6144: Qwen3-1.7B; 1024 / 3072: Qwen3-0.6B;
@@ -210,6 +244,9 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
                  (128, 40, 8, 128, True, False, False, False),   # Qwen3-14B: 40 heads over 8 kv, five cores of eight (the attention gate)
                  (128, 56, 8, 128, False, False, False, False),  # Nanbeige4.3-33B: 56 heads over 8 kv, seven cores of eight on
                                                                  # the row-4 placement (OPEN-FAMILY-NANBEIGE, 2026-11-07)
+                 (64, 24, 8, 64, True, False, False, False),     # lfm2-700m-gguf (the attention gate, designs/attn/probe_dense.py)
+                 (128, 12, 2, 128, False, False, False, True),   # qwen2.5-1.5b-instruct-gguf (the attention gate, designs/attn/probe_dense.py)
+                 (128, 32, 4, 128, True, False, False, False),   # qwen3-coder-30b-a3b-instruct-gguf (the attention gate, designs/attn/probe_dense.py)
                  keys=("head_dim", "num_heads", "num_kv_heads", "rotary_dim",
                        "qk_norm", "attn_gate", "qk_norm_post_rope", "qkv_bias"),
                  # the MoE and Qwen3.5 recipes predate the post-RoPE and bias knobs and never set them
@@ -235,13 +272,13 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
                   "to 32 lanes; 16 entered with OPEN-FAMILY-QWEN35's 2B / 0.8B pass, 48 (64 lanes, "
                   "glue_ab_w.cc) with its 27B pass"),
     Template("short_conv", "designs/short_conv/sc.h",
-             {"taps": values(3), "width": values(2048)},
+             {"taps": values(3), "width": values(2048, 1536, 1024)},  # lfm2-700m-gguf (utilities/op-gate.py: the short_conv fixture at this geometry)  # lfm2-350m-gguf (utilities/op-gate.py: the short_conv fixture at this geometry)
              note="LFM2's depthwise causal conv, which REPLACES attention in a layer. (3, 2048) is "
                   "LFM2-1.2B, OPEN-SHORT-CONV-KERNEL's procedure through oflm serve on 2026-09-13; "
                   "the core holds taps - 1 state rows, so another tap count is a design change, "
                   "not a knob"),
     Template("ln", "designs/ln/ln.cc",
-             {"width": values(1024, 2048, 2560, 3072, 3840, 4096, 5120, 7168)},
+             {"width": values(1024, 2048, 2560, 3072, 3840, 4096, 5120, 7168, 1536, 5376)},
              combos=(combination(
                  # (width, groups); 1024 / 2048 take the fused single-core path (N <= 2048),
                  # 2560 / 3072 / 4096 the split-output one, 5120 the streamed residual (ln.py
@@ -256,6 +293,8 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
                  # (7168, 1): Nanbeige4.3-33B's quarter-element norm (ln_nrq.cc); make_test PASS on
                  # the NPU and the whole model, 2026-11-07 (OPEN-FAMILY-NANBEIGE).
                  (7168, 1),
+                 (1536, 1),  # qwen2.5-1.5b-instruct-i1-gguf (utilities/op-gate.py: the ln fixture at this geometry)
+                 (5376, 1),  # gemma-3-27b-it-i1-gguf (utilities/op-gate.py: the ln fixture at this geometry)
                  keys=("width", "groups"),
                  defaults={"groups": 1}),),),
     Template("router", "designs/router/router.h",
@@ -284,7 +323,7 @@ CATALOGUE: dict[str, Template] = {t.name: t for t in [
                   "(designs/xing_batch/check_xmb.py, with every q4_0 GEMM shape of the route), the 1-, 3- and 8-layer "
                   "cuts and the whole model against the fp64 GGUF reference (2026-11-08)"),
     Template("lm_head_q4", "designs/lm_head_q4/lm_head_q4.py",
-             {"K": values(1024, 2048, 2560, 3072, 3840, 4096), "vocab": multiple_of(64)},
+             {"K": values(1024, 2048, 2560, 3072, 3840, 4096, 5120, 1536, 5376), "vocab": multiple_of(64)},  # qwen3-14b (utilities/op-gate.py: the lm_head_q4 fixture at this geometry)  # qwen2.5-1.5b-instruct-i1-gguf (utilities/op-gate.py: the lm_head_q4 fixture at this geometry)  # gemma-3-27b-it-i1-gguf (utilities/op-gate.py: the lm_head_q4 fixture at this geometry)
              note="the q4 head is the gemv_q4 kernel with lm_head_q8's uneven band split; validated per K"),
     Template("lm_head_t2", "designs/lm_head_t2/lm_head_t2.py",
              {"K": values(5120), "vocab": multiple_of(64)},

@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-PATHS = ("src/open_qwen36", "src/include/nlohmann", "LICENSE_OPEN_RUNTIME.md")
+PATHS = ("src/open_qwen36", "src/gguf", "src/include/nlohmann", "LICENSE_OPEN_RUNTIME.md")
 CHANGES = Path(__file__).with_name("engine-changes.json")
 
 

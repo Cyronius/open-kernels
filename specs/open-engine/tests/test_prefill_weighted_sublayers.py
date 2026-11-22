@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+from native_compiler import executable_path, find_cxx
 from types import SimpleNamespace
 import numpy as np
 import pytest
@@ -23,7 +24,7 @@ int main(int argc,char**argv) {
  row("res",63,6,2,2,x); // old target must not be captured
  try{row("res",51,17,1,2,x);return 1;}catch(const std::runtime_error&){}
 }
-''');exe=tmp_path/'test';subprocess.run(['c++','-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
+''');exe=executable_path(tmp_path/'test');subprocess.run([find_cxx(),'-std=c++17','-I',str(TOOL),str(cpp),'-o',str(exe)],check=True)
  subprocess.run([str(exe),str(tmp_path/'run')],check=True)
  assert {p.name for p in tmp_path.glob('*.bin')}=={'run_L55_P7_res.bin','run_L51_P17_res.bin'}
  assert (tmp_path/'run_L51_P17_res.bin').read_bytes()==np.array([3,4],'<f4').tobytes()

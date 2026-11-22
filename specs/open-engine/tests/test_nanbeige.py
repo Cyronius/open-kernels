@@ -169,10 +169,12 @@ def test_q8_head_takes_one_chunk_a_call_at_7168(monkeypatch):
         assert mod.PER_CALL == want, k
 
 
-def test_only_the_q4_head_is_unvalidated(monkeypatch):
-    """Without OPEN_KERNELS_UNVALIDATED the recipe refuses exactly at lm_head_q4 K 7168: every point the
-    hardware pass exercised (norm, GEMVs, Q8 head, attention) is catalogued."""
+def test_shipped_gguf_head_is_validated_and_q4_head_remains_refused(monkeypatch):
+    from recipes.catalogue import require
+
     monkeypatch.delenv("OPEN_KERNELS_UNVALIDATED", raising=False)
     s = ModelSpec.from_hf_config(HF_NANBEIGE43_33B, real_vocab=166107)
+    DR.recipe(s)
+    assert DR.gguf_q41_view(s)
     with pytest.raises(OpRangeError, match=r"lm_head_q4: K=7168"):
-        DR.recipe(s)
+        require("lm_head_q4", K=s.hidden, vocab=DR.lm_rows(s))

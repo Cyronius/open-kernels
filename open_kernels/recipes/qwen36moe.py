@@ -106,7 +106,7 @@ def probe_env() -> dict[str, str]:
 # ---- the q4_1 / q8 pool chunk formats (gemv_q4.h, lm_head_q8.h): format constants, not model ones
 CHUNK = 5120                 # q4_1: 32 rows x 256 K (8192 values) + bf16 d, m per 32-block
 CHUNK_F32 = 6144             # GGUF-direct (spec.quant "q4_1_f32"): the same tile, the fp16
-                             # block scales/mins widened EXACTLY to f32 (open_kernels/gguf_pool.py)
+                             # block scales/mins widened EXACTLY to f32 (open_kernels/gguf_pool/gguf_pool.py)
 CHUNK_Q40 = 4608             # GGUF-direct Q4_0 (spec.quant "q4_0"): the same codes and the bf16 d
                              # plane alone; the cores take m = -8 d (gemv_q4.h GEMV_Q4_0_NATIVE)
 # The quants a GGUF-direct view (the manifest's "gguf" section) is built at: its pools are
@@ -1765,11 +1765,11 @@ def _gguf_op(spec: ModelSpec, op: dict) -> dict:
     o = op["op"]
     hd, kd, vd, kh = spec.head_dim, spec.lin_key_dim, spec.lin_value_dim, spec.lin_key_heads
     if o == "expert_stripes":
-        return {"op": "q35_stripes", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
+        return {"op": "expert_stripes_gguf", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
                 "dst": op["dst"], "experts": op["experts"], "stripes": op["stripes"],
                 "stripe_bytes": op["stripe_bytes"], "in_dim": op["in_dim"]}
     if o == "expert_down":
-        return {"op": "q35_down", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
+        return {"op": "expert_down_gguf", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
                 "experts": op["experts"], "expert_bytes": op["expert_bytes"]}
     if o == "lmhead_q8":
         return {"op": "q35_lmhead", "tensor": GGUF_GLOBALS[t], "dst": op["dst"], "in_dim": op["in_dim"]}

@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+from native_compiler import executable_path, find_cxx
 
 import pytest
 
@@ -97,8 +98,8 @@ int main() {
 '''
     cpp = tmp_path / 'test.cpp'
     cpp.write_text(source)
-    exe = tmp_path / 'test'
-    subprocess.run(['c++', '-std=c++17', '-O2', '-ffp-contract=off',
+    exe = executable_path(tmp_path / 'test')
+    subprocess.run([find_cxx(), '-std=c++17', '-O2', '-ffp-contract=off',
                     '-I', str(TOOL), '-I', str(ROOT / 'src'), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 
