@@ -26,10 +26,10 @@
 
 ## Production bar for OFLM kernel sets
 
-Scope here: open-kernels work is separate from OFLM. Verify every item through phlegm first: `phlegm run` /
-`phlegm serve` in place of `oflm add` / `oflm serve`, and `phlegm bench` in place of `oflm bench`. OFLM's registry
-entry, `oflm` commands, docs pages and README row are OFLM's separate effort. Do not list them as open-kernels gaps
-or plan OFLM work for them.
+Scope here: open-kernels work is separate from OFLM. Both oflm and phlegm are test suites for the items below:
+`phlegm run` / `phlegm serve` / `phlegm bench` and `oflm add` / `oflm serve` / `oflm bench` both count as evidence.
+OFLM's registry entry, engine, server, docs pages and README row are OFLM's separate effort. List them under an
+"OFLM side" heading, not as open-kernels gaps.
 
 Do not add q4nx support for any model: q4nx is being deprecated. New support
 loads the model from GGUF.
@@ -51,10 +51,10 @@ show each of these items with measurements:
 - Speculative decoding was explored: MTP, DFlash, DFlash2, prompt lookup or
   another drafter. Ship one, or reject it with the measured reason. We
   generally want one.
-- `oflm add` and `oflm serve` run the model, not only `open_qwen36_cli`.
+- `oflm add` / `oflm serve` or `phlegm run` / `phlegm serve` run the model, not only `open_qwen36_cli`.
 - The model ships quantized, usually q4. Prefer Unsloth's GGUFs when the
   engine supports their quant types; state the reason for any other source.
-- Benchmarks are recorded: `oflm bench` results (prefill and decode against
+- Benchmarks are recorded: `oflm bench` or `phlegm bench` results (prefill and decode against
   context length, with the machine and stack named) on the model's page in
   `docs/docs/benchmarks/`, and a row in the README's "Recommended models"
   table.
