@@ -4065,8 +4065,13 @@ keeps Q/P high and low limbs and online softmax/PV on the NPU. On 16 query heads
 256-query operator comparisons to independent FP64 passed at 512, 4096 and 8192 keys. A contiguous
 per-head KV stream preserved the 8192-row output byte-for-byte and passed at 131072 keys with relative
 Frobenius error 2.12e-5. The three core-image CDO payloads match across both stream layouts. This is a
-synthetic operator result. Whole-model integration, populated 128K quality and production rates
-remain open. The installed set is unchanged.
+synthetic operator result. A scratch dense runtime integration retained the existing BF16 decode cache,
+staged head planes once per layer, and used the same 32736-token populated fixture. It recovered the
+exact key, matched all 8 Vulkan continuation tokens, and returned finite logits after position 32767.
+Measured development prefill was 129.95 tok/s versus 48.35 tok/s in the prior unpaired installed run.
+Fused attention with source-scale projections reached 499/508 and median partial KL 0.000511
+against uncached CPU, still above the Vulkan control median. Production integration, populated 128K
+quality and matched timing remain open. The installed set is unchanged.
 
 **Status 2026-11-21: not accepted.**
 
