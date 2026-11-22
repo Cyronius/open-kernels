@@ -4190,9 +4190,11 @@ mode `fast`, the default, runs on bfp16 GEMMs and `accurate` runs on the q4 rout
   CPU. Measure top-20 partial KL and argmax on a short prompt and on a prompt of about 500 tokens.
 - Whole model, every prompt position, on both prefill modes: for each prompt, compare Vulkan and the independent
   FP32 or FP64 forward to the same llama.cpp CPU replay. Set the minimum argmax agreement to the lower of the
-  two reference counts and the maximum median top-20 partial KL to the higher of their two medians. Each NPU
-  prefill mode must meet both limits on each prompt. Report both reference results separately and also report
-  the NPU against the independent forward.
+  two reference counts and the maximum median top-20 partial KL to the higher of their two medians. Report
+  both NPU modes against these parity targets and against the independent forward. For the recommended
+  installed MiniCPM5-2B o7d6 configuration, the owner accepts the measured teacher-forced gap below to
+  preserve throughput. Parity remains a comparison target for this model, and the recorded exception
+  applies to this checkpoint and kernel set. The remaining acceptance checks still apply.
 - Long context: the NPU against the independent forward on the last 256 positions past the 4096 window and at capacity minus 64
   (`decgate.py`: prefill P - 255, then 255 forced decode steps).
 - Greedy: equal to llama.cpp CPU's tokens, apart from near ties.
@@ -4409,22 +4411,27 @@ KL. The three-dispatch scratch route with NPU attention measured 31.83–32.13 t
 for 508-token prefill with every-position logit dumps. End-to-end device projection,
 attention and head quality within the accepted limits remains open.
 
-**Status 2026-11-22: not accepted.**
+**Recommended production configuration (owner decision, 2026-11-22).** Use the pure Q4_1
+projection GGUF with its original Q6_K head and the installed o7d6 fast prefill route.
+The NPU runtime repacks that head into its resident Q8/BF16-scale format. The compensated
+projection, host attention and offline source-head experiments remain diagnostic.
+
+**Status 2026-11-22: accepted for the recommended installed 16384-context configuration with the model-specific teacher-forced exception above.**
 
 | criterion | status |
 | --- | --- |
 | unit | PASS |
 | pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
 | tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
-| Teacher forced vs llama.cpp CPU, both prefill modes | FAIL (measured, installed o7d6, strict CPU-only b11393). Revised limits are at least 496/508 and at most 0.000511 median top-20 partial KL on the long prompt, and 18/18 and 0.000791 on the short prompt (rounded limits shown). Installed fast and accurate miss both long metrics. Accurate also misses short KL. The rebuilt f32-scale route meets argmax on both prompts and misses KL on both (0.000680 long, 0.001178 short). |
+| Teacher forced vs llama.cpp CPU, both prefill modes | ACCEPTED EXCEPTION (owner decision, installed o7d6). Measured against strict CPU-only b11393 on 508 tokens, fast scores 493/508 / 0.001523 median partial KL and accurate 491/508 / 0.000948. Both miss the parity targets of 496/508 and 0.000511. Both agree at 18/18 on the short prompt. Fast KL is 0.000482 and accurate is 0.001083 against the short target of 0.000791. |
 | NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Installed fast matched Vulkan on populated 32K retrieval and returned finite logits at position 32767. A synthetic seek with empty KV history returned finite logits at 131071 with the installed set. The fused scratch route passed the populated 128K Vulkan comparison above. Installed populated 128K and paired timing remain unverified. |
 | greedy vs llama.cpp | Strict CPU-only b11393, installed set (measured): short fast 48/48, accurate 37/48. At token 38, CPU selected ID 350 over 35 by 0.031 logits and accurate NPU selected ID 35 over 350 by 0.053 logits. Both modes matched all 48 tokens on the long prompt. |
-| `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
-| `phlegm serve` | NOT RUN: stopped at the teacher-forced failure |
+| `phlegm run` | PASS on installed o7d6 (measured): the Paris answer appears on stdout with thinking on and off, with reasoning on stderr only when enabled. Both requests sampled exact stop ID 130073. |
+| `phlegm serve` | PASS on installed o7d6 (measured): the same answer streamed and nonstreamed, reasoning in `reasoning_content` only with thinking enabled, and `enable_thinking: false` honored in both modes. All four requests sampled exact stop ID 130073. The streamed reasoning carried one extra trailing newline on this fixture. |
 | decode-attention changes gated | PASS (`decgate.py` on each non-identical step) |
 
 The attention tuple `(128, 16, 2, 128, False, False, False)` entered the catalogue on the two-request llama.cpp match and the unit
-test. Points enter only after a compare (OPEN-OP-RANGE), so this one stays provisional until the teacher-forced comparison has run.
+test. The teacher-forced comparison and model-specific acceptance decision are recorded above (OPEN-OP-RANGE).
 
 ### OPEN-CONVERT-QWEN35-VHEADS: a GGUF's tiled value heads come back in grouped order
 **Applies to:** openflowlm-next (`utilities/q4nx-build/q4nx/models/qwen35.py`)
