@@ -333,22 +333,55 @@ __attribute__((noinline)) inline void gqd_dequant_block(
 // for ODD). D16 folds the odd rows' x16 -- their nibbles arrive from the 0xF0 mask
 // unshifted -- into the scale. Verbatim from designs/moe_batch/moe_batch.h's
 // mb_scale; the two designs read the same pool bytes the same way.
+#if !GQD_SCALES_F32
 template <bool ODD, bool D16>
 static inline aie::vector<bfloat16, 64> gqd_scale(const gqd_scale_t *__restrict p, unsigned kb) {
-#if GQD_SCALES_F32
-  // Match the GGUF decode path: narrow the losslessly widened scale with RNE.
-  aie::accum<accfloat, 16> sc;
-  sc.from_vector(aie::load_v<16>(p + kb * 32));
-  const aie::vector<bfloat16, 16> v16 = sc.to_vector<bfloat16>();
-#else
   const aie::vector<bfloat16, 16> v16 = aie::load_v<16>(p + kb * 32);
-#endif
   const aie::vector<bfloat16, 32> v32 = aie::concat(v16, v16);
   aie::vector<bfloat16, 16> h = ODD ? aie::filter_odd(v32, 1) : aie::filter_even(v32, 1);
   if constexpr (ODD && D16) h = aie::mul(h, (bfloat16)0.0625f).to_vector<bfloat16>();
   const aie::vector<bfloat16, 32> h32 = aie::concat(h, h);
   return aie::concat(h32, h32);
 }
+#endif
+
+#if GQD_SCALES_F32
+// The f32 planes widen the source Q4_1 fp16 metadata losslessly. Seed the
+// accumulator with the original offset, and split each scale into two BF16
+// terms so cancellation in q*d+m happens before operand rounding.
+// Keep the live accumulators at 16 lanes to fit the producer registers.
+template <bool Odd>
+__attribute__((noinline)) static aie::vector<bfloat16, 64> gqd_full_dequant(
+    const float *dp, const float *mp, unsigned kb,
+    const aie::vector<bfloat16, 64> &nibbles) {
+  const auto dv = aie::load_v<16>(dp + kb * 32);
+  const auto mv = aie::load_v<16>(mp + kb * 32);
+  const auto dd = aie::concat(dv, dv);
+  const auto mm = aie::concat(mv, mv);
+  const auto scale = Odd ? aie::filter_odd(dd, 1) : aie::filter_even(dd, 1);
+  const auto offset = Odd ? aie::filter_odd(mm, 1) : aie::filter_even(mm, 1);
+  aie::accum<accfloat, 16> scale_acc;
+  scale_acc.from_vector(scale);
+  const auto high = scale_acc.to_vector<bfloat16>();
+  aie::accum<accfloat, 16> high_acc;
+  high_acc.from_vector(high);
+  const auto residual = aie::sub(scale, high_acc.to_vector<float>());
+  aie::accum<accfloat, 16> low_acc;
+  low_acc.from_vector(residual);
+  const auto low = low_acc.to_vector<bfloat16>();
+  const auto eval = [&](const aie::vector<bfloat16, 16> &values) {
+    aie::accum<accfloat, 16> result;
+    result.from_vector(offset);
+    result = aie::mac(result, values, low);
+    result = aie::mac(result, values, high);
+    return result.to_vector<bfloat16>();
+  };
+  return aie::concat(aie::concat(eval(nibbles.template extract<16>(0)),
+                                 eval(nibbles.template extract<16>(1))),
+                     aie::concat(eval(nibbles.template extract<16>(2)),
+                                 eval(nibbles.template extract<16>(3))));
+}
+#endif
 
 // k-slice `ky` (0..3) of `band` -> `scratch`, the bf16 A operand mm.cc reads:
 // contiguous (GQD_R=4 rows x GQD_S=8 k) blocks, block index = row_block * 8 + col_block.
@@ -372,6 +405,13 @@ __attribute__((noinline)) inline void gqd_fused_ky(const uint8_t *__restrict ban
       for (unsigned sub = 0; sub < GQD_COLA; ++sub) {  // 8 k at a time = one A-operand column block
         const unsigned k0 = ky * GQD_K64 + sub * GQD_S;
         const unsigned kb = k0 / 32;                   // d / m are constant over a 32-k block
+#if GQD_SCALES_F32
+        const auto q = aie::load_v<64>(nibp + k0 * 8);
+        const auto ne = aie::to_float<bfloat16>(aie::bit_and((uint8_t)0x0F, q), 0);
+        const auto no = aie::to_float<bfloat16>(aie::bit_and((uint8_t)0xF0, q), 4);
+        const auto we = gqd_full_dequant<false>(dp, mp, kb, ne);
+        const auto wo = gqd_full_dequant<true>(dp, mp, kb, no);
+#else
         const aie::vector<bfloat16, 64> d_e = gqd_scale<false, false>(dp, kb);
         const aie::vector<bfloat16, 64> d_o = gqd_scale<true, true>(dp, kb);
 #if GQD_Q4_0
@@ -394,6 +434,7 @@ __attribute__((noinline)) inline void gqd_fused_ky(const uint8_t *__restrict ban
         so = aie::mac(so, no, d_o);
         const aie::vector<bfloat16, 64> we = se.to_vector<bfloat16>();
         const aie::vector<bfloat16, 64> wo = so.to_vector<bfloat16>();
+#endif
         // [k][row-pair] -> [row-pair][k], then zip the even and odd rows back into
         // natural row order: 8-element groups te0, to0, te1, to1, ... = rows 0, 1, 2, 3, ...
         const aie::vector<bfloat16, 64> te = aie::transpose(we, GQD_S, GQD_S);

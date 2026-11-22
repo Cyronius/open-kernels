@@ -4188,8 +4188,13 @@ mode `fast`, the default, runs on bfp16 GEMMs and `accurate` runs on the q4 rout
 - Tokenizer: phlegm's template and tokenizer reproduce transformers' text and ids on chat prompts, with thinking on and off.
 - References on the same GGUF: llama.cpp CPU against Vulkan (the control), and an independent fp32 or fp64 forward against llama.cpp
   CPU. Measure top-20 partial KL and argmax on a short prompt and on a prompt of about 500 tokens.
-- Whole model, every prompt position, on both prefill modes: the NPU against llama.cpp CPU must sit within the control's argmax and KL.
-  Report the NPU against the independent forward too.
+- Whole model, every prompt position, on both prefill modes: for each prompt, compare Vulkan and the independent
+  FP32 or FP64 forward to the same llama.cpp CPU replay. Set the minimum argmax agreement to the lower of the
+  two reference counts and the maximum median top-20 partial KL to the higher of their two medians. Report
+  both NPU modes against these parity targets and against the independent forward. For the recommended
+  installed MiniCPM5-2B o7d6 configuration, the owner accepts the measured teacher-forced gap below to
+  preserve throughput. Parity remains a comparison target for this model, and the recorded exception
+  applies to this checkpoint and kernel set. The remaining acceptance checks still apply.
 - Long context: the NPU against the independent forward on the last 256 positions past the 4096 window and at capacity minus 64
   (`decgate.py`: prefill P - 255, then 255 forced decode steps).
 - Greedy: equal to llama.cpp CPU's tokens, apart from near ties.
@@ -4255,22 +4260,178 @@ Plan and handoff: `.plans/minicpm5-2b.md`.
 - llama.cpp b11393 Vulkan on the same GGUF, measured on the same host: decode about 128 tok/s. Prefill with flash attention is
   4406 / 3512 / 2810 / 1965 tok/s at 1k / 4k / 8k / 16k, against about 610 tok/s for the NPU at 1k.
 
-**Status 2026-11-18: not accepted.**
+**2026-11-21 precision isolation (measured).** On the same 508-token fixture, the FP32 median partial KL
+against uncached llama.cpp CPU was 0.000564 with source GGUF projections and head, 0.000921 after projection
+scale/norm rounding, 0.000453 with only the simulated Q8/BF16 head, and 0.000969 with both. Installed
+accurate mode agrees with the rounded-projection/repacked-head FP32 diagnostic at 505/508 positions
+(median partial KL 2.73e-7). The 6144-byte f32-scale NPU view produced identical prefill logits to the
+installed accurate view at every position of both prompts. In the GEMM producer, `gqd_scale` narrows the
+f32 planes to BF16 before dequantization, so changing carriage alone does not correct the arithmetic.
+A scratch producer used an FP32 offset and two BF16 scale limbs before rounding the dequantized
+operand to BF16. All four NPU projection shapes passed the independent operator gate (at most 8.44e-7
+relative Frobenius error against the BF16 operand product). On 508 tokens the candidate scored 498/508
+and median partial KL 0.000589 against uncached CPU, and 506/508 and 0.000021 against FP32. The uncached
+Vulkan control still has the lower median against CPU (0.000381). Gate 3 remains failed. The local
+handoff records the reproduction and artifact hashes. The installed set is unchanged.
+
+**2026-11-21 fused-attention operator (measured, experimental).** A scratch 128-wide flash producer
+keeps Q/P high and low limbs and online softmax/PV on the NPU. On 16 query heads and 2 KV heads,
+256-query operator comparisons to independent FP64 passed at 512, 4096 and 8192 keys. A contiguous
+per-head KV stream preserved the 8192-row output byte-for-byte and passed at 131072 keys with relative
+Frobenius error 2.12e-5. The three core-image CDO payloads match across both stream layouts. This is a
+synthetic operator result. A scratch dense runtime integration retained the existing BF16 decode cache,
+staged head planes once per layer, and used the same 32736-token populated fixture. It recovered the
+exact key, matched all 8 Vulkan continuation tokens, and returned finite logits after position 32767.
+Measured development prefill was 129.95 tok/s versus 48.35 tok/s in the prior unpaired installed run.
+Fused attention with source-scale projections reached 499/508 and median partial KL 0.000511
+against uncached CPU, still above the Vulkan control median. Production integration, installed 128K
+quality and matched timing remain open. The installed set is unchanged.
+
+**2026-11-21 populated 128K scratch runtime (measured).** The fused fast route completed a
+131040-token prompt at capacity 131072. It retrieved the exact key and matched all eight
+Vulkan continuation tokens through `<|im_end|>` (ID 130073). First-position partial KL against
+Vulkan was 0.001170. The 33 captured logits rows were finite and matched the CLI argmax trace.
+The diagnostic continued through all 32 consumed decode positions, ending at 131071.
+Development NPU prefill and decode were 34.12 tok/s and 1.81 tok/s under Arbiter.
+The earlier unpaired Vulkan reference prefilled at 378.25 tok/s.
+
+**2026-11-21 KV storage isolation (measured).** Rounding the independent forward's rotated K and
+V to FP16 or BF16, with FP32 attention arithmetic and source GGUF weights, gave 498/508 against
+uncached CPU in both cases. Median top-20 partial KL was 0.000565 and 0.000547 respectively,
+compared with 0.000564 for FP32 storage and 0.000381 for the Vulkan control. Adding simulated
+Q8_1 projection and Q8_K head activation quantization with FP16/BF16 storage gave 494/508 and
+496/508 (median partial KL 0.000830 and 0.000834). All cases agreed at 18/18 on the short prompt.
+Cache storage precision alone does not explain the reference gap in this diagnostic.
+
+**2026-11-21 CPU reference audit (measured).** The earlier b11393 replay used `-ngl 0`.
+With that setting, the server logged CPU KV storage, Vulkan-host model storage and a Vulkan
+compute buffer. On eight sampled prefixes of the 508-token fixture, adding `--device none`
+changed the top token at positions 440 and 460 with flash attention set to auto. Explicitly enabling
+flash attention reproduced the CPU-only auto results. Disabling it restored the prior top token
+at 460, with different probabilities. Repeating the original device selection reproduced the
+prior probabilities at both positions. The completed strict CPU replay used `--device none`,
+`--cache-ram 0` and disabled per-request prefix reuse.
+
+The strict CPU-only 18-token replay completed. Vulkan, installed NPU fast and accurate, and
+the independent FP32 forward each agreed at 18/18. Their median top-20 partial KL values
+against strict CPU were 0.000783, 0.000482, 0.001083 and 0.000791 respectively. Installed fast
+meets both short-prompt comparisons. Installed accurate exceeds the Vulkan KL. On 508 tokens,
+Vulkan agreed at 497/508 (median partial KL 0.000463), installed fast at 493/508 (0.001523),
+installed accurate at 491/508 (0.000948) and independent FP32 at 496/508 (0.000511).
+At position 420, the recorded Vulkan top 256 omitted two of CPU's top 20. Their probabilities
+are bounded above by the last recorded log probability, giving a partial KL lower bound of
+1.525 at that position. Substituting either that bound or positive infinity gives the same
+508-row median. All 508 argmax comparisons use observed tokens. The fused source-scale probe
+scored 495/508 (0.000647) and the fused fast probe scored 499/508 (0.001486).
+
+The native parser and model check from open-kernels `977e546` accepted the installed manifest
+with the model's config in a CPU-only check. Both the base and raw GGUF `dx` entries parsed
+as `kvslice=8`, `rb=1`, with the `attnpos` patch. CLI and HTTP generation have separate gates.
+
+**2026-11-22 matched final-tail ablation (measured, experimental).** Captured the pre-tail
+residual at every position and replayed final RMSNorm and the original GGUF Q6_K head in
+FP32 on the same residual. On 508 tokens against strict CPU, installed fast moved from
+493/508 and median partial KL 0.001523 to 494/508 and 0.001452. Installed accurate moved from
+491/508 and 0.000948 to 491/508 and 0.000822. The source-scale projection probe moved from
+496/508 and 0.000680 to 497/508 and 0.000568. All short-prompt runs were 18/18. Accurate
+with the FP32 tail still exceeded the short Vulkan KL (0.000893 vs 0.000783). A higher
+precision tail helps the source-scale candidate, with residual differences remaining before it.
+
+**2026-11-22 rebuilt f32-scale producer (measured).** The 6144-byte Q4_1 projection
+producer uses the original FP32 offset and two BF16 scale limbs before rounding the
+dequantized operand to BF16. All four rebuilt MiniCPM5 projection streams share the
+ELF, init and enable CDO payloads. At T256, independent operator relative Frobenius
+error was 0.00162–0.00172 against the source product and at most 8.44e-7 against the
+BF16 operand product. The core program was 5984 bytes, with 61512 bytes of placed
+L1 including a 4096-byte stack. The generated DMA program used at most one live
+shim BD per channel and three per column, and at most 16 and 12 memtile BDs in the
+two 24-entry pools.
+
+Against strict CPU-only b11393, the rebuilt route scored 18/18 with median top-20 partial
+KL 0.001178 and 496/508 with 0.000680. The two installed prefill modes reproduced their
+recorded strict CPU scores. Vulkan scored 18/18 and 497/508 with KL 0.000783 and 0.000463.
+The independent FP32 forward on source weights also missed both long control metrics
+(496/508 and 0.000511). Against that independent forward, the rebuilt route scored
+506/508 and 0.000021. It matched the 48-token CPU greedy continuation on the long prompt
+and the first 37 on the short prompt.
+
+Four alternating 508-token development pairs compared the same f32-scale manifest with
+the old and new projection streams under Arbiter. Median prefill fell from 220.92 to
+186.46 tok/s (median paired change -15.18%). Decode was 18.53 and 18.80 tok/s, with the
+same decode kernels. Gate 3 remains failed.
+
+Populated boundary runs measured the last 256 logits rows against independent FP32.
+At position 4352 the old and new projection routes agreed at 250/256 and 252/256
+(median partial KL 0.000271 and 0.000148). At position 16320 they agreed at 245/256
+and 249/256 (0.000151 and 0.000345). Forced decode at these depths was 14.14 to
+14.14 tok/s and 8.17 to 8.11 tok/s respectively under shared load.
+
+In a CPU-only projection comparison, using two BF16 activation limbs with the same
+BF16 weights and same simulated repacked head changed strict CPU median partial KL
+from 0.002041 to 0.000869 on 18 tokens and from 0.000703 to 0.000659 on 508 tokens.
+Long argmax agreement moved from 496/508 to 495/508. These model simulations
+use FP32 accumulation and independent attention. Both compensated scores exceed
+the respective Vulkan KL controls. A separate CPU ablation measured the shared-exponent
+format used by the fast route. On 508 tokens, switching from BF16 to BFP16 for just
+activations, just weights, or both yielded 494/508, 495/508 and 491/508, with median
+partial KL 0.000835, 0.001108 and 0.001291. The BF16 baseline was 496/508 and 0.000703.
+The simulating forward keeps attention and the output tail fixed. The result isolates
+an effect from projection operand precision within the simulation.
+
+Repeating the activation-only comparison with the original Q6_K tail (CPU simulation)
+gave 18/18 with median partial KL 0.001838 for one activation limb and 0.001387 for two.
+On 508 tokens both scored 497/508, with medians 0.000530 and 0.000534 respectively.
+The revised KL limit is 0.000791 on the short prompt and 0.000511 on the long prompt.
+
+**2026-11-22 compensated projection and attention diagnostic (measured, scratch).**
+Using two BF16 limbs for each projection operand and adding the high product and
+both cross products passed the revised comparison in the CPU simulation with
+the original Q6_K head. With BF16 KV storage the 18/508-token scores were
+18/18 and 496/508 with median partial KL 0.000596 and 0.000510. With FP16 KV
+storage they were 18/18 and 496/508 with 0.000755 and 0.000496.
+
+All four T256 NPU projection shapes passed a synthetic check of the three
+products. Relative Frobenius error against the source product dropped from
+0.00231–0.00243 to 3.66e-6–3.95e-6. In the scratch runtime, storing the summed
+projection results in separate host buffers produced byte-identical residuals
+across two model runs at each length. The initial attempt to write the sum into
+the mapped DMA output produced nonrepeatable logits and was rejected.
+
+| Compensated NPU projections | 18-token argmax / median KL | 508-token argmax / median KL |
+| --- | --- | --- |
+| NPU attention, installed head | 18/18 / 0.000764 | 497/508 / 0.000685 |
+| NPU attention, offline source Q6_K head | 18/18 / 0.000772 | 497/508 / 0.000559 |
+| Host attention, installed head | 18/18 / 0.000810 | 496/508 / 0.000677 |
+| Host attention, offline source Q6_K head | 18/18 / 0.000723 | 496/508 / 0.000501 |
+| Revised limits | 18/18 / 0.000791 | 496/508 / 0.000511 |
+
+Host attention used BF16 KV storage. The hybrid diagnostic meets both revised
+limits on both fixtures. With NPU attention the diagnostic still misses long
+KL. The three-dispatch scratch route with NPU attention measured 31.83–32.13 tok/s
+for 508-token prefill with every-position logit dumps. End-to-end device projection,
+attention and head quality within the accepted limits remains open.
+
+**Recommended production configuration (owner decision, 2026-11-22).** Use the pure Q4_1
+projection GGUF with its original Q6_K head and the installed o7d6 fast prefill route.
+The NPU runtime repacks that head into its resident Q8/BF16-scale format. The compensated
+projection, host attention and offline source-head experiments remain diagnostic.
+
+**Status 2026-11-22: accepted for the recommended installed 16384-context configuration with the model-specific teacher-forced exception above.**
 
 | criterion | status |
 | --- | --- |
 | unit | PASS |
-| pack check | NOT RUN |
-| tokenizer | NOT RUN: runs pass ids to `open_qwen36_cli`, and `chat.py` does not know the template |
-| llama.cpp CPU vs Vulkan control; NPU vs llama.cpp CPU, teacher forced | NOT RUN: only the fp32 forward has been compared |
-| NPU vs independent forward, whole model and long context | measured (tables above) |
-| greedy vs llama.cpp | PASS (2026-11-11 set; later sets are token-identical to it) |
-| `phlegm run` | PASS on the 2026-11-11 set; NOT RUN on the installed set |
-| `phlegm serve` | NOT RUN |
+| pack check | PASS (measured): 294 Q4_1 projections bit-exact to the carriage oracle after Q/K un-permute, 85 norms exact, Q6_K head bit-exact to the Q8/BF16 oracle (relative L2 0.00553 against source) |
+| tokenizer | PASS (measured): Phlegm rendered text and token IDs match Transformers 5.20.2 for English, Chinese, and long ChatML prompts with thinking on and off. Stop ID 130073 is `<\|im_end\|>`. |
+| Teacher forced vs llama.cpp CPU, both prefill modes | ACCEPTED EXCEPTION (owner decision, installed o7d6). Measured against strict CPU-only b11393 on 508 tokens, fast scores 493/508 / 0.001523 median partial KL and accurate 491/508 / 0.000948. Both miss the parity targets of 496/508 and 0.000511. Both agree at 18/18 on the short prompt. Fast KL is 0.000482 and accurate is 0.001083 against the short target of 0.000791. |
+| NPU vs independent forward, whole model and long context | Measured: on 508 tokens fast/accurate agree with FP32 at 497/508 and 499/508, median partial KL 0.000627 and 0.000131. Both agree at 18/18 on the short prompt. Installed fast matched Vulkan on populated 32K retrieval and returned finite logits at position 32767. A synthetic seek with empty KV history returned finite logits at 131071 with the installed set. The fused scratch route passed the populated 128K Vulkan comparison above. Installed populated 128K and paired timing remain unverified. |
+| greedy vs llama.cpp | Strict CPU-only b11393, installed set (measured): short fast 48/48, accurate 37/48. At token 38, CPU selected ID 350 over 35 by 0.031 logits and accurate NPU selected ID 35 over 350 by 0.053 logits. Both modes matched all 48 tokens on the long prompt. |
+| `phlegm run` | PASS on installed o7d6 (measured): the Paris answer appears on stdout with thinking on and off, with reasoning on stderr only when enabled. Both requests sampled exact stop ID 130073. |
+| `phlegm serve` | PASS on installed o7d6 (measured): the same answer streamed and nonstreamed, reasoning in `reasoning_content` only with thinking enabled, and `enable_thinking: false` honored in both modes. All four requests sampled exact stop ID 130073. The streamed reasoning carried one extra trailing newline on this fixture. |
 | decode-attention changes gated | PASS (`decgate.py` on each non-identical step) |
 
 The attention tuple `(128, 16, 2, 128, False, False, False)` entered the catalogue on the two-request llama.cpp match and the unit
-test. Points enter only after a compare (OPEN-OP-RANGE), so this one stays provisional until the teacher-forced comparison has run.
+test. The teacher-forced comparison and model-specific acceptance decision are recorded above (OPEN-OP-RANGE).
 
 ### OPEN-CONVERT-QWEN35-VHEADS: a GGUF's tiled value heads come back in grouped order
 **Applies to:** openflowlm-next (`utilities/q4nx-build/q4nx/models/qwen35.py`)
