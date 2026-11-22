@@ -4355,6 +4355,24 @@ the old and new projection streams under Arbiter. Median prefill fell from 220.9
 186.46 tok/s (median paired change -15.18%). Decode was 18.53 and 18.80 tok/s, with the
 same decode kernels. Gate 3 remains failed.
 
+Populated boundary runs measured the last 256 logits rows against independent FP32.
+At position 4352 the old and new projection routes agreed at 250/256 and 252/256
+(median partial KL 0.000271 and 0.000148). At position 16320 they agreed at 245/256
+and 249/256 (0.000151 and 0.000345). Forced decode at these depths was 14.14 to
+14.14 tok/s and 8.17 to 8.11 tok/s respectively under shared load.
+
+In a CPU-only projection comparison, using two BF16 activation limbs with the same
+BF16 weights and same simulated repacked head changed strict CPU median partial KL
+from 0.002041 to 0.000869 on 18 tokens and from 0.000703 to 0.000659 on 508 tokens.
+Long argmax agreement moved from 496/508 to 495/508. These model simulations
+use FP32 accumulation and independent attention. Both compensated scores exceed
+the respective Vulkan KL controls. A separate CPU ablation measured the shared-exponent
+format used by the fast route. On 508 tokens, switching from BF16 to BFP16 for just
+activations, just weights, or both yielded 494/508, 495/508 and 491/508, with median
+partial KL 0.000835, 0.001108 and 0.001291. The BF16 baseline was 496/508 and 0.000703.
+The simulating forward keeps attention and the output tail fixed. The result isolates
+an effect from projection operand precision within the simulation.
+
 **Status 2026-11-22: not accepted.**
 
 | criterion | status |
