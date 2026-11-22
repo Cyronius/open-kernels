@@ -4332,6 +4332,29 @@ FP32 on the same residual. On 508 tokens against strict CPU, installed fast move
 with the FP32 tail still exceeded the short Vulkan KL (0.000893 vs 0.000783). A higher
 precision tail helps the source-scale candidate, with residual differences remaining before it.
 
+**2026-11-22 rebuilt f32-scale producer (measured).** The 6144-byte Q4_1 projection
+producer uses the original FP32 offset and two BF16 scale limbs before rounding the
+dequantized operand to BF16. All four rebuilt MiniCPM5 projection streams share the
+ELF, init and enable CDO payloads. At T256, independent operator relative Frobenius
+error was 0.00162–0.00172 against the source product and at most 8.44e-7 against the
+BF16 operand product. The core program was 5984 bytes, with 61512 bytes of placed
+L1 including a 4096-byte stack. The generated DMA program used at most one live
+shim BD per channel and three per column, and at most 16 and 12 memtile BDs in the
+two 24-entry pools.
+
+Against strict CPU-only b11393, the rebuilt route scored 18/18 with median top-20 partial
+KL 0.001178 and 496/508 with 0.000680. The two installed prefill modes reproduced their
+recorded strict CPU scores. Vulkan scored 18/18 and 497/508 with KL 0.000783 and 0.000463.
+The independent FP32 forward on source weights also missed both long control metrics
+(496/508 and 0.000511). Against that independent forward, the rebuilt route scored
+506/508 and 0.000021. It matched the 48-token CPU greedy continuation on the long prompt
+and the first 37 on the short prompt.
+
+Four alternating 508-token development pairs compared the same f32-scale manifest with
+the old and new projection streams under Arbiter. Median prefill fell from 220.92 to
+186.46 tok/s (median paired change -15.18%). Decode was 18.53 and 18.80 tok/s, with the
+same decode kernels. Gate 3 remains failed.
+
 **Status 2026-11-22: not accepted.**
 
 | criterion | status |

@@ -1230,8 +1230,8 @@ def gguf_q41_view(spec: ModelSpec) -> bool:
     """The manifest's `gguf` section is the q4_1 program itself, packed from the GGUF (OPEN-FAMILY-NANBEIGE).
 
     `std_perm_gguf` packs a Q4_0 / Q4_1 tensor into the q4_1 law's 5120-B chunk with its codes kept
-    and its fp16 scale pair rounded to bf16 (what the f32-scale kernels narrow it to on the core
-    anyway); a pure Q4_0 GGUF from BF16 has bf16-exact scales and m = -8 d, so it packs exactly. The
+    and its fp16 scale pair rounded to bf16. A pure Q4_0 GGUF from BF16 has bf16-exact scales
+    and m = -8 d, so it packs exactly. The
     runtime un-permutes llama.cpp's Q / K rows there. The head is the GGUF's Q8_0 kept as codes
     (`lmhead_q8` on lm_head_q8 with bf16 scales), not requantized to q4_1. Only a spec that would
     otherwise have no section takes it (split FF, no f32 twin), so every other manifest is unchanged."""
