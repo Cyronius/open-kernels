@@ -4305,6 +4305,10 @@ against strict CPU were 0.000783, 0.000482, 0.001083 and 0.000791 respectively. 
 meets both short-prompt comparisons. Installed accurate exceeds the Vulkan KL. The 508-token
 strict replay was still running when those numbers were recorded.
 
+The native parser and model check from open-kernels `977e546` accepted the installed manifest
+with the model's config in a CPU-only check. Both the base and raw GGUF `dx` entries parsed
+as `kvslice=8`, `rb=1`, with the `attnpos` patch. CLI and HTTP generation have separate gates.
+
 **Status 2026-11-21: not accepted.**
 
 | criterion | status |
