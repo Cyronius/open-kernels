@@ -60,6 +60,9 @@ to make the same exact-length requests to OFLM and the checkpoint's CPU implemen
 `--prompt-name document --prefix "search_document: "` for Nomic serving. The utility checks the
 server's model identity, processed token count, and vector normalization before recording the
 comparison. Long-input performance needs a quiet-machine repeat with the driver and design named.
+Use `--mixed --batches 4 16` to compare varied, exact-length fixtures through the same CPU and
+serving paths. The utility checks the full batch token count and ordered result indices and
+records the lowest cosine in each batch.
 
 ## Release design control
 
@@ -81,6 +84,18 @@ Raw reports are under `.plans/bert/release-quality-*.log` and `.plans/bert/relea
 in the bring-up worktree.
 
 ## 512-token candidate
+
+All five families compiled and passed the design checker on the same Windows toolchain. Each
+family has four streams per tier, at batches 1, 4 and 16. Raw exports are retained under
+`.plans/bert/seq512/xclbins`. The SHA-256 values identify the checked designs.
+
+| Family | `design.json` SHA-256 |
+|---|---|
+| BERT-h384-bfp16 | `e853a0796fdec0d669c24a424e779537da28fa7c2dee8189f1b03f2e4d391a37` |
+| BERT-h384-bf16 | `c90e0943ce432a846129b6a52e02461049ecc00fda4d0b0917b5f2cb65fd05aa` |
+| BERT-h768-bfp16 | `629f4dd319f20f8e13af048250120ecfc10ec0089d79ea3928decfa9ee857482` |
+| BERT-h768-gated-bfp16 | `209efdb401275a80bab9c215668c4e8ead72eebca6a4469562e895688d58f763` |
+| BERT-h1024-bfp16 | `61006bcde2e0beb3367482b87fc4abe0f17bc2f4fa6b7b3c0ac5fc9319ee0c95` |
 
 MiniLM's re-export loaded on the NPU with 12 instruction streams and batch tiers 1, 4 and 16.
 `oflm-test --embedding` passed. Both 256-token probes agreed with the publisher CPU reference at
@@ -120,9 +135,40 @@ models loaded from GGUF and passed the batch-4 bit-identity gate on the 64-token
 Nomic needed `--prompt-name document`. These runs used an isolated registry overlay with the
 canonical tags because the installed backend rejects custom embedding tags even after the
 installer registers them. The generated entries label Q8_0 weights as bf16. The local
-overlay records Q8_0 and leaves the user registry alone. Accuracy against the publisher weights
-and longer-context validation are still open for the quantized route. Raw logs are
-`.plans/bert/smoke-gguf-canonical.log` and `.plans/bert/nomic-gguf-document.log`.
+overlay records Q8_0 and leaves the user registry alone. The 32- and 64-token HTTP probes also
+matched the original CPU checkpoints. The sample is two fixtures per length.
+
+| Q8_0 model | Minimum CPU cosine | `oflm-test --embedding` |
+|---|---:|---|
+| MiniLM | 0.999314 | Pass |
+| BGE small | 0.999867 | Pass |
+| BGE base | 0.999574 | Pass |
+| BGE large | 0.999696 | Pass |
+| Nomic | 0.997948 | The explicit document requests passed. The embedded suite still omitted the required task prompt. |
+
+Longer-context validation is open for the quantized route. Raw reports are
+`.plans/bert/gguf-quality-*.log`, `.plans/bert/smoke-gguf-canonical.log` and
+`.plans/bert/nomic-gguf-document.log`. The compatible Q4 comparison uses MiniLM Q4_0 from
+Second State, BGE small Q4_0 from ChristianAzinn, BGE base and large Q4_K_M from CompendiumLabs,
+and Nomic Q4_0 from the original publisher.
+
+| Q4 model | Lowest CPU cosine across single requests and batch-4 fixtures |
+|---|---:|
+| MiniLM Q4_0 | 0.953409 |
+| BGE small Q4_0 | 0.973202 |
+| BGE base Q4_K_M | 0.985465 |
+| BGE large Q4_K_M | 0.985452 |
+| Nomic Q4_0 | 0.861227 |
+
+The Q4 trials ran at 32 and 64 tokens. They used varied context at 64 tokens and the same short
+fixtures at 32 tokens. All loaded on the NPU. The Q4 results favor Q8_0 for the provisional
+selection. Both formats unpack to the same NPU weight layout, so the primary benefit of Q4
+here is the smaller download. Raw reports are under `.plans/bert/q4-quality-*.log`.
+
+For the extended Q8_0 trials, the [position-table utility](../../utilities/bert-embeddings/extend_npue.py)
+restores the missing rows from the original verified GGUF. Nomic uses the existing zero-table
+convention for RoPE within its GGUF's declared context. All five staged 512-token containers
+matched the original automatic packs byte for byte outside the position tensor.
 
 ## OFLM side
 
