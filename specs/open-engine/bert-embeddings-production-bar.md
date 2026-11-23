@@ -196,6 +196,13 @@ restores the missing rows from the original verified GGUF. Nomic uses the existi
 convention for RoPE within its GGUF's declared context. All five staged 512-token containers
 matched the original automatic packs byte for byte outside the position tensor.
 
+The staged Q8_0 packs for MiniLM and all three BGE models served 512 tokens per input, including
+batch 4 at 2,048 total tokens. Their lowest cosine across the two single inputs and the batch
+was 0.999443 for MiniLM, 0.999891 for BGE-small, 0.999720 for BGE-base and 0.999717 for BGE-large.
+MiniLM's 512-token run is exploratory beyond its published 256-token serving limit. Raw outputs
+are under `.plans/bert/q8-long-quality-*.log`. This verifies the staged weights and kernels
+while the automatic release pack still needs to preserve those position rows.
+
 ## OFLM side
 
 - Make a clean GTE pull reproducible by pinning the known config revision or accepting and
