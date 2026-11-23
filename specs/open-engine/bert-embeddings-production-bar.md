@@ -208,6 +208,20 @@ The staged Nomic Q8_0 pack also served exact 512-token singles and batch 4 with
 still failed its generic requests without the required prompt. This run covers 512 tokens
 with the standard rotary settings. It leaves the 8,192-token dynamic RoPE gate open.
 
+## Model features
+
+- GTE dense retrieval passed a short multilingual probe using an English query, related
+  German, Spanish, Chinese and Russian passages, and unrelated English and French passages.
+  The lowest CPU cosine was 0.999642 across all seven vectors. The gap between the weakest
+  relevant passage and the strongest distractor was 0.2652 on NPU and 0.2634 on CPU.
+- Nomic accepted `search_query`, `search_document`, `clustering` and `classification`.
+  All four vectors differed for the same text and matched their task-specific CPU references
+  with a minimum cosine of 0.998892. The server returned 768 values for a request with
+  `dimensions: 256`. Resizable output remains open.
+
+Raw report `.plans/bert/features.log`, SHA-256
+`52028291087aa646355099bce62fd0a3053bfa0df835e1f21bd20ce60d224901`.
+
 ## OFLM side
 
 - Make a clean GTE pull reproducible by pinning the known config revision or accepting and
@@ -220,3 +234,5 @@ with the standard rotary settings. It leaves the 8,192-token dynamic RoPE gate o
 - Map the encoder's over-limit error to an HTTP 400 with the input length and supported limit.
 - Route registered embedding entries to NPUE by declared family and design. Keep the actual
   GGUF quant in the registry metadata and report the runtime packing format separately.
+- Honor and validate supported embedding dimensions. Expose GTE's sparse output or document
+  the dense-only route and its reason.
