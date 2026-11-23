@@ -714,6 +714,26 @@ a repeat under controlled load before release. Raw log
 `dc3df8689291a2f8c740e49c84a4789e37fc17c422bcef7470196f2c88b25073`.
 MiniLM matrix SHA-256 `109c331e3d502071f707030c1630f6e61e80a3eb34c3e41b5f23c4ffdeef7866`.
 
+### Skipping padded host queries
+
+The resident embedding service now supplies each lane's occupied row count
+to the host attention path. QK, softmax and AV only produce occupied query
+rows. They retain the original padded key span, masks and reduction order.
+The projection shapes remain fixed, with zero attention output for unused
+rows. The device attention hook and the standalone encoder use their
+existing routes.
+
+Extracting the original and revised host loops into a single-thread AVX2
+test gave identical occupied output bytes for MiniLM's captured QKV and
+synthetic 32- and 64-wide heads. The cases included mixed lengths, an
+unused batch lane, and a fully occupied 512-token request. At four
+64-token inputs in the fixed 256-token design, the isolated attention
+median fell from 13.35 to 3.23 ms. At full capacity the two medians were
+20.09 and 20.24 ms. The native worker built successfully. The service-level
+parity check and baseline–candidate–baseline benchmark remain queued.
+CPU loop log `.plans/bert/npue-query-pruning-cpu.log`, SHA-256
+`3a00effd5db636c8c2f9b959ec85e6a9c125fb0ed4c2ebdab4e2699b0f63bac5`.
+
 ## Cold packing from GGUF
 
 Build the CPU-only packer from an x64 MSVC developer shell with
