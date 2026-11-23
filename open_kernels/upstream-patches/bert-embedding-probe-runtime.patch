@@ -40,7 +40,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    }
 
    npue::Encoded encode(const std::string &text, int max_len) const {
-@@ -1372,6 +1396,12 @@
+@@ -1372,6 +1396,17 @@
 
    // Staged once: the mask, in the form softmax consumes.
    std::vector<float> add_mask;   // [batch, g_seq]
@@ -50,10 +50,15 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +  int64_t query_count(int64_t input) const {
 +    return active_queries.empty() ? g_seq : active_queries[input];
 +  }
++  // Keep the final partial AVX row intact. The suffix consists only of
++  // masked keys; it cannot contribute meaningful weight to an occupied row.
++  int64_t key_span(int64_t input) const {
++    return std::min<int64_t>(g_seq, (query_count(input) + 7) & ~int64_t(7));
++  }
 
    // Unified gemm_rtp mode (tasks/0032): all four GEMM refs above point at ONE
    // design; each op is an instruction-stream slot bound before dispatch. The
-@@ -1445,6 +1475,8 @@
+@@ -1445,6 +1480,8 @@
    // MB of allocate-and-touch per encode at batch 128, and ~280 MB at
    // bge-large's width. resize() after the first call is a no-op.
    std::vector<float> qkvbuf, ctx, proj, up, down, scores;
@@ -62,7 +67,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    // arch=2 only: swiglu_cpu()'s output, [rows][g_ffn] -- a separate buffer
    // from `up` because an in-place version of this compaction is NOT safe
    // under threading (see swiglu_cpu's own comment). Empty/unused for every
-@@ -1460,6 +1492,39 @@
+@@ -1460,6 +1497,39 @@
    // duplicating it for a second arch would be the actual mistake.
    std::vector<float> rope_cos, rope_sin;
    bool rope_ready = false;
@@ -102,7 +107,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
    // Device-resident weights, one slot per layer per design, plus the bias
    // pointers straight into the mapped file. Filled by stage_all().
-@@ -1499,6 +1564,7 @@
+@@ -1499,6 +1569,7 @@
    // (narrow-to-bf16 instead of quantise, no scale) -- one flag, two datapaths,
    // so --no-fuse-ffn A/Bs whichever one the loaded container actually uses.
    bool fuse_ffn_epilogue = true;
@@ -110,7 +115,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    double t_hostln = 0.0, t_hostsm = 0.0, t_hostgelu = 0.0;
 
 
-@@ -1531,7 +1597,7 @@
+@@ -1531,7 +1602,7 @@
      // from everything printed beside it (tasks/0086).
      t_qk = t_av = 0.0;
      t_npu = t_attn = 0.0;
@@ -119,7 +124,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
      t_conv = t_in = t_disp = t_out = t_bias = 0.0;
      n_dispatch = 0;
    }
-@@ -1763,12 +1829,15 @@
+@@ -1763,16 +1834,20 @@
        const int64_t hi = std::min<int64_t>(n_rows, lo + chunk);
        const int64_t rows_per_seq = g_heads * g_seq;
        for (int64_t r = lo; r < hi; ++r) {
@@ -127,34 +132,112 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +        if (!active_queries.empty() && r % g_seq >= active_queries[input])
 +          continue;
          float *row = scores.data() + r * g_seq;
++        const int64_t keys = key_span(input);
          // The additive padding mask, folded in here rather than in qk(): the
          // row is already resident, so this is free, and it leaves qk() as the
          // pure matmul an array kernel could run. Same single float addition
          // qk() used to do, so the result is unchanged to the bit.
 -        const float *mk = add_mask.data() + (r / rows_per_seq) * g_seq;
+-        for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];
 +        const float *mk = add_mask.data() + input * g_seq;
-         for (int64_t j = 0; j < g_seq; ++j) row[j] += mk[j];
++        for (int64_t j = 0; j < keys; ++j) row[j] += mk[j];
  #if defined(__AVX2__)
          __m256 mx = _mm256_loadu_ps(row);
-@@ -2547,7 +2616,7 @@
+-        for (int64_t j = 8; j < g_seq; j += 8)
++        for (int64_t j = 8; j < keys; j += 8)
+           mx = _mm256_max_ps(mx, _mm256_loadu_ps(row + j));
+         __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(mx),
+                                _mm256_extractf128_ps(mx, 1));
+@@ -1782,7 +1857,7 @@
+         const __m256 log2e = _mm256_set1_ps(1.4426950408889634f);
+         const __m256 argfloor = _mm256_set1_ps(-120.0f);
+         __m256 sum = _mm256_setzero_ps();
+-        for (int64_t j = 0; j < g_seq; j += 8) {
++        for (int64_t j = 0; j < keys; j += 8) {
+           __m256 a = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(row + j), mv),
+                                    log2e);
+           __m256 e = exp2_avx2(_mm256_max_ps(a, argfloor));
+@@ -1790,19 +1865,19 @@
+           sum = _mm256_add_ps(sum, e);
+         }
+         const __m256 inv = _mm256_set1_ps(1.0f / hsum256(sum));
+-        for (int64_t j = 0; j < g_seq; j += 8)
++        for (int64_t j = 0; j < keys; j += 8)
+           _mm256_storeu_ps(row + j,
+                            _mm256_mul_ps(_mm256_loadu_ps(row + j), inv));
+ #else
+         float m = row[0];
+-        for (int64_t j = 1; j < g_seq; ++j) m = std::max(m, row[j]);
++        for (int64_t j = 1; j < keys; ++j) m = std::max(m, row[j]);
+         float sum = 0.f;
+-        for (int64_t j = 0; j < g_seq; ++j) {
++        for (int64_t j = 0; j < keys; ++j) {
+           row[j] = std::exp(row[j] - m);
+           sum += row[j];
+         }
+         const float inv = 1.0f / sum;
+-        for (int64_t j = 0; j < g_seq; ++j) row[j] *= inv;
++        for (int64_t j = 0; j < keys; ++j) row[j] *= inv;
+ #endif
+       }
+     });
+@@ -2547,7 +2622,8 @@
      pool->run([&](int w, int nw) {
        for (int64_t p = w; p < pairs; p += nw) {
          const int64_t b = p / g_heads, h = p % g_heads;
 -        for (int64_t i = 0; i < g_seq; ++i) {
++        const int64_t keys = key_span(b);
 +        for (int64_t i = 0, end = query_count(b); i < end; ++i) {
            const float *q = &qkv_p[(b * g_seq + i) * 3 * g_hidden + h * g_head_dim];
            float *dst = &sc_p[(p * g_seq + i) * g_seq];
            // head_dim / 8 vectors, held across the j loop. head_dim is 32 for
-@@ -2631,7 +2700,7 @@
+@@ -2581,7 +2657,7 @@
+           const int64_t nv = NV ? NV : g_head_dim / 8;
+           for (int64_t v = 0; v < nv; ++v) qv[v] = _mm256_loadu_ps(q + v * 8);
+ #endif
+-          for (int64_t j = 0; j < g_seq; ++j) {
++          for (int64_t j = 0; j < keys; ++j) {
+             const float *k = &qkv_p[(b * g_seq + j) * 3 * g_hidden + g_hidden +
+                                     h * g_head_dim];
+ #if defined(__AVX512F__)
+@@ -2631,7 +2707,8 @@
      pool->run([&](int w, int nw) {
        for (int64_t p = w; p < pairs; p += nw) {
          const int64_t b = p / g_heads, h = p % g_heads;
 -        for (int64_t i = 0; i < g_seq; ++i) {
++        const int64_t keys = key_span(b);
 +        for (int64_t i = 0, end = query_count(b); i < end; ++i) {
            const float *a = &sc_p[(p * g_seq + i) * g_seq];
            float *o = &ctx_p[(b * g_seq + i) * g_hidden + h * g_head_dim];
  #if defined(__AVX2__)
-@@ -2795,8 +2864,16 @@
+@@ -2662,7 +2739,7 @@
+           for (int64_t v = 0; v < nz; ++v) zacc[v] = _mm512_setzero_ps();
+           const bool tail = (nv & 1) != 0;
+           if (tail) yacc = _mm256_setzero_ps();
+-          for (int64_t j = 0; j < g_seq; ++j) {
++          for (int64_t j = 0; j < keys; ++j) {
+             const float *v = &qkv_p[(b * g_seq + j) * 3 * g_hidden +
+                                     2 * g_hidden + h * g_head_dim];
+             const __m512 zaj = _mm512_set1_ps(a[j]);
+@@ -2680,7 +2757,7 @@
+           __m256 acc[NV ? NV : kMaxHeadVecs];
+           const int64_t nv = NV ? NV : g_head_dim / 8;
+           for (int64_t v = 0; v < nv; ++v) acc[v] = _mm256_setzero_ps();
+-          for (int64_t j = 0; j < g_seq; ++j) {
++          for (int64_t j = 0; j < keys; ++j) {
+             const float *v = &qkv_p[(b * g_seq + j) * 3 * g_hidden +
+                                     2 * g_hidden + h * g_head_dim];
+             const __m256 aj = _mm256_set1_ps(a[j]);
+@@ -2692,7 +2769,7 @@
+ #endif
+ #else
+           for (int64_t d = 0; d < g_head_dim; ++d) o[d] = 0.f;
+-          for (int64_t j = 0; j < g_seq; ++j) {
++          for (int64_t j = 0; j < keys; ++j) {
+             const float *v = &qkv_p[(b * g_seq + j) * 3 * g_hidden +
+                                     2 * g_hidden + h * g_head_dim];
+             for (int64_t d = 0; d < g_head_dim; ++d) o[d] += a[j] * v[d];
+@@ -2795,8 +2872,16 @@
      pool->run([&](int w, int nw) {
        for (int64_t row = w; row < n_rows; row += nw) {
          const int64_t s = row % g_seq;    // [b][s] row order -> s = row % seq
@@ -173,7 +256,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
          float *row_base = p + row * row_stride;
          for (int64_t h = 0; h < g_heads; ++h) {
            rotate_pair(row_base + h * g_head_dim, cs, sn);              // Q
-@@ -2808,15 +2885,25 @@
+@@ -2808,15 +2893,25 @@
 
    std::vector<float> run(const std::vector<float> &emb_in) {
      std::vector<float> x = emb_in;
@@ -200,7 +283,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
      residual.resize(x.size());
      // Set by the PREVIOUS iteration's fused LayerNorm, which already wrote
-@@ -2833,32 +2920,40 @@
+@@ -2833,32 +2928,40 @@
        // per-position rotation of the projected q/k, not of the input) and
        // strictly before qk() reads them. No-op (false) for every arch=0
        // container.
@@ -266,7 +349,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
        gemm(attn_out, is_ao, ctx, s_ao[L], b_ao[L], proj, g_hidden,
             i8w(ws_ao, L), i8w(as_ao, L));
-@@ -4504,6 +4599,10 @@
+@@ -4504,6 +4607,10 @@
    Encoder *lead;
    std::vector<Encoder *> all;
    int64_t fallback_batch;
@@ -277,7 +360,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
    // Greedy against the tier ladder: 64 texts with tiers {4,16,32,128}
    // becomes 32+32, both exact, instead of one half-padded 128.
-@@ -4524,32 +4623,36 @@
+@@ -4524,32 +4631,36 @@
      return jobs;
    }
 
@@ -327,7 +410,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
        for (int64_t s = 0; s < g_seq; ++s) {
          const int32_t id = en.input_ids[s];
          const float m = static_cast<float>(en.attention_mask[s]);
-@@ -4561,18 +4664,52 @@
+@@ -4561,18 +4672,52 @@
          for (int64_t c = 0; c < g_hidden; ++c)
            dst[c] = wv[c] + pv[c] + w_typ[c];
        }
@@ -383,7 +466,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
      std::atomic<int64_t> tok_total{0};
      if (all.size() > 1 && jobs.size() > 1) {
        std::atomic<size_t> next{0};
-@@ -4591,8 +4728,7 @@
+@@ -4591,8 +4736,7 @@
            if (stop.load(std::memory_order_relaxed)) return;
            try {
              int64_t nt = 0;
@@ -393,7 +476,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
              tok_total += nt;
            } catch (...) {
              // First one wins. Which job reports first is a thread race, so
-@@ -4616,7 +4752,7 @@
+@@ -4616,7 +4760,7 @@
      } else {
        for (const auto &j : jobs) {
          int64_t nt = 0;
@@ -402,7 +485,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
          tok_total += nt;
        }
      }
-@@ -4692,15 +4828,56 @@
+@@ -4692,15 +4836,56 @@
    // allowed to be guessed.
    std::vector<float> embed(const std::vector<std::string> &texts,
                             const std::string &prompt_name = std::string(),
@@ -463,7 +546,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    int lanes() const { return stack_.n_lanes; }
    size_t vocab_size() const { return svc_.tok.vocab_size(); }
    std::vector<std::string> prompt_names() const { return prompt_names_sorted(); }
-@@ -4760,5 +4937,6 @@
+@@ -4760,5 +4945,6 @@
    npu::Device dev_;
    Stack stack_;
    EmbedService svc_;
