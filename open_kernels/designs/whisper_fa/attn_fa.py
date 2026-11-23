@@ -256,6 +256,7 @@ def flash_attn(
     valid_len: CompileTime[int],
     attention_scale_one: CompileTime[bool] = False,
     runtime_valid_len: CompileTime[bool] = False,
+    native_bf16: CompileTime[bool] = False,
 ):
     NQ = 4  # q-tile columns per head-group -- fixed, matches attn_npu2.py main()
     NS = num_cascade_stages
@@ -298,7 +299,9 @@ def flash_attn(
         + tile_size_q * dv  # gp
         + tile_size_q * dv  # gp_c (merge scratch; present on ty != NS-1)
     )
-    assert per_core_bytes < 64512, f"L1 budget exceeded: {per_core_bytes} B"
+    # Native BF16 matrix products use a larger shared MAC frame.
+    stack_size = 4096 if native_bf16 else 2048
+    assert per_core_bytes + stack_size < 65536, f"L1 budget exceeded: {per_core_bytes} B plus stack"
 
     # ------------------------------------------------------------- kernels
     # Compile attn_npu2.cc ONCE (bound to one symbol); every other symbol
@@ -315,9 +318,10 @@ def flash_attn(
         f"-Dvalid_len={valid_len}",
         f"-DFA_RUNTIME_VALID_LEN={int(runtime_valid_len)}",
         "-DFP32_STATE=1",
-        "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         "-DROUND_CONV_EVEN",
     ]
+    if not native_bf16:
+        compile_flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
     if attention_scale_one:
         compile_flags.append("-DFA_ATTENTION_SCALE_ONE")
 
@@ -844,7 +848,7 @@ def flash_attn(
                 # debug ladder scripts (attempts 29-32, 21_attempt30...),
                 # which never re-added the final normalisation dropped by
                 # fa_iron4 attempt 17's debug bypass).
-                workers[h][tx][s] = Worker(fn, fn_args, tile=Tile(c, 2 + s), stack_size=2048)
+                workers[h][tx][s] = Worker(fn, fn_args, tile=Tile(c, 2 + s), stack_size=stack_size)
 
     # Cascade edges: ty = NS-1 (bottom, row 2+NS-1) -> ... -> ty = 0 (top,
     # row 2). Same direction/shape as cascade.py's row (n_aie_rows-1) -> row
@@ -972,6 +976,7 @@ SPECIALIZE = dict(
     valid_len=int(os.environ.get("FA_VALID_LEN", 1500)),
     attention_scale_one=bool(int(os.environ.get("FA_SCALE_ONE", "0"))),
     runtime_valid_len=bool(int(os.environ.get("FA_RUNTIME_VALID_LEN", "0"))),
+    native_bf16=bool(int(os.environ.get("FA_NATIVE_BF16", "0"))),
 )
 
 

@@ -56,7 +56,7 @@ def check_artifact(path, sequence, heads=HEADS, head_width=HEAD_WIDTH):
         raise ValueError(f"{path} does not match the requested BERT attention artifact")
 
 
-def build(path, sequence, heads=HEADS, head_width=HEAD_WIDTH):
+def build(path, sequence, heads=HEADS, head_width=HEAD_WIDTH, *, native_bf16=False):
     validate_geometry(sequence, heads, head_width)
     if path.exists():
         raise FileExistsError(path)
@@ -74,6 +74,7 @@ def build(path, sequence, heads=HEADS, head_width=HEAD_WIDTH):
         "FA_VALID_LEN": str(LENGTH_MARKER),
         "FA_RUNTIME_VALID_LEN": "1",
         "FA_SCALE_ONE": "0",
+        "FA_NATIVE_BF16": str(int(native_bf16)),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=path.parent) as work:
@@ -95,10 +96,13 @@ def main():
     parser.add_argument("--sequence", required=True, type=int, choices=SEQUENCES)
     parser.add_argument("--heads", type=int, default=HEADS)
     parser.add_argument("--head-width", type=int, default=HEAD_WIDTH)
+    parser.add_argument("--native-bf16", action="store_true", help="build with native BF16 matrix products")
     parser.add_argument("--check", action="store_true", help="verify an existing artifact")
     args = parser.parse_args()
+    if args.check and args.native_bf16:
+        parser.error("--native-bf16 selects a build mode")
     if not args.check:
-        build(args.out, args.sequence, args.heads, args.head_width)
+        build(args.out, args.sequence, args.heads, args.head_width, native_bf16=args.native_bf16)
     check_artifact(args.out, args.sequence, args.heads, args.head_width)
     print(f"Verified {args.out} at {args.sequence} tokens ({args.heads} x {args.head_width})")
 

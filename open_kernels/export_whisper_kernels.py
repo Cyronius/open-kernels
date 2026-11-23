@@ -275,6 +275,7 @@ def _run_fa_build(bdir: Path) -> None:
         "FA_VALID_LEN": str(FA_SHAPE["valid_len"]),
         "FA_RUNTIME_VALID_LEN": "0",
         "FA_SCALE_ONE": "0",
+        "FA_NATIVE_BF16": "0",
     })
     t0 = time.time()
     r = subprocess.run([sys.executable, str(HERE / "build_design.py"), str(FA_DESIGN), str(bdir)],

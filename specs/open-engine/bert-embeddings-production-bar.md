@@ -685,6 +685,24 @@ both captured layers and the 257-key mask test. Its 512-key synthetic
 worst-head relative L2 was 0.038506 against a 0.03 limit, so it stayed on
 host attention. The remaining 16-by-64 gate needs a precision investigation.
 
+On the failing fixture, fitting a separate scalar gain to every output row
+still left 0.032915 relative L2 on the worst head. A CPU model of BF16
+rounding and the four-stage merge with exact exponentiation and matrix
+products estimated 0.006103 L2. A separate EBS8 rounding control on Q, K and
+V gave 0.018909. These CPU approximations motivate isolating the matrix
+path on the device. Raw report
+`.plans/bert/bge-large-attention-error-decomposition.json`, SHA-256
+`fee5a8cf0d54627c251cc3125e291bac8a30ed851f00697baf51fc5a612c0fef`.
+The BERT exporter can build this geometry with `--native-bf16`. This
+candidate keeps the same memory layout and runtime length mask. Its largest
+core program is 15,760 bytes. Static disassembly found a 2,112-byte frame
+and at most 3,840 bytes in positive stack adjustments summed over a core,
+so the native build reserves 4,096 bytes. The largest reserved local
+extent plus static data is 64,388 bytes. The BFP16 control reproduced its
+instruction stream. Device parity and latency remain open. Raw budget
+report `.plans/bert/bge-large-native-bf16-budget.json`, SHA-256
+`f55e9f3b41e7a5986bccf75d72925b8af79e9a60bdd88add6e2989d4fd0db527`.
+
 ## First live Phlegm performance run
 
 On Ryzen AI 9 HX PRO 370 with Windows 26200, NPU driver 32.0.20102.3930
