@@ -203,6 +203,11 @@ MiniLM's 512-token run is exploratory beyond its published 256-token serving lim
 are under `.plans/bert/q8-long-quality-*.log`. This verifies the staged weights and kernels
 while the automatic release pack still needs to preserve those position rows.
 
+The staged Nomic Q8_0 pack also served exact 512-token singles and batch 4 with
+`search_document`. The minimum CPU cosine was 0.997649. The unmodified OFLM test suite
+still failed its generic requests without the required prompt. This run covers 512 tokens
+with the standard rotary settings. It leaves the 8,192-token dynamic RoPE gate open.
+
 ## OFLM side
 
 - Make a clean GTE pull reproducible by pinning the known config revision or accepting and
