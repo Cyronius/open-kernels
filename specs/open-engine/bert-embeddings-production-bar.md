@@ -108,6 +108,11 @@ BGE small served both 512-token requests at CPU cosines 0.999982–0.999984. Its
 passed. An exact 513-token request received HTTP 500 with a generic server error. The engine
 rejected the oversized input, and the REST layer needs to expose that as a client error.
 
+The single-sequence 8,192-token Nomic/GTE experiment compiled and passed the artifact checker.
+It uses four streams and the same 8,192 total rows as the largest release tier. Its
+`design.json` SHA-256 is `b73db99879c4bb42d194caf781cd43f7523f3e76fa491ff554e5dbf55f4f67a3`.
+Runtime and Nomic dynamic RoPE parity are separate checks.
+
 A standalone MiniLM profile using the same 512-token design dispatched four GEMMs per layer
 (24 total). Five warm runs measured host attention at 18.1–21.7 ms, softmax at 3.9–5.2 ms,
 normalization at 1.5–1.7 ms, conversions and bias at 2.9–4.0 ms, and buffer sync at 0.8–1.5 ms.
