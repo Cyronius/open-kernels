@@ -2,9 +2,11 @@
 
 import argparse
 import hashlib
+from importlib.metadata import version
 import json
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 
 import gguf
@@ -151,12 +153,20 @@ def verify_projection(config, reader, arch):
         raise ValueError("projection design is missing encoder streams")
 
 
-def pack(gguf_path, design, packer, output, expected_hash):
+def sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def require_source(gguf_path, expected_hash):
+    if sha256(gguf_path) != expected_hash:
+        raise ValueError("GGUF SHA-256 mismatch")
+
+
+def pack(gguf_path, design, packer, output, expected_hash, *, log=None):
     if output.exists():
         raise FileExistsError(output)
-    with gguf_path.open("rb") as stream:
-        if hashlib.file_digest(stream, "sha256").hexdigest() != expected_hash:
-            raise ValueError("GGUF SHA-256 mismatch")
+    require_source(gguf_path, expected_hash)
     data = gguf.GGUFReader(gguf_path)
     name = field(data, "general.name")
     if name not in MODELS:
@@ -193,7 +203,8 @@ def pack(gguf_path, design, packer, output, expected_hash):
         unaugmented = temporary / "packed.npue"
         packer_arch = {"bert": "bert", "nomic-bert": "nomic", "new": "gte"}[arch]
         subprocess.run([str(packer.resolve(strict=True)), packer_arch, str(checkpoint),
-                        repo, pool, str(length), str(layout["tile_n"]), str(unaugmented)], check=True)
+                        repo, pool, str(length), str(layout["tile_n"]), str(unaugmented)],
+                       check=True, stdout=log)
         # Verify the pack against its selected design before making it visible.
         with Reader(unaugmented) as packed:
             if packed.config["max_seq_len"] != length or packed.config["hidden"] != field(
@@ -209,16 +220,63 @@ def pack(gguf_path, design, packer, output, expected_hash):
         result.rename(output)
 
 
+def cached_pack(gguf_path, design, packer, cache, expected_hash):
+    require_source(gguf_path, expected_hash)
+    here = Path(__file__).resolve().parent
+    identity = {
+        "gguf_sha256": expected_hash,
+        "design_sha256": sha256(design / "gemm_rtp" / "design.json"),
+        "packer_sha256": sha256(packer),
+        "scripts_sha256": {
+            rel: sha256(here / rel)
+            for rel in ("pack_gguf.py", "stage_gte_gguf.py", "convert_gte_gguf.py",
+                        "extend_npue.py", "../../npu_offload/gemm_rtp/npue.py")
+        },
+        "python_packages": {name: version(name) for name in ("gguf", "numpy", "safetensors")},
+    }
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+    destination = cache / key
+    output = destination / "model.npue"
+    if not destination.exists():
+        cache.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="packing-", dir=cache) as temporary:
+            entry = Path(temporary) / "entry"
+            entry.mkdir()
+            packed = entry / "model.npue"
+            pack(gguf_path, design, packer, packed, expected_hash, log=sys.stderr)
+            (entry / "receipt.json").write_text(
+                json.dumps({**identity, "npue_sha256": sha256(packed)}, sort_keys=True),
+                encoding="utf-8",
+            )
+            try:
+                entry.rename(destination)
+            except OSError:
+                # A concurrent cold run may already have published this key.
+                if not destination.is_dir():
+                    raise
+    receipt = json.loads((destination / "receipt.json").read_text(encoding="utf-8"))
+    if receipt != {**identity, "npue_sha256": sha256(output)}:
+        raise ValueError(f"cached NPUE integrity check failed: {destination}")
+    return output.resolve()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf", type=Path)
     parser.add_argument("design", type=Path)
-    parser.add_argument("output", type=Path)
+    parser.add_argument("output", type=Path, nargs="?")
+    parser.add_argument("--cache", type=Path, help="publish and reuse a checksummed NPUE cache entry")
     parser.add_argument("--packer", type=Path, required=True)
     parser.add_argument("--gguf-sha256", required=True)
     args = parser.parse_args()
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    pack(args.gguf, args.design, args.packer, args.output, args.gguf_sha256)
+    if (args.cache is None) == (args.output is None):
+        parser.error("provide either an output pathname or --cache")
+    if args.cache is not None:
+        output = cached_pack(args.gguf, args.design, args.packer, args.cache, args.gguf_sha256)
+        print(json.dumps({"pack_path": str(output), "gguf_sha256": args.gguf_sha256}))
+    else:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        pack(args.gguf, args.design, args.packer, args.output, args.gguf_sha256)
 
 
 if __name__ == "__main__":

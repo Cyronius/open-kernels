@@ -602,14 +602,34 @@ staged safetensors hashes. BGE records the corrected 512-position slice in its
 fusion metadata. Nomic keeps the GGUF's layer-norm epsilon metadata, which
 the current native runtime implements as 1e-12.
 
-The output is still an explicit input to `phlegm serve --embed-model`.
-Automatic packaging at install or startup and live cold-pack NPU parity
-remain open. A second cold run reproduced all six file hashes. The tool
+A second cold run reproduced all six file hashes. The tool
 refused a mismatched GGUF checksum, a 512-token MiniLM design and a gated
 layout for ungated BGE. Raw comparison `.plans/bert/direct-gguf-parity.log`
 has SHA-256 `b7ebe567465027be4ce6d691ad9aa8d436d70c184ede5258ccdb5d5b0e5a6da3`.
 Raw replay `.plans/bert/direct-gguf-replay.log` has SHA-256
 `d7893f5073b26f9e1e0aecce514ea169746be943a67f792438da5e00babe1ac8`.
+
+Phlegm `5c133b9` accepts the GGUF directly in `serve --embed-model` and
+`bench embed --embed-model` with `--embed-packer` and
+`--embed-gguf-sha256`. Use `--embed-pack-script` to point a development
+checkout at the packing script. The Python packaging environment needs
+`gguf`, `numpy` and `safetensors`. Packing runs before Phlegm acquires
+the device lock. The cache keys on source content, design, packer,
+packing scripts and dependency versions. It verifies the GGUF on every
+startup and checks the NPUE against its receipt before reuse.
+
+Two concurrent MiniLM cold starts published one cache entry. The warm
+lookup reused the same file. The cache rejected a modified NPUE and an
+incorrect GGUF checksum. A Phlegm startup test used the actual Q8_0
+MiniLM GGUF, then a native test worker opened the pack and returned a
+384-dimensional synthetic result. The benchmark reused the pack and
+reported the GGUF and NPUE hashes. Device parity and performance on the
+GGUF startup route remain open.
+
+Cache evidence `.plans/bert/cached-gguf-pack.log`, SHA-256
+`2dd1a76b18adc918abd7fa7261d1774367d57650e7766294743ad3709d6384ec`.
+Startup evidence `.plans/bert/phlegm-gguf-startup.log`, SHA-256
+`03f1ba139327fa1733aee1c0540f1c56ad08dcd66489c0bf1febb57aad2b0797`.
 
 ## Model features
 
