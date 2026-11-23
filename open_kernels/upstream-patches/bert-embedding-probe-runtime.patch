@@ -290,7 +290,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
          tok_total += nt;
        }
      }
-@@ -4692,15 +4789,36 @@
+@@ -4692,15 +4789,43 @@
    // allowed to be guessed.
    std::vector<float> embed(const std::vector<std::string> &texts,
                             const std::string &prompt_name = std::string(),
@@ -309,6 +309,13 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +                                     int64_t *tokens, const EmbedService::InspectRows &inspect = {}) {
 +    std::lock_guard<std::mutex> lk(call_mu_);
 +    return svc_.embed_token_ids(inputs, tokens, inspect);
++  }
++
++  bool fits_texts(const std::vector<std::string> &texts, const std::string &prompt_name) const {
++    const auto prefix = resolve_prompt(prompt_name);
++    return std::all_of(texts.begin(), texts.end(), [&](const std::string &text) {
++      return !svc_.tok.encode(prefix + text, static_cast<int>(g_seq)).truncated;
++    });
 +  }
 +
 +  const npue::File &packed_model() const { return model_; }

@@ -16,7 +16,7 @@ metadata and artifact hashes. HTTP remains separately measured with
 |---|---|
 | Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
 | Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
-| Context | MiniLM served its published 256-token limit and BGE served 512-token inputs. GTE matched the publisher at 8,192 tokens. Nomic passed local publisher parity at 8,192 tokens with dynamic RoPE. Deployment still needs request-length routing and validation of the long route through Phlegm. |
+| Context | MiniLM served its published 256-token limit and BGE served 512-token inputs. GTE matched the publisher at 8,192 tokens. Nomic passed local publisher parity at 8,192 tokens with dynamic RoPE. Phlegm's length routing needs hardware parity and measurement. |
 | NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. The local GTE and Nomic worker also dispatches attention and softmax to the NPU. Tokenization, embedding lookup, normalization, activation, and pooling remain on the host. Release serving integration and profiling are open. |
 | Speculative decode | Not applicable to an encoder. |
 | Published input weights | The registry currently pulls safetensors. The provisional Q8_0 selection has serving evidence through 256 for MiniLM and through 512 for BGE, GTE and Nomic. The new 8,192-token Nomic Q8_0 pack needs runtime parity. GTE still needs a direct GGUF reader and automatic full-length packing. |
@@ -38,6 +38,20 @@ fixtures and batches of one and four. It covers 64 tokens and the lengths in
 the table, plus 512 tokens for both long-context models. The live Inkling
 session still owns the shared NPU. Hardware results through this entry point
 remain open.
+
+Phlegm `718125f` added `--embed-short-design` and optional
+`--embed-short-attention` to both serving and benchmarking. Text routing
+uses the model tokenizer and task prefix to check capacity. Pretokenized
+inputs use their exact lengths. The entire batch takes the short route
+only when every input fits. Synthetic HTTP exercised the short boundary,
+a mixed-length batch, the 8,192-token ceiling, invalid requests and
+short-long-short recovery. A synthetic benchmark recorded both routes.
+
+The development implementation uses two resident workers because the NPUE
+encoder geometry is process-wide. It keeps one shared Phlegm device lock
+and dispatches one request at a time. Measure the added resident weights
+and context-switch cost before enabling the route by default. R-0003 and
+R-0008 in xdna2-notes document the cost of adding contexts for variants.
 
 The 512-token comparison also includes MiniLM as an exploratory run. Its encoder has 512 position
 embeddings and the publisher uses a 256-token truncation limit for serving. See the

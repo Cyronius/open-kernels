@@ -43,6 +43,9 @@ Json embed(npue::enc::Embedder& model, const Json& request,
     if (!inputs.is_array() || inputs.empty())
         throw std::invalid_argument("BERT embeddings require a nonempty array of inputs");
     const auto prompt = request.value("prompt_name", std::string{});
+    const bool length_only = request.value("length_only", false);
+    if (length_only && !text_input)
+        throw std::invalid_argument("length_only requires text inputs");
     const bool return_sparse = request.value("return_sparse", false);
     if (return_sparse && !sparse_head)
         throw std::invalid_argument("this embedding pack does not provide GTE sparse output");
@@ -88,7 +91,9 @@ Json embed(npue::enc::Embedder& model, const Json& request,
             throw std::invalid_argument("prompt_name is required. Choose from " + npue::enc::join_names(names));
         if (!prompt.empty() && std::find(names.begin(), names.end(), prompt) == names.end())
             throw std::invalid_argument("unsupported prompt_name '" + prompt + "'");
-        values = model.embed(inputs.get<std::vector<std::string>>(), prompt, &tokens, inspect);
+        const auto texts = inputs.get<std::vector<std::string>>();
+        if (length_only) return {{"ok", true}, {"fits", model.fits_texts(texts, prompt)}};
+        values = model.embed(texts, prompt, &tokens, inspect);
     } else {
         if (!prompt.empty())
             throw std::invalid_argument("include the task prefix in token_ids when tokenizing");
@@ -163,7 +168,8 @@ int main(int argc, char** argv) {
         }
         reply(protocol, {{"ok", true}, {"protocol", 1}, {"dimensions", model.hidden()},
                          {"context", model.seq()}, {"npu_attention", bool(attention)},
-                         {"prompt_names", model.prompt_names()}, {"sparse", bool(sparse)}});
+                         {"prompt_names", model.prompt_names()}, {"sparse", bool(sparse)},
+                         {"length_probe", true}});
         for (std::string line; std::getline(std::cin, line);) {
             try {
                 reply(protocol, embed(model, Json::parse(line), sparse));
