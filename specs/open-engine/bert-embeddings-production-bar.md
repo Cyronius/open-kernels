@@ -203,8 +203,10 @@ with the 8,192-token design padding both lengths to the same capacity. The exact
 
 The same hardware uses the pack's static theta. The publisher's dynamic RoPE uses the
 original theta at or below 2,048 tokens and scales it as the sequence grows. A
-diagnostic pack with only theta changed is queued for both lengths to isolate the
-effect. Production parity requires length-specific scaling.
+diagnostic pack changed only theta to 7453.483032, the value for an exact 8,192-token
+request. It reduced cosine at 2,048 tokens to 0.939621 and 0.940555, compared with
+0.997938 and 0.997862 on the original pack. The full-length control is still running.
+This rejects a single 8,192-token theta as a default across lengths.
 
 The existing bidirectional [FlashAttention design](../../open_kernels/designs/whisper_fa/README.md)
 compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder
@@ -240,8 +242,13 @@ tracked static build matched its pre-change instruction stream and connectivity.
 The compiled PDI bytes differ between builds. The tracked 512-capacity runtime
 image passed at key lengths 259, 381 and 512 with bit-identical repeats and a minimum
 sampled row cosine of 0.999449 over all three lengths. Warm dispatch times ranged from
-1.13 to 1.28 ms. Running 8,192 capacity with a dynamic length, alternating lengths
-in one resident context, and model-level quality and latency remain separate checks.
+1.13 to 1.28 ms. Running 8,192 capacity with a dynamic length and alternating lengths
+in one resident context remain separate checks. A 2,048-capacity build is queued to
+measure the intermediate route without padding attention to 8,192. The checker also
+accepts captured Q/K/V in float32, comparing the device output against float64
+attention over BF16-rounded inputs and reporting the extra error due to rounding the
+original tensors. The layer 0 and 11 GTE captures are queued at 512 and 8,192 tokens.
+Model-level quality and latency still need an integrated run.
 
 GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
 the publisher CPU vectors with a minimum cosine of 0.999475. The observed single

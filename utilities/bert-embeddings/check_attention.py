@@ -60,14 +60,41 @@ def patch_key_length(source, target, marker, length):
     target.write_bytes(stream)
 
 
+def synthetic_fixture(shape, valid_length):
+    generator = np.random.default_rng(42)
+    query, key, value = [generator.normal(0, 0.5, shape).astype(np.float32) for _ in range(3)]
+    # The first query must attend to the last valid key in every head.
+    query[:, 0] = 0
+    query[:, 0, 0] = 7
+    key[:, valid_length - 1, 0] = 16
+    value[:, valid_length - 1, 0] = 8
+    if valid_length < shape[1]:
+        # This key would dominate the first query if padding were visible.
+        key[:, valid_length, 0] = 24
+        value[:, valid_length, 0] = -8
+    return query, key, value
+
+
+def captured_fixture(path, shape, valid_length):
+    with np.load(path, allow_pickle=False) as data:
+        tensors = tuple(data[name] for name in ("query", "key", "value"))
+    if any(tensor.shape != (HEADS, valid_length, WIDTH) or tensor.dtype != np.float32
+           or not np.isfinite(tensor).all()
+           for tensor in tensors):
+        raise ValueError("Q/K/V captures must be finite float32 arrays shaped [heads, valid_length, width]")
+    padding = ((0, 0), (0, shape[1] - valid_length), (0, 0))
+    return tuple(np.pad(tensor, padding) for tensor in tensors)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--harness", required=True, type=Path)
     parser.add_argument("--build", required=True, type=Path)
     parser.add_argument("--work", required=True, type=Path)
-    parser.add_argument("--sequence", required=True, type=int, choices=(512, 8192))
+    parser.add_argument("--sequence", required=True, type=int, choices=(512, 2048, 8192))
     parser.add_argument("--valid-length", type=int, help="key length to test")
     parser.add_argument("--rtp-marker", type=int, help="compiled register value for a runtime-length build")
+    parser.add_argument("--fixture", type=Path, help="use captured float32 Q/K/V in an NPZ file")
     args = parser.parse_args()
     valid_length = args.sequence if args.valid_length is None else args.valid_length
     if not 2 <= valid_length <= args.sequence:
@@ -77,19 +104,10 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     sequence = args.sequence
     shape = (HEADS, sequence, WIDTH)
-    generator = np.random.default_rng(42)
-    query, key, value = [generator.normal(0, 0.5, shape).astype(np.float32) for _ in range(3)]
-    # The first query must attend to the last valid key in every head.
-    query[:, 0] = 0
-    query[:, 0, 0] = 7
-    key[:, valid_length - 1, 0] = 16
-    value[:, valid_length - 1, 0] = 8
-    if valid_length < sequence:
-        # This key would dominate the first query if padding were visible.
-        key[:, valid_length, 0] = 24
-        value[:, valid_length, 0] = -8
+    original = (captured_fixture(args.fixture, shape, valid_length) if args.fixture
+                else synthetic_fixture(shape, valid_length))
     tensors = []
-    for name, values in zip(("query", "key", "value"), (query, key, value), strict=True):
+    for name, values in zip(("query", "key", "value"), original, strict=True):
         bits = bf16_bits(values)
         bits.tofile(work / f"{name}.bin")
         tensors.append(from_bf16(bits))
@@ -122,15 +140,25 @@ def main():
     expected = reference(query, key[:, :valid_length], value[:, :valid_length], rows)
     actual = output[:, rows].astype(np.float64)
     finite = bool(np.isfinite(output).all())
-    tail_error = float(np.abs(actual[:, 0, 0] - expected[:, 0, 0]).max())
-    actual, expected = actual[:, 1:], expected[:, 1:]
+    if args.fixture:
+        original_query, original_key, original_value = original
+        full_precision = reference(original_query, original_key[:, :valid_length],
+                                   original_value[:, :valid_length], rows)
+        rounding_relative_l2 = np.linalg.norm(expected - full_precision) / np.linalg.norm(full_precision)
+        fixture_stats = f"bf16_input_relative_l2={rounding_relative_l2:.6g}"
+        fixture_pass = True
+    else:
+        tail_error = float(np.abs(actual[:, 0, 0] - expected[:, 0, 0]).max())
+        fixture_stats = f"last_key_error={tail_error:.6g} last_key_min_output={output[:, 0, 0].min():.6g}"
+        fixture_pass = tail_error < 0.1
+        actual, expected = actual[:, 1:], expected[:, 1:]
     relative_l2 = np.linalg.norm(actual - expected, axis=(1, 2)) / np.linalg.norm(expected, axis=(1, 2))
     cosine = (actual * expected).sum(axis=2) / (np.linalg.norm(actual, axis=2) * np.linalg.norm(expected, axis=2))
     print(f"sequence={sequence} valid_keys={valid_length} heads={HEADS} sampled_rows={len(rows)} "
           f"finite={finite} repeatable={repeatable} "
           f"worst_head_relative_l2={relative_l2.max():.6g} min_row_cosine={cosine.min():.8f} "
-          f"last_key_error={tail_error:.6g} last_key_min_output={output[:, 0, 0].min():.6g}")
-    passed = finite and repeatable and relative_l2.max() < 0.03 and cosine.min() > 0.995 and tail_error < 0.1
+          f"{fixture_stats}")
+    passed = finite and repeatable and relative_l2.max() < 0.03 and cosine.min() > 0.995 and fixture_pass
     return 0 if passed else 1
 
 
