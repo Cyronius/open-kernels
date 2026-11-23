@@ -152,6 +152,25 @@ GELU ran in the fused host packing path. Kernel dispatch and wait took 9.2–10.
 three runs and rose to 71.5 and 116.6 ms during the last two. Collect a quiet-machine repeat
 before using these figures as performance claims.
 
+The full batch-16 comparison demonstrates the cost of padding short requests to the
+512-token design. With the same 64-token inputs, the larger design took 4.1–9.6 times
+the HTTP wall time of the release design. At the longer input lengths the candidate
+was faster than the four-thread FP32 CPU reference. Times are warmed medians in milliseconds.
+
+| Model | 64 tokens, release | 64 tokens, 512 design | Long tokens per input | Long NPU HTTP | Long CPU |
+|---|---:|---:|---:|---:|---:|
+| MiniLM | 52.6 | 505.0 | 256 | 526.4 | 563.1 |
+| BGE small | 123.8 | 1,118.7 | 512 | 1,180.9 | 2,584.0 |
+| BGE base | 322.8 | 1,609.6 | 512 | 2,535.6 | 8,403.4 |
+| BGE large | 575.1 | 4,630.9 | 512 | 4,838.2 | 28,557.7 |
+| Nomic | 399.8 | 1,635.4 | 512 | 1,645.5 | 10,906.9 |
+| GTE | 388.0 | 2,031.0 | 512 | 1,988.0 | 11,185.8 |
+
+All requests used the publisher checkpoint packs. Dibs reported concurrent Inkling jobs
+during both measurements. The results establish a short-input regression worth addressing.
+The quiet-machine production rate gate remains open. Raw results are in
+`.plans/bert/bench512-quality-*.log` and `.plans/bert/measure-exact.log`.
+
 ## Published GGUF candidates
 
 Five pinned Q4_K_M downloads matched their Hub SHA-256. The loader's compatibility depends on the
