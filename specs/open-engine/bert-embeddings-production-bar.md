@@ -1,8 +1,10 @@
 # BERT embedding production audit
 
 This audit covers the six encoders in [OFLM #240](https://github.com/Atomic-Germ/OpenFlowLM-Next/issues/240).
-The inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`. The benchmark entry point is
-`oflm bench-embed TAG`, which reports encoder latency and throughput across batch sizes.
+The OFLM inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`.
+`oflm bench-embed TAG` reports encoder latency and throughput across batch sizes.
+The Phlegm development route uses `phlegm serve --embed-model PACK --embed-worker EXE
+--embed-design DIR [--embed-attention DIR]`.
 
 ## Production bar
 
@@ -10,10 +12,10 @@ The inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`. The be
 |---|---|
 | Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
 | Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
-| Context | Release designs process 64 tokens per sequence. Staged publisher packs served exact 512-token fixtures. Nomic served exact 8,192 tokens but missed publisher parity. Two exact GTE 8,192-token fixtures matched the publisher. The deployment still needs request-length routing and the correct error for over-limit input. |
-| NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. Tokenization, embedding lookup, attention/softmax, normalization, activation, and pooling are host stages. Stage costs over long inputs remain open. |
+| Context | MiniLM served its published 256-token limit and BGE served 512-token inputs. GTE matched the publisher at 8,192 tokens. Nomic passed local publisher parity at 8,192 tokens with dynamic RoPE. Deployment still needs request-length routing and validation of the long route through Phlegm. |
+| NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. The local GTE and Nomic worker also dispatches attention and softmax to the NPU. Tokenization, embedding lookup, normalization, activation, and pooling remain on the host. Release serving integration and profiling are open. |
 | Speculative decode | Not applicable to an encoder. |
-| Published input weights | The present registry pulls and packs publisher safetensors into the tiled NPUE format. Establish published GGUF coverage per checkpoint and compare quality before choosing the default quant. |
+| Published input weights | The registry currently pulls safetensors. The provisional Q8_0 selection has serving evidence through 256 for MiniLM and through 512 for BGE, GTE and Nomic. The new 8,192-token Nomic Q8_0 pack needs runtime parity. GTE still needs a direct GGUF reader and automatic full-length packing. |
 | Serving and features | Run `oflm-test --embedding` on each tag. Exercise Nomic task prefixes and GTE multilingual inputs. Check GTE sparse output support and the publishers' elastic dimensions separately from full-width dense vectors. |
 
 | Tag | Published input length to verify | Design family |
@@ -487,7 +489,7 @@ matched the original CPU checkpoints. The sample is two fixtures per length.
 | BGE large | 0.999696 | Pass |
 | Nomic | 0.997948 | The explicit document requests passed. The embedded suite still omitted the required task prompt. |
 
-Longer-context validation is open for the quantized route. Raw reports are
+These release-design runs cover 32 and 64 tokens. Raw reports are
 `.plans/bert/gguf-quality-*.log`, `.plans/bert/smoke-gguf-canonical.log` and
 `.plans/bert/nomic-gguf-document.log`. The compatible Q4 comparison uses MiniLM Q4_0 from
 Second State, BGE small Q4_0 from ChristianAzinn, BGE base and large Q4_K_M from CompendiumLabs,
@@ -523,6 +525,20 @@ The staged Nomic Q8_0 pack also served exact 512-token singles and batch 4 with
 still failed its generic requests without the required prompt. This run covers 512 tokens
 with the standard rotary settings. It leaves the 8,192-token dynamic RoPE gate open.
 
+Nomic's published GGUF declares 2,048 tokens as its default and documents an
+8,192-token extended context. The `--nomic-dynamic-rope` option in
+`extend_npue.py` exposes that capacity for packs with matching Nomic v1.5
+identity and rotary geometry. The ordinary packing ceiling stays 2,048.
+[Publisher GGUF card](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF)
+
+The published Q8_0 GGUF with SHA-256
+`3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7`
+produced an 8,192-position NPUE pack with SHA-256
+`121598c1e75bc06030dd572a5d2a585669abcfb305d289cde94163e5076047f9`.
+The 149 non-position tensors were byte-identical to the 512-token GGUF pack.
+The utility rejected 8,192 without the option and 8,193 with it.
+Runtime parity for the extended quantized pack remains open.
+
 ## Model features
 
 - GTE dense retrieval passed a short multilingual probe using an English query, related
@@ -531,8 +547,16 @@ with the standard rotary settings. It leaves the 8,192-token dynamic RoPE gate o
   relevant passage and the strongest distractor was 0.2652 on NPU and 0.2634 on CPU.
 - Nomic accepted `search_query`, `search_document`, `clustering` and `classification`.
   All four vectors differed for the same text and matched their task-specific CPU references
-  with a minimum cosine of 0.998892. The server returned 768 values for a request with
-  `dimensions: 256`. Resizable output remains open.
+  with a minimum cosine of 0.998892. Stock OFLM returned 768 values for a request
+  with `dimensions: 256`. The resident worker and Phlegm accept 64, 128, 256,
+  512 and 768. The reduced-width route centers the full vector before taking and
+  normalizing the prefix. [Publisher Matryoshka reference](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5#adjusting-dimensionality)
+- A native replay of the postprocessing code on saved NPU vectors matched the
+  publisher CPU reference at 2,048 and 8,192 tokens for all four reduced widths.
+  The minimum cosine was 0.997466 and all norms were within 1e-6 of 1.
+  End-to-end Phlegm validation remains open while the Inkling run holds the
+  shared NPU lock. Raw report `.plans/bert/nomic-matryoshka-native.log`, SHA-256
+  `e5c0433b2b8694a3605a80b5f0f3c2a0d38f43c7046805c83c7af6444c26d0bc`.
 
 Raw report `.plans/bert/features.log`, SHA-256
 `52028291087aa646355099bce62fd0a3053bfa0df835e1f21bd20ce60d224901`.

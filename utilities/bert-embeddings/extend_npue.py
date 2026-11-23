@@ -35,13 +35,23 @@ def check_gte_rope(source, container):
         raise ValueError("GGUF rotary frequencies disagree with the original GTE pack")
 
 
-def extend(packed, weights, output, length):
+def extend(packed, weights, output, length, *, nomic_dynamic_rope=False):
     if output.exists():
         raise FileExistsError(output)
     source = gguf.GGUFReader(weights)
     arch = source.fields["general.architecture"].contents()
     capacity = source.fields[f"{arch}.context_length"].contents()
     with Reader(packed) as container:
+        if nomic_dynamic_rope:
+            config = container.config
+            if (arch != "nomic-bert" or capacity != 2048
+                    or source.fields["general.name"].contents() != "nomic-embed-text-v1.5"
+                    or source.fields["nomic-bert.rope.freq_base"].contents() != 1000.0
+                    or config.get("source_repo") != "nomic-ai/nomic-embed-text-v1.5"
+                    or config.get("arch") != "nomic_bert_rope_swiglu"
+                    or config.get("head_dim") != 64 or config.get("rope_theta") != 1000.0):
+                raise ValueError("dynamic RoPE extension requires the Nomic v1.5 GGUF and NPUE pack")
+            capacity = 8192
         entry = container.entries[POSITION]
         old_length, width = entry["logical_shape"]
         if old_length != container.config["max_seq_len"] or entry["dtype"] != "F32":
@@ -81,12 +91,15 @@ def main():
     parser.add_argument("weights", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--length", type=int, required=True)
+    parser.add_argument("--nomic-dynamic-rope", action="store_true",
+                        help="allow Nomic v1.5's documented 8192-token dynamic RoPE context")
     parser.add_argument("--gguf-sha256", required=True)
     args = parser.parse_args()
     with args.weights.open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != args.gguf_sha256:
             raise ValueError("GGUF SHA-256 mismatch")
-    extend(args.packed, args.weights, args.output, args.length)
+    extend(args.packed, args.weights, args.output, args.length,
+           nomic_dynamic_rope=args.nomic_dynamic_rope)
 
 
 if __name__ == "__main__":

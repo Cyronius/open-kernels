@@ -47,18 +47,21 @@ def fixtures(tokenizer, lengths, prefix, mixed=False):
             yield length, text
 
 
-def request_embedding(url, model, prompt_name, text):
+def request_embedding(url, model, prompt_name, text, dimensions=None):
     body = {"model": model, "input": text}
     if prompt_name is not None:
         body["prompt_name"] = prompt_name
+    if dimensions is not None:
+        body["dimensions"] = dimensions
     request = Request(url + "/v1/embeddings", json.dumps(body).encode(),
                       {"Content-Type": "application/json"})
     with urlopen(request, timeout=300) as response:
         return json.load(response)
 
 
-def embed_server_batch(url, model, prompt_name, texts, length):
-    result = request_embedding(url, model, prompt_name, texts[0] if len(texts) == 1 else texts)
+def embed_server_batch(url, model, prompt_name, texts, length, dimensions=None):
+    result = request_embedding(url, model, prompt_name, texts[0] if len(texts) == 1 else texts,
+                               dimensions)
     if result.get("model") != model:
         raise ValueError(f"server returned model {result.get('model')!r}, expected {model!r}")
     count = result["usage"]["prompt_tokens"]
@@ -67,15 +70,21 @@ def embed_server_batch(url, model, prompt_name, texts, length):
         raise ValueError(f"server processed {count} tokens, expected {expected}")
     if [item["index"] for item in result["data"]] != list(range(len(texts))):
         raise ValueError("server returned missing or out-of-order embedding indices")
-    return [item["embedding"] for item in result["data"]]
+    vectors = [item["embedding"] for item in result["data"]]
+    if dimensions is not None and any(len(vector) != dimensions for vector in vectors):
+        raise ValueError(f"server did not honor dimensions={dimensions}")
+    return vectors
 
 
-def cpu_reference(directory, prefix, max_length):
+def cpu_reference(directory, prefix, max_length, dimensions=None):
     import torch
     from transformers import AutoConfig, AutoModel, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
     config = AutoConfig.from_pretrained(directory, local_files_only=True)
+    if dimensions is not None and (config.model_type != "nomic_bert" or
+                                   dimensions not in (64, 128, 256, 512, 768)):
+        raise ValueError("this CPU reference supports configurable dimensions for Nomic v1.5")
     options = {}
     if config.model_type == "nomic_bert" and max_length > 2048:
         options["rope_parameters"] = {"rope_theta": 1000.0, "rope_type": "dynamic", "factor": 2.0}
@@ -99,6 +108,8 @@ def cpu_reference(directory, prefix, max_length):
         pooled = hidden[:, 0] if use_cls else hidden.mean(dim=1)
         if config.model_type == "nomic_bert":
             pooled = torch.nn.functional.layer_norm(pooled, (pooled.shape[-1],))
+        if dimensions is not None:
+            pooled = pooled[:, :dimensions]
         return torch.nn.functional.normalize(pooled, dim=1).numpy()
 
     return embed
@@ -140,6 +151,7 @@ def main():
     parser.add_argument("--lengths", type=int, nargs="+", required=True)
     parser.add_argument("--url")
     parser.add_argument("--prompt-name")
+    parser.add_argument("--dimensions", type=int)
     parser.add_argument("--prefix", default="")
     parser.add_argument("--mixed", action="store_true",
                         help="fill long probes with varied passages and keep an exact token count")
@@ -168,11 +180,12 @@ def main():
     cases = list(fixtures(tokenizer, args.lengths, args.prefix, args.mixed))
     cpu = None
     if args.cpu_reference or args.cpu_checkpoint:
-        cpu = cpu_reference(args.cpu_checkpoint or args.checkpoint, args.prefix, max(args.lengths))
+        cpu = cpu_reference(args.cpu_checkpoint or args.checkpoint, args.prefix,
+                            max(args.lengths), args.dimensions)
     url = args.url.rstrip("/") if args.url else None
 
     def server(texts, length):
-        return embed_server_batch(url, args.model, args.prompt_name, texts, length)
+        return embed_server_batch(url, args.model, args.prompt_name, texts, length, args.dimensions)
 
     similarities = []
     for length, text in cases:
@@ -196,7 +209,7 @@ def main():
     if args.max_input is not None:
         length, text = next(fixtures(tokenizer, [args.max_input + 1], args.prefix, args.mixed))
         try:
-            request_embedding(url, args.model, args.prompt_name, text)
+            request_embedding(url, args.model, args.prompt_name, text, args.dimensions)
         except HTTPError as exc:
             error = json.load(exc)["error"]
             print(json.dumps({"model": args.model, "tokens": length,
