@@ -1,0 +1,96 @@
+"""Check a 12-head bidirectional FlashAttention build with the Windows harness."""
+
+import argparse
+from pathlib import Path
+import subprocess
+
+import numpy as np
+
+
+HEADS = 12
+WIDTH = 64
+
+
+def bf16_bits(values):
+    bits = values.view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+    return (rounded >> 16).astype("<u2")
+
+
+def from_bf16(bits):
+    return (bits.astype(np.uint32) << 16).view(np.float32)
+
+
+def reference(query, key, value, rows):
+    scores = query[:, rows].astype(np.float64) @ key.astype(np.float64).swapaxes(1, 2)
+    scores /= np.sqrt(WIDTH)
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    weights /= weights.sum(axis=-1, keepdims=True)
+    return weights @ value.astype(np.float64)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--harness", required=True, type=Path)
+    parser.add_argument("--build", required=True, type=Path)
+    parser.add_argument("--work", required=True, type=Path)
+    parser.add_argument("--sequence", required=True, type=int, choices=(512, 8192))
+    parser.add_argument("--valid-length", type=int, help="key length compiled into the design")
+    args = parser.parse_args()
+    valid_length = args.sequence if args.valid_length is None else args.valid_length
+    if not 2 <= valid_length <= args.sequence:
+        parser.error("--valid-length must be at least two and within the sequence")
+
+    work = args.work.resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    sequence = args.sequence
+    shape = (HEADS, sequence, WIDTH)
+    generator = np.random.default_rng(42)
+    query, key, value = [generator.normal(0, 0.5, shape).astype(np.float32) for _ in range(3)]
+    # The first query must attend to the last valid key in every head.
+    query[:, 0] = 0
+    query[:, 0, 0] = 7
+    key[:, valid_length - 1, 0] = 16
+    value[:, valid_length - 1, 0] = 8
+    if valid_length < sequence:
+        # This key would dominate the first query if padding were visible.
+        key[:, valid_length, 0] = 24
+        value[:, valid_length, 0] = -8
+    tensors = []
+    for name, values in zip(("query", "key", "value"), (query, key, value), strict=True):
+        bits = bf16_bits(values)
+        bits.tofile(work / f"{name}.bin")
+        tensors.append(from_bf16(bits))
+
+    size_bytes = int(np.prod(shape)) * 2
+    build = args.build.resolve()
+    config = work / "attention.cfg"
+    config.write_text(
+        f"device\nxclbin G {build / 'final.xclbin'}\nkernelx k G {build / 'insts.bin'}\n"
+        f"buf q {size_bytes} query.bin\nbuf kb {size_bytes} key.bin\nbuf v {size_bytes} value.bin\n"
+        f"buf o {size_bytes}\nrun k q kb v o\nrun k q kb v o\ndump o output.bin {size_bytes}\n",
+        encoding="ascii",
+    )
+    subprocess.run([str(args.harness.resolve()), config.name], cwd=work, check=True, timeout=400)
+    output = from_bf16(np.fromfile(work / "output.bin", dtype="<u2")).reshape(shape)
+
+    # Sample both sides of each query-tile boundary and the last query.
+    tile_boundary_rows = {row for edge in range(256, valid_length, 256) for row in (edge - 1, edge)}
+    rows = sorted(tile_boundary_rows | {row for row in (0, 1, 63, 64, valid_length - 1) if row < valid_length})
+    query, key, value = tensors
+    expected = reference(query, key[:, :valid_length], value[:, :valid_length], rows)
+    actual = output[:, rows].astype(np.float64)
+    finite = bool(np.isfinite(output).all())
+    tail_error = float(np.abs(actual[:, 0, 0] - expected[:, 0, 0]).max())
+    actual, expected = actual[:, 1:], expected[:, 1:]
+    relative_l2 = np.linalg.norm(actual - expected, axis=(1, 2)) / np.linalg.norm(expected, axis=(1, 2))
+    cosine = (actual * expected).sum(axis=2) / (np.linalg.norm(actual, axis=2) * np.linalg.norm(expected, axis=2))
+    print(f"sequence={sequence} valid_keys={valid_length} heads={HEADS} sampled_rows={len(rows)} finite={finite} "
+          f"worst_head_relative_l2={relative_l2.max():.6g} min_row_cosine={cosine.min():.8f} "
+          f"last_key_error={tail_error:.6g} last_key_min_output={output[:, 0, 0].min():.6g}")
+    passed = finite and relative_l2.max() < 0.03 and cosine.min() > 0.995 and tail_error < 0.1
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

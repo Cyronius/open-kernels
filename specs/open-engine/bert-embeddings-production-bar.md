@@ -10,7 +10,7 @@ The inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`. The be
 |---|---|
 | Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
 | Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
-| Context | The release designs process 64 tokens per sequence. The 512-token build is a candidate. Check real token counts and the over-limit response before comparing vectors or timing any longer request. |
+| Context | Release designs process 64 tokens per sequence. Staged publisher packs served exact 512-token fixtures. Nomic served exact 8,192 tokens but missed publisher parity. GTE parity and kernel selection by request length remain open. |
 | NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. Tokenization, embedding lookup, attention/softmax, normalization, activation, and pooling are host stages. Stage costs over long inputs remain open. |
 | Speculative decode | Not applicable to an encoder. |
 | Published input weights | The present registry pulls and packs publisher safetensors into the tiled NPUE format. Establish published GGUF coverage per checkpoint and compare quality before choosing the default quant. |
@@ -151,7 +151,10 @@ The [sequence derivation tool](../../npu_offload/gemm_rtp/derive_sequence.py) al
 an 8,192-token design directly from the 512-token design's batch-16 streams. Its xclbin and
 bootstrap instructions are byte-identical to the source 512-token design. Its four per-operation
 instruction files are byte-identical to the independently built 8,192-token instructions.
-The derived artifact passed the checker. A separate hardware comparison is queued.
+The derived artifact passed the checker. A separate hardware comparison is queued. A
+2,048-token view derived from the same 512-token image also passed the checker. It uses
+the 2,048- and 8,192-row streams for batches 1 and 4. The same Nomic fixture is queued
+for profiling at 2,048 tokens with both 2,048- and 8,192-row padding.
 
 The 64- and 512-token artifacts have eight shared streams for each family. All 40 corresponding
 instruction pairs were byte-identical. The gated family's AIE partition payload, connectivity,
@@ -183,6 +186,31 @@ All requests used the publisher checkpoint packs. Dibs reported concurrent Inkli
 during both measurements. The results establish a short-input regression worth addressing.
 The quiet-machine production rate gate remains open. Raw results are in
 `.plans/bert/bench512-quality-*.log` and `.plans/bert/measure-exact.log`.
+
+## Long-context Nomic and bidirectional attention
+
+The 8,192-token design served exact Nomic inputs through `oflm serve` with the staged
+publisher weights. Both 2,048-token fixtures scored at least 0.997861 against the
+publisher's CPU model. The two exact 8,192-token fixtures scored 0.456015 and 0.455719.
+The observed HTTP timings were 47.9?74.9 s at 2,048 tokens and 74.4?94.7 s at 8,192,
+with the 8,192-token design padding both lengths to the same capacity. The exact
+8,193-token request returned HTTP 500. Raw results are in
+`.plans/bert/seq8192-quality-nomic-embed-text_v1.5.log`, SHA-256
+`5848771e0d0b2432d201df3dc3d744133dcbe8156e3a90a942b4051bd06f3613`.
+
+The same hardware uses the pack's static theta. The publisher's dynamic RoPE uses the
+original theta at or below 2,048 tokens and scales it as the sequence grows. A
+diagnostic pack with only theta changed is queued for both lengths to isolate the
+effect. Production parity requires length-specific scaling.
+
+The existing bidirectional [FlashAttention design](../../open_kernels/designs/whisper_fa/README.md)
+compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder
+geometry. The new [hardware check](../../utilities/bert-embeddings/check_attention.py)
+compares BF16 I/O with a float64 CPU oracle at query-tile boundaries and verifies that
+the first query attends to the last valid key. A third build was started at capacity
+8,192 with 2,051 valid keys to test both a partly masked key tile and fully masked
+cascade stages. NPU execution, runtime masking for ordinary shorter or mixed-length
+inputs, and integrated encoder measurements remain open.
 
 ## Published GGUF candidates
 
