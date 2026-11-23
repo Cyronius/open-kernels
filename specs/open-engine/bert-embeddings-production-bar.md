@@ -734,6 +734,16 @@ parity check and baseline–candidate–baseline benchmark remain queued.
 CPU loop log `.plans/bert/npue-query-pruning-cpu.log`, SHA-256
 `3a00effd5db636c8c2f9b959ec85e6a9c125fb0ed4c2ebdab4e2699b0f63bac5`.
 
+### Intermediate context for Nomic and GTE
+
+The current 64/8,192 route sends a 512-token input to the 8,192-token
+projection design. The queued comparison keeps the same full route and
+tests a 512-token secondary design with host or NPU attention. All four
+trials per model use identical Q8_0 packs and 64- and 512-token fixtures
+at batches one and four. Runs with the existing 64-token secondary
+design bracket the two alternatives. Preflight verified that all three
+capacities use the same weight layout. Device timings are pending.
+
 ## Cold packing from GGUF
 
 Build the CPU-only packer from an x64 MSVC developer shell with
