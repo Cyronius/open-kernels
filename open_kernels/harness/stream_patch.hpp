@@ -85,6 +85,40 @@ inline size_t op_len(uint32_t w) {
     }
 }
 
+/// For the eight-column BERT attention design, locate one WRITE32 key-length
+/// register per compute tile. The compiled marker identifies the value word.
+inline std::vector<size_t> bert_length_table(const std::vector<uint32_t>& words, uint32_t marker) {
+    if (words.size() < 4 || words[3] != words.size() * sizeof(uint32_t))
+        throw std::runtime_error("bertlength: invalid transaction size");
+
+    std::vector<size_t> patches(32);
+    size_t offset = 4;
+    for (uint32_t operation = 0; operation < words[2]; ++operation) {
+        if (offset >= words.size())
+            throw std::runtime_error("bertlength: truncated transaction");
+        const auto opcode = words[offset];
+        const auto count = op_len(opcode);
+        if (count == 1 || count > words.size() - offset)
+            throw std::runtime_error("bertlength: unsupported or truncated operation");
+        if (opcode == 0 && words[offset + 4] == marker) {
+            const auto address = words[offset + 2];
+            const auto col = address >> 25;
+            const auto row = (address >> 20) & 31;
+            if (col >= 8 || row < 2 || row > 5 || words[offset + 3] != 0 ||
+                    words[offset + 5] != count * sizeof(uint32_t))
+                throw std::runtime_error("bertlength: invalid compute-tile register write");
+            auto& patch = patches[4 * col + row - 2];
+            if (patch)
+                throw std::runtime_error("bertlength: duplicate compute-tile register write");
+            patch = offset + 4;
+        }
+        offset += count;
+    }
+    if (offset != words.size() || std::find(patches.begin(), patches.end(), 0) != patches.end())
+        throw std::runtime_error("bertlength: expected one register write per compute tile");
+    return patches;
+}
+
 /// One patchable weight fill: the word to rewrite, which routed slot it stands
 /// for (bit 8 set = the down slice rather than a gate/up stripe) plus, for
 /// `moeroute`, the fill's kind and position inside its stripe.

@@ -205,8 +205,13 @@ The same hardware uses the pack's static theta. The publisher's dynamic RoPE use
 original theta at or below 2,048 tokens and scales it as the sequence grows. A
 diagnostic pack changed only theta to 7453.483032, the value for an exact 8,192-token
 request. It reduced cosine at 2,048 tokens to 0.939621 and 0.940555, compared with
-0.997938 and 0.997862 on the original pack. The full-length control is still running.
-This rejects a single 8,192-token theta as a default across lengths.
+0.997938 and 0.997862 on the original pack. On the first full-length fixture it
+restored cosine from 0.456015 to 0.997399, with all 150 packed tensor payloads
+unchanged. The second full-length control is still running. The rotary base must be
+selected by each input's true length, across both request order and batches. For
+length L above 2048, the publisher's dynamic NTK base in this model is
+1000 ? (2L/2048 ? 1)^(64/62). At or below 2048 it is 1000.
+Raw report `.plans/bert/rope-fixed-seq8192-quality-nomic-embed-text_v1.5.log`.
 
 The existing bidirectional [FlashAttention design](../../open_kernels/designs/whisper_fa/README.md)
 compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder
@@ -243,7 +248,9 @@ The compiled PDI bytes differ between builds. The tracked 512-capacity runtime
 image passed at key lengths 259, 381 and 512 with bit-identical repeats and a minimum
 sampled row cosine of 0.999449 over all three lengths. Warm dispatch times ranged from
 1.13 to 1.28 ms. Running 8,192 capacity with a dynamic length and alternating lengths
-in one resident context remain separate checks. A 2,048-capacity build is queued to
+in one resident context remain separate checks. The harness now patches and
+syncs the same instruction buffer for each requested length after validating and
+caching all 32 tile register offsets from the original transaction. A 2,048-capacity build is queued to
 measure the intermediate route without padding attention to 8,192. The checker also
 accepts captured Q/K/V in float32, comparing the device output against float64
 attention over BF16-rounded inputs and reporting the extra error due to rounding the

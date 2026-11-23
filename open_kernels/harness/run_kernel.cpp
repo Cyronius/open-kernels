@@ -44,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -107,6 +108,8 @@ struct Kernel {
     std::vector<MoePatch> moe, moe2;
     std::vector<AttnPatch> attn;
     std::vector<stream_patch::AttnRowPatch> attn_rows;
+    std::vector<size_t> bert_length;
+    uint32_t bert_marker = 0;
     bool moe_built = false, moe2_built = false, attn_built = false, attn_rows_built = false;
 
     uint32_t* instr_words() { return instr->map<uint32_t*>(); }
@@ -377,6 +380,29 @@ struct Host {
             k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             std::printf("attnpos %s pos %zu (%.3f ms)\n", kn.c_str(), pos, ms);
+        } else if (cmd == "bertlength") {
+            auto kn = need(it, "bertlength kernel");
+            const auto marker = num(need(it, "bertlength marker"), "bertlength marker");
+            const auto capacity = num(need(it, "bertlength capacity"), "bertlength capacity");
+            const auto length = num(need(it, "bertlength valid keys"), "bertlength valid keys");
+            if (!marker || marker > capacity || !length || length > capacity ||
+                    capacity > std::numeric_limits<uint32_t>::max())
+                throw std::runtime_error("bertlength: marker and valid length must fit the capacity");
+            auto& k = kernel(kn);
+            if (!k.classic)
+                throw std::runtime_error("bertlength requires a kernelx instruction stream");
+            auto t0 = std::chrono::steady_clock::now();
+            if (k.bert_length.empty()) {
+                k.bert_length = stream_patch::bert_length_table(k.words, static_cast<uint32_t>(marker));
+                k.bert_marker = static_cast<uint32_t>(marker);
+            } else if (k.bert_marker != marker) {
+                throw std::runtime_error("bertlength: compiled marker changed for the same kernel");
+            }
+            auto* words = k.instr_words();
+            for (const auto word : k.bert_length) words[word] = static_cast<uint32_t>(length);
+            k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("bertlength %s valid keys %zu (%.3f ms)\n", kn.c_str(), length, ms);
         } else if (cmd == "attnrows") {
             // attnrows <kernel> <pos0> <rows>: a dxl stream built for positions 1 .. rows, moved to pos0 .. pos0 + rows - 1.
             auto kn = need(it, "attnrows kernel");
