@@ -10,7 +10,7 @@ The inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`. The be
 |---|---|
 | Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
 | Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
-| Context | Release designs process 64 tokens per sequence. Staged publisher packs served exact 512-token fixtures. Nomic served exact 8,192 tokens but missed publisher parity. GTE parity and kernel selection by request length remain open. |
+| Context | Release designs process 64 tokens per sequence. Staged publisher packs served exact 512-token fixtures. Nomic served exact 8,192 tokens but missed publisher parity. GTE's first exact 8,192-token fixture matched the publisher. Repeated maximum-length checks and kernel selection by request length remain open. |
 | NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. Tokenization, embedding lookup, attention/softmax, normalization, activation, and pooling are host stages. Stage costs over long inputs remain open. |
 | Speculative decode | Not applicable to an encoder. |
 | Published input weights | The present registry pulls and packs publisher safetensors into the tiled NPUE format. Establish published GGUF coverage per checkpoint and compare quality before choosing the default quant. |
@@ -220,11 +220,12 @@ The transaction verifier found 32 distinct length writes and changed the mask fr
 `25d9aaf2737ff0c4346c6042c2853f88d052563382a6ed6e74efe4e77b7eb246`).
 This verifies how the length is conveyed in the stream. The NPU parity check must
 still establish that the new value reaches each worker on repeated dispatches.
-An 8,192-capacity runtime-parameter build is in progress.
+The 8,192-capacity prototype also compiled. The same verifier patched 32 writes to set 2,051 valid keys without changing its xclbin.
 
 GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
 the publisher CPU vectors with a minimum cosine of 0.999475. The observed single
-request timings were 83.2?86.0 s. The raw report is
+request timings were 83.2?86.0 s. The first exact 8,192-token request scored 0.999570,
+taking 93.6 s through HTTP compared with 26.1 s for the reference. The raw report is
 `.plans/bert/seq8192-quality-gte-multilingual_base.log`.
 
 ## Published GGUF candidates
@@ -250,8 +251,12 @@ in the GGUF vocabulary, and the exact publisher tokenizer is retained. The
 prototype emitted 138 tensors into a 348,620,160-byte Q8_0 GGUF and verified their
 names, source shapes and finite dequantized values on readback. SHA-256 is
 `c12175db0b1b7f2dc6daacc2e72dc0203b89921433e8d4f6cc5273c76bedc574`. The readback tensors were replayed through the
-existing GTE packer to stage an NPU quality check. A direct GGUF reader and
-validation through the standard installation path are still required.
+existing GTE packer to stage an NPU quality check. On CPU, embeddings made from the
+dequantized tensors matched the original publisher weights at 64, 512 and 8,192 tokens
+with cosines 0.999816, 0.999789 and 0.999789. These are single dense CLS fixtures.
+Raw report `.plans/bert/gte-gguf-cpu.log`, SHA-256
+`3eca5adcc2ff1c9e2480ec10d906316a4e74f55f7b60d9e4a561a4901728bcdd`. A direct GGUF reader and validation through
+the standard installation path are still required.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
