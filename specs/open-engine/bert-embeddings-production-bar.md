@@ -151,8 +151,11 @@ The [sequence derivation tool](../../npu_offload/gemm_rtp/derive_sequence.py) al
 an 8,192-token design directly from the 512-token design's batch-16 streams. Its xclbin and
 bootstrap instructions are byte-identical to the source 512-token design. Its four per-operation
 instruction files are byte-identical to the independently built 8,192-token instructions.
-The derived artifact passed the checker. A separate hardware comparison is queued. A
-2,048-token view derived from the same 512-token image also passed the checker. It uses
+The derived artifact passed the checker. The derived and independently compiled images
+also returned the same bytes for one exact 8,192-token GTE request through OFLM.
+The vector SHA-256 was
+`9e0f8680a72aed87d413871cc9ba2f3e793979ebe10f7504402fabd0a0a8064e`.
+A 2,048-token view derived from the same 512-token image also passed the checker. It uses
 the 2,048- and 8,192-row streams for batches 1 and 4. The same Nomic fixture is queued
 for profiling at 2,048 tokens with both 2,048- and 8,192-row padding.
 
@@ -207,10 +210,19 @@ The existing bidirectional [FlashAttention design](../../open_kernels/designs/wh
 compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder
 geometry. The new [hardware check](../../utilities/bert-embeddings/check_attention.py)
 compares BF16 I/O with a float64 CPU oracle at query-tile boundaries and verifies that
-the first query attends to the last valid key. A third build was started at capacity
-8,192 with 2,051 valid keys to test both a partly masked key tile and fully masked
-cascade stages. NPU execution, runtime masking for ordinary shorter or mixed-length
-inputs, and integrated encoder measurements remain open.
+the first query attends to the last valid key. The Strix Point NPU passed the
+static 512- and 8,192-token checks, including the 8,192-capacity build with 2,051 valid
+keys. Outputs were finite and bit-identical across two dispatches per case.
+
+| Attention capacity | Valid keys | Minimum sampled row cosine | First / second dispatch (ms) |
+|---:|---:|---:|---:|
+| 512 | 512 | 0.999495 | 3.81 / 1.11 |
+| 8192 | 8192 | 0.999584 | 88.51 / 70.35 |
+| 8192 | 2051 | 0.999336 | 87.12 / 72.96 |
+
+The harness measured submit and wait for a single layer with synthetic BF16 inputs.
+Raw report `.plans/bert/attention-run.log`, SHA-256
+`83ab92d7335e42e8698c51e62880f30965777d5e30048e5c7b4eec0b2b0b1dbf`.
 
 The 2,051-valid-key build completed. An isolated runtime-parameter prototype also
 compiled at 512-token capacity. It writes a length register and releases a barrier on
@@ -225,8 +237,11 @@ writes to set 2,051 valid keys without changing its xclbin. The optional
 `FA_RUNTIME_VALID_LEN` path is now in the shared design. At 512 capacity the tracked
 runtime build matched the prototype's instruction stream and XRT connectivity. The
 tracked static build matched its pre-change instruction stream and connectivity.
-The compiled PDI bytes differ between builds. Both runtime lengths require fresh
-hardware checks with the tracked build.
+The compiled PDI bytes differ between builds. The tracked 512-capacity runtime
+image passed at key lengths 259, 381 and 512 with bit-identical repeats and a minimum
+sampled row cosine of 0.999449 over all three lengths. Warm dispatch times ranged from
+1.13 to 1.28 ms. Running 8,192 capacity with a dynamic length, alternating lengths
+in one resident context, and model-level quality and latency remain separate checks.
 
 GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
 the publisher CPU vectors with a minimum cosine of 0.999475. The observed single
@@ -263,8 +278,15 @@ existing GTE packer to stage an NPU quality check. On CPU, embeddings made from 
 dequantized tensors matched the original publisher weights at 64, 512 and 8,192 tokens
 with cosines 0.999816, 0.999789 and 0.999789. These are single dense CLS fixtures.
 Raw report `.plans/bert/gte-gguf-cpu.log`, SHA-256
-`3eca5adcc2ff1c9e2480ec10d906316a4e74f55f7b60d9e4a561a4901728bcdd`. A direct GGUF reader and validation through
-the standard installation path are still required.
+`3eca5adcc2ff1c9e2480ec10d906316a4e74f55f7b60d9e4a561a4901728bcdd`. The reproducible
+[converter](../../utilities/bert-embeddings/convert_gte_gguf.py) accepted the current
+publisher directory and emitted a byte-identical GGUF. It takes the checkpoint directory
+and a new output path and requires the Python `gguf`, `numpy` and `safetensors` packages.
+
+The replayed NPUE pack served 64- and 512-token single and batch-4 requests with a
+minimum cosine of 0.999379 against the original publisher CPU model. It passed
+`oflm-test --embedding`. A direct GGUF reader and validation through the standard
+installation path are still required.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
