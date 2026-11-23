@@ -68,6 +68,14 @@ for each fixture. The pending short-input comparison uses the same two
 64-token cases (batch sizes one and four) with and without length routing
 for each model, followed by the full context sweep.
 
+The queued Windows run also serves each Q8_0 GGUF with the benchmark's
+worker, cache, projection and routing options. It compares single requests
+at each tested length and a four-input 64-token batch with the publisher's
+FP32 reference. The gate requires exact token counts, ordered unit vectors,
+cosine similarity of at least 0.995, and HTTP 400 at the model limit plus one.
+MiniLM publisher vectors replayed through a synthetic worker passed this
+check through Phlegm HTTP. All six hardware comparisons remain open.
+
 The 512-token comparison also includes MiniLM as an exploratory run. Its encoder has 512 position
 embeddings and the publisher uses a 256-token truncation limit for serving. See the
 [MiniLM model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2),
