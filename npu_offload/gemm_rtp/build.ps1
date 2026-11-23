@@ -86,8 +86,6 @@ foreach ($f in $families) {
         continue
     }
     Write-Host ("  {0,-24} {1}" -f $f.name, ($f.serves -join ', '))
-    if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-
     $t0 = Get-Date
     Push-Location $here
     # 2>&1 | Out-String rather than a redirection: PowerShell 5.1 wraps a
@@ -128,7 +126,9 @@ if ($failed.Count) {
 Write-Host ""
 Write-Host "Checking the built sets against $Spec"
 Push-Location $here
-& python check_design_sets.py --xclbins $Dst --spec $Spec
+$checkArgs = @('--xclbins', $Dst, '--spec', $Spec)
+if ($Only) { $checkArgs += @('--only', $families[0].name) }
+& python check_design_sets.py @checkArgs
 $rc = $LASTEXITCODE
 Pop-Location
 exit $rc

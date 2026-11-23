@@ -36,6 +36,9 @@ and [GTE model card](https://huggingface.co/Alibaba-NLP/gte-multilingual-base).
 - All five design families from [OFLM pre-v.0.1.0](https://github.com/Atomic-Germ/OpenFlowLM-Next/releases/tag/pre-v.0.1.0)
   passed `check_design_sets.py`. Linux tarball SHA-256
   `58997fb7115bf40903e3edda8184d4ced749a4c622d3c2e53f09f5c0ebf50a13`.
+  The release, 512-token and 8,192-token artifacts also passed the instruction-file and slot
+  checks. The checker requires every declared stream file, a nonempty xclbin and bootstrap
+  instruction image, and the exporter slot assignment for each operation and batch tier.
 - The extended comparison uses `--seq 512 --batch 16 --batches 1,4,16`, keeping the largest
   stream at the release design's 8,192 rows. The original batch-multiple-of-four guard rejected
   the one-sequence tier. Its matrix has 512 rows, which meets the exporter's actual 256-row

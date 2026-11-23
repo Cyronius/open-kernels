@@ -95,14 +95,18 @@ def main() -> int:
     ap.add_argument("--xclbins", default=str(HERE.parent.parent / "src" / "xclbins"),
                     help="directory holding the built design families")
     ap.add_argument("--spec", default=str(HERE / "families.json"))
+    ap.add_argument("--only", help="check just this family from the spec")
     args = ap.parse_args()
 
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
     common = spec["common"]
     root = Path(args.xclbins)
+    families = [fam for fam in spec["families"] if args.only is None or fam["name"] == args.only]
+    if not families:
+        ap.error(f"no design families selected from {args.spec}")
 
     bad = 0
-    for fam in spec["families"]:
+    for fam in families:
         name = fam["name"]
         dj = root / name / "gemm_rtp" / "design.json"
         if not dj.is_file():
@@ -117,21 +121,35 @@ def main() -> int:
         streams = design.get("streams", [])
         wanted_streams = Counter((op, batch) for batch in want["tiers"] for op in STREAM_OPS)
         found_streams = Counter((stream.get("op"), stream.get("batch")) for stream in streams)
+        filenames = ["final.xclbin", "insts.bin"]
+        filenames += [f"insts_{op}_b{batch}.bin" for op, batch in wanted_streams]
+        missing_files = [filename for filename in filenames
+                         if not (dj.parent / filename).is_file() or not (dj.parent / filename).stat().st_size]
         wrong_rows = [
             stream for stream in streams
             if stream.get("batch") not in want["tiers"]
             or stream.get("M") != stream["batch"] * want["seq"]
         ]
-        if diff or wrong_rows or found_streams != wanted_streams:
+        slots = {key: slot for slot, key in enumerate(wanted_streams, start=1)}
+        wrong_bindings = []
+        for stream in streams:
+            op, batch = stream.get("op"), stream.get("batch")
+            if stream.get("slot") != slots.get((op, batch)) or stream.get("file") != f"insts_{op}_b{batch}.bin":
+                wrong_bindings.append((op, batch))
+        if diff or wrong_rows or missing_files or wrong_bindings or found_streams != wanted_streams:
             bad += 1
             print(f"MISMATCH {name}:")
             for k, (w, g) in sorted(diff.items()):
                 print(f"           {k}: families.json says {w!r}, "
                       f"design.json says {g!r}")
-            for name, streams_diff in (("missing", wanted_streams - found_streams),
-                                       ("unexpected", found_streams - wanted_streams)):
+            for label, streams_diff in (("missing", wanted_streams - found_streams),
+                                        ("unexpected", found_streams - wanted_streams)):
                 for (op, batch), count in streams_diff.items():
-                    print(f"           {name}: {count} {op} stream(s) for tier {batch}")
+                    print(f"           {label}: {count} {op} stream(s) for tier {batch}")
+            for filename in missing_files:
+                print(f"           missing or empty: {filename}")
+            for op, batch in wrong_bindings:
+                print(f"           {op} tier {batch}: incorrect instruction file or slot")
             for stream in wrong_rows:
                 batch = stream.get("batch")
                 print(f"           {stream.get('op')} tier {batch}: "

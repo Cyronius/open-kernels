@@ -15,12 +15,11 @@ spec.loader.exec_module(checker)
 
 
 @pytest.mark.parametrize(
-    ("seq", "rows", "omit_last", "expected_exit"),
-    [(512, 1024, False, 0), (64, 1024, False, 1),
-     (512, 128, False, 1), (512, 1024, True, 1)],
+    ("defect", "expected_exit"),
+    [(None, 0), ("seq", 1), ("rows", 1), ("stream", 1), ("file", 1), ("binding", 1)],
 )
 def test_design_sequence_matches_export_flags_and_stream_rows(
-    tmp_path, monkeypatch, seq, rows, omit_last, expected_exit
+    tmp_path, monkeypatch, defect, expected_exit
 ):
     root = tmp_path / "xclbins"
     design_dir = root / "bert" / "gemm_rtp"
@@ -29,16 +28,29 @@ def test_design_sequence_matches_export_flags_and_stream_rows(
     flags = ["--seq", "512", "--batches", "2", "--tg-depth", "2"]
     family_spec.write_text(json.dumps({
         "common": flags,
-        "families": [{"name": "bert", "args": []}],
+        "families": [{"name": "bert", "args": []}, {"name": "unbuilt", "args": []}],
     }), encoding="utf-8")
     design = checker.expected(flags)
     operations = ("qkv", "attn_out", "ffn_up", "ffn_down")
-    if omit_last:
+    if defect == "stream":
         operations = operations[:-1]
-    design.update(seq=seq, tile={"n": design.pop("tile_n")},
-                  streams=[{"op": op, "batch": 2, "M": rows} for op in operations])
+    names = [f"insts_{op}_b2.bin" for op in operations]
+    streams = [
+        {"op": op, "batch": 2, "M": 128 if defect == "rows" else 1024,
+         "slot": slot, "file": name}
+        for slot, (op, name) in enumerate(zip(operations, names), start=1)
+    ]
+    if defect == "binding":
+        streams[-1]["slot"] = streams[0]["slot"]
+    files = ["final.xclbin", "insts.bin", *names]
+    if defect == "file":
+        files.pop()
+    for name in files:
+        (design_dir / name).write_bytes(b"fixture")
+    design.update(seq=64 if defect == "seq" else 512,
+                  tile={"n": design.pop("tile_n")}, streams=streams)
     (design_dir / "design.json").write_text(json.dumps(design), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [
-        str(CHECKER), "--xclbins", str(root), "--spec", str(family_spec),
+        str(CHECKER), "--xclbins", str(root), "--spec", str(family_spec), "--only", "bert",
     ])
     assert checker.main() == expected_exit
