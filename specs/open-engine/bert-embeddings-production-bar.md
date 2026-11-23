@@ -318,6 +318,21 @@ FIXTURE PREFIX OUTPUT` and append `FIXTURE OUTPUT` pairs to reuse the resident
 encoder. The build replay matched all four recorded vectors byte for byte and
 again produced identical Nomic outputs before and after the 8,192-token request.
 
+Pass `--worker` to the same build command to build the resident NPUE text
+worker. Run it with `PACK DESIGN [VERIFIED-ATTENTION-DIRECTORY]`. The worker
+loads one model, enables Nomic v1.5's per-input rotary scaling, reports its
+capacity and prompt names in a protocol-1 greeting, and accepts newline-delimited
+JSON requests with `texts` and optional `prompt_name`. Its stdout carries only
+protocol records. Device diagnostics go to stderr.
+
+On the Strix Point NPU, the built worker returned byte-identical vectors for
+GTE at 8,192 tokens and Nomic at 2,048 and 8,192 tokens. It preserved the Nomic
+batch-of-two order and output bytes. Requests above capacity returned the actual
+token count and the 8,192-token limit as an invalid request. A valid Nomic
+request after that error produced the original short vector. Raw log
+`.plans/bert/npue-worker-smoke.log`, SHA-256
+`0b1ffe1006e62a3ed71a1e06d8586a82b5cfd35da8980b4b27e032957919e043`.
+
 Raw run `.plans/bert/integrated-npue-run.log`, SHA-256
 `446873b6e77e41690d294def3268e3bd83a78b19107bdb914349f0d604880fa1`.
 CPU comparison `.plans/bert/integrated-npue-verify.log`, SHA-256

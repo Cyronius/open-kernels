@@ -19,10 +19,11 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    // arch=2 only: swiglu_cpu()'s output, [rows][g_ffn] -- a separate buffer
    // from `up` because an in-place version of this compaction is NOT safe
    // under threading (see swiglu_cpu's own comment). Empty/unused for every
-@@ -1460,6 +1464,37 @@
+@@ -1460,6 +1464,39 @@
    // duplicating it for a second arch would be the actual mistake.
    std::vector<float> rope_cos, rope_sin;
    bool rope_ready = false;
++  bool nomic_dynamic_rope = false;
 +  using RotaryTable = std::pair<std::vector<float>, std::vector<float>>;
 +  std::map<int64_t, RotaryTable> rotary_tables;
 +  std::vector<const RotaryTable*> rotary_by_input;
@@ -31,7 +32,8 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +    rotary_by_input.clear();
 +    rotary_tables.clear();
 +    const char* opt = std::getenv("NPUE_NOMIC_DYNAMIC_ROPE");
-+    if (!opt || std::string(opt) != "1" || g_rope_theta != 1000.0 ||
++    if (!(nomic_dynamic_rope || (opt && std::string(opt) == "1")) ||
++        g_rope_theta != 1000.0 ||
 +        model.config_string("arch") != "nomic_bert_rope_swiglu")
 +      return;
 +    constexpr int64_t original_context = 2048;
@@ -151,3 +153,18 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
        gemm(attn_out, is_ao, ctx, s_ao[L], b_ao[L], proj, g_hidden,
             i8w(ws_ao, L), i8w(as_ao, L));
+@@ -4701,6 +4749,14 @@
+   int64_t hidden() const { return g_hidden; }
+   int64_t seq() const { return g_seq; }
+   int64_t batch() const { return stack_.batch; }
++  void enable_nomic_dynamic_rope() {
++    stack_.lead->nomic_dynamic_rope = true;
++  }
++  void set_attention_probe(decltype(Encoder::attention_probe) callback) {
++    if (stack_.n_lanes != 1 || g_heads != 12 || g_head_dim != 64)
++      throw std::invalid_argument("BERT NPU attention requires one lane and 12 heads of width 64");
++    stack_.lead->attention_probe = std::move(callback);
++  }
+   int lanes() const { return stack_.n_lanes; }
+   size_t vocab_size() const { return svc_.tok.vocab_size(); }
+   std::vector<std::string> prompt_names() const { return prompt_names_sorted(); }

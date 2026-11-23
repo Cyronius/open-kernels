@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--xrt-lib", type=Path, required=True, help="XRT coreutil import library")
     parser.add_argument("--boost-include", type=Path, required=True, help="Directory containing boost/any.hpp")
     parser.add_argument("--output", type=Path, required=True, help="Output .exe path")
+    parser.add_argument("--worker", action="store_true", help="Build the resident embedding worker")
     args = parser.parse_args()
 
     compiler = shutil.which("cl.exe")
@@ -60,11 +61,13 @@ def main():
         patch = (PATCH_DIR / entry["patch"]).read_text(encoding="utf-8")
         subprocess.run(["git", "apply", "-"], input=patch.encode("utf-8"), cwd=stage, check=True)
         sources = [str(NPUE / name) for name in SOURCES]
+        program = "npue_worker.cpp" if args.worker else "profile_npue.cpp"
         subprocess.run([
             compiler, "/nologo", "/EHsc", "/O2", "/arch:AVX2", "/std:c++20", "/utf-8",
             f"/I{NPUE}", f"/I{xrt_include}", f"/I{boost_include}",
             f"/I{REPO / 'npu_offload' / 'gemm_rtp'}",
-            str(Path(__file__).with_name("profile_npue.cpp")), *sources, str(xrt_lib),
+            f"/I{REPO / 'src' / 'include'}",
+            str(Path(__file__).with_name(program)), *sources, str(xrt_lib),
             f"/Fe{output}",
         ], cwd=stage, check=True)
 
