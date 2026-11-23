@@ -10,7 +10,35 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
  #include <algorithm>
  #include <array>
-@@ -1445,6 +1447,8 @@
+@@ -339,6 +341,27 @@
+
+   size_t vocab_size() const {
+     return wordpiece ? wordpiece->vocab_size() : xlmr->vocab_size();
++  }
++
++  npue::Encoded encode_token_ids(const std::vector<int32_t> &ids, size_t index,
++                                  int64_t sequence) const {
++    if (ids.size() > static_cast<size_t>(sequence))
++      throw npue::InputTooLong(index, ids.size(), sequence);
++    const auto vocab = vocab_size();
++    if (ids.empty() || std::any_of(ids.begin(), ids.end(), [vocab](int32_t id) {
++          return id < 0 || static_cast<size_t>(id) >= vocab;
++        }))
++      throw std::invalid_argument("input " + std::to_string(index) +
++                                  " must contain valid model token IDs");
++    const auto pad = wordpiece ? wordpiece->pad_id : xlmr->pad_id;
++    npue::Encoded encoded;
++    encoded.n_tokens = encoded.n_tokens_full = static_cast<int32_t>(ids.size());
++    encoded.input_ids = ids;
++    encoded.input_ids.resize(sequence, pad);
++    encoded.attention_mask.assign(ids.size(), 1);
++    encoded.attention_mask.resize(sequence, 0);
++    encoded.token_type_ids.assign(sequence, 0);
++    return encoded;
+   }
+
+   npue::Encoded encode(const std::string &text, int max_len) const {
+@@ -1445,6 +1468,8 @@
    // MB of allocate-and-touch per encode at batch 128, and ~280 MB at
    // bge-large's width. resize() after the first call is a no-op.
    std::vector<float> qkvbuf, ctx, proj, up, down, scores;
@@ -19,7 +47,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    // arch=2 only: swiglu_cpu()'s output, [rows][g_ffn] -- a separate buffer
    // from `up` because an in-place version of this compaction is NOT safe
    // under threading (see swiglu_cpu's own comment). Empty/unused for every
-@@ -1460,6 +1464,39 @@
+@@ -1460,6 +1485,39 @@
    // duplicating it for a second arch would be the actual mistake.
    std::vector<float> rope_cos, rope_sin;
    bool rope_ready = false;
@@ -59,7 +87,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
    // Device-resident weights, one slot per layer per design, plus the bias
    // pointers straight into the mapped file. Filled by stage_all().
-@@ -2795,8 +2830,16 @@
+@@ -2795,8 +2853,16 @@
      pool->run([&](int w, int nw) {
        for (int64_t row = w; row < n_rows; row += nw) {
          const int64_t s = row % g_seq;    // [b][s] row order -> s = row % seq
@@ -78,7 +106,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
          float *row_base = p + row * row_stride;
          for (int64_t h = 0; h < g_heads; ++h) {
            rotate_pair(row_base + h * g_head_dim, cs, sn);              // Q
-@@ -2808,6 +2851,7 @@
+@@ -2808,6 +2874,7 @@
 
    std::vector<float> run(const std::vector<float> &emb_in) {
      std::vector<float> x = emb_in;
@@ -86,7 +114,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
      layer_norm(x, s_ln[0]);
 
      qkvbuf.resize(rows * 3 * g_hidden);
-@@ -2816,7 +2860,7 @@
+@@ -2816,7 +2883,7 @@
      up.resize(rows * (g_gated_ffn ? 2 : 1) * g_ffn);
      if (g_gated_ffn) gated.resize(rows * g_ffn);
      down.resize(rows * g_hidden);
@@ -95,7 +123,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
      residual.resize(x.size());
      // Set by the PREVIOUS iteration's fused LayerNorm, which already wrote
-@@ -2835,30 +2879,34 @@
+@@ -2835,30 +2902,34 @@
        // container.
        if (g_rope) apply_rope_qkv(qkvbuf);
 
@@ -153,7 +181,97 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
        gemm(attn_out, is_ao, ctx, s_ao[L], b_ao[L], proj, g_hidden,
             i8w(ws_ao, L), i8w(as_ao, L));
-@@ -4701,6 +4749,14 @@
+@@ -4524,15 +4595,11 @@
+     return jobs;
+   }
+
+-  // `prefix_text` is the literal text to prepend, "" for none. It is an
+-  // ARGUMENT rather than a member (tasks/0118) because --serve now takes the
+-  // prompt per request: holding it as state is what made one server able to
+-  // answer only one kind of query. Prepended to the RAW text before
+-  // tokenization, the same place tools/verify_embed_e2e.py does it, so the
+-  // two agree on what "applying a prefix" means.
+-  void chunk(Encoder &e, const std::vector<std::string> &texts,
+-             int64_t base, int64_t take, const std::string &prefix_text,
+-             std::vector<float> &out, int64_t *tokens) const {
++  using EncodeInput = std::function<npue::Encoded(int64_t)>;
++
++  void chunk(Encoder &e, const EncodeInput &encode_input,
++             int64_t base, int64_t take, std::vector<float> &out,
++             int64_t *tokens) const {
+     const size_t row_floats = static_cast<size_t>(g_seq) * g_hidden;
+     const int64_t bt = e.use_tier(take);
+     std::vector<float> buf(static_cast<size_t>(bt) * row_floats, 0.f);
+@@ -4540,10 +4607,7 @@
+     std::vector<float> cam(static_cast<size_t>(bt) * g_seq, 0.f);
+     int64_t ntok = 0;
+     for (int64_t b = 0; b < take; ++b) {
+-      const auto en = prefix_text.empty()
+-          ? tok.encode(texts[base + b], static_cast<int>(g_seq))
+-          : tok.encode(prefix_text + texts[base + b],
+-                      static_cast<int>(g_seq));
++      const auto en = encode_input(base + b);
+       // `base + b` is the caller's own index. Tiers are an implementation
+       // detail of how this runtime batches, and naming a tier-local row
+       // would send someone looking at the wrong text.
+@@ -4571,8 +4635,26 @@
+   std::vector<float> embed(const std::vector<std::string> &texts,
+                            const std::string &prefix_text,
+                            int64_t *tokens = nullptr) {
+-    std::vector<float> out(texts.size() * g_hidden, 0.f);
+-    const auto jobs = plan(static_cast<int64_t>(texts.size()));
++    return embed_encoded(texts.size(), [&](int64_t index) {
++      // Task prompts precede the raw text, before tokenization.
++      return prefix_text.empty()
++          ? tok.encode(texts[index], static_cast<int>(g_seq))
++          : tok.encode(prefix_text + texts[index], static_cast<int>(g_seq));
++    }, tokens);
++  }
++
++  std::vector<float> embed_token_ids(const std::vector<std::vector<int32_t>> &inputs,
++                                     int64_t *tokens) {
++    return embed_encoded(inputs.size(), [&](int64_t index) {
++      return tok.encode_token_ids(inputs[index], index, g_seq);
++    }, tokens);
++  }
++
++ private:
++  std::vector<float> embed_encoded(size_t count, const EncodeInput &encode_input,
++                                   int64_t *tokens) {
++    std::vector<float> out(count * g_hidden, 0.f);
++    const auto jobs = plan(static_cast<int64_t>(count));
+     std::atomic<int64_t> tok_total{0};
+     if (all.size() > 1 && jobs.size() > 1) {
+       std::atomic<size_t> next{0};
+@@ -4591,8 +4673,7 @@
+           if (stop.load(std::memory_order_relaxed)) return;
+           try {
+             int64_t nt = 0;
+-            chunk(*e, texts, jobs[j].first, jobs[j].second, prefix_text,
+-                  out, &nt);
++            chunk(*e, encode_input, jobs[j].first, jobs[j].second, out, &nt);
+             tok_total += nt;
+           } catch (...) {
+             // First one wins. Which job reports first is a thread race, so
+@@ -4616,7 +4697,7 @@
+     } else {
+       for (const auto &j : jobs) {
+         int64_t nt = 0;
+-        chunk(*lead, texts, j.first, j.second, prefix_text, out, &nt);
++        chunk(*lead, encode_input, j.first, j.second, out, &nt);
+         tok_total += nt;
+       }
+     }
+@@ -4698,9 +4779,23 @@
+     return svc_.embed(texts, prefix, tokens);
+   }
+
++  std::vector<float> embed_token_ids(const std::vector<std::vector<int32_t>> &inputs,
++                                     int64_t *tokens) {
++    std::lock_guard<std::mutex> lk(call_mu_);
++    return svc_.embed_token_ids(inputs, tokens);
++  }
++
    int64_t hidden() const { return g_hidden; }
    int64_t seq() const { return g_seq; }
    int64_t batch() const { return stack_.batch; }

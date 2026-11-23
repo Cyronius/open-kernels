@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -33,17 +34,13 @@ void reply(std::FILE* out, const Json& response) {
 }
 
 Json embed(npue::enc::Embedder& model, const Json& request) {
-    if (!request.is_object() || request.contains("token_ids"))
-        throw std::invalid_argument("BERT embeddings require text inputs");
-    const auto texts = request.at("texts").get<std::vector<std::string>>();
-    if (texts.empty())
-        throw std::invalid_argument("BERT embeddings require at least one input");
+    const bool text_input = request.contains("texts");
+    if (!request.is_object() || text_input == request.contains("token_ids"))
+        throw std::invalid_argument("provide either texts or token_ids");
+    const auto& inputs = request.at(text_input ? "texts" : "token_ids");
+    if (!inputs.is_array() || inputs.empty())
+        throw std::invalid_argument("BERT embeddings require a nonempty array of inputs");
     const auto prompt = request.value("prompt_name", std::string{});
-    const auto names = model.prompt_names();
-    if (prompt.empty() && !names.empty())
-        throw std::invalid_argument("prompt_name is required. Choose from " + npue::enc::join_names(names));
-    if (!prompt.empty() && std::find(names.begin(), names.end(), prompt) == names.end())
-        throw std::invalid_argument("unsupported prompt_name '" + prompt + "'");
     const auto width = static_cast<size_t>(model.hidden());
     auto dimensions = width;
     if (request.contains("dimensions")) {
@@ -60,8 +57,34 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
     }
 
     int64_t tokens = 0;
-    auto values = model.embed(texts, prompt, &tokens);
-    if (values.size() != texts.size() * width ||
+    std::vector<float> values;
+    if (text_input) {
+        const auto names = model.prompt_names();
+        if (prompt.empty() && !names.empty())
+            throw std::invalid_argument("prompt_name is required. Choose from " + npue::enc::join_names(names));
+        if (!prompt.empty() && std::find(names.begin(), names.end(), prompt) == names.end())
+            throw std::invalid_argument("unsupported prompt_name '" + prompt + "'");
+        values = model.embed(inputs.get<std::vector<std::string>>(), prompt, &tokens);
+    } else {
+        if (!prompt.empty())
+            throw std::invalid_argument("include the task prefix in token_ids when tokenizing");
+        std::vector<std::vector<int32_t>> token_ids;
+        token_ids.reserve(inputs.size());
+        for (const auto& row : inputs) {
+            if (!row.is_array())
+                throw std::invalid_argument("token_ids must contain token sequences");
+            auto& ids = token_ids.emplace_back();
+            ids.reserve(row.size());
+            for (const auto& token : row) {
+                if (!token.is_number_integer() || token < 0 ||
+                    token > (std::numeric_limits<int32_t>::max)())
+                    throw std::invalid_argument("token IDs must be nonnegative int32 values");
+                ids.push_back(token.get<int32_t>());
+            }
+        }
+        values = model.embed_token_ids(token_ids, &tokens);
+    }
+    if (values.size() != inputs.size() * width ||
         !std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); }))
         throw std::runtime_error("encoder returned an invalid embedding");
     auto vectors = Json::array();

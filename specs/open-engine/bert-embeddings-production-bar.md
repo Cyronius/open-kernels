@@ -323,8 +323,9 @@ Pass `--worker` to the same build command to build the resident NPUE text
 worker. Run it with `PACK DESIGN [ATTENTION-DIRECTORY]`. The worker
 loads one model, enables Nomic v1.5's per-input rotary scaling, reports its
 capacity and prompt names in a protocol-1 greeting, and accepts newline-delimited
-JSON requests with `texts` and optional `prompt_name`. Its stdout carries only
-protocol records. Device diagnostics go to stderr.
+JSON requests with `texts` or `token_ids`. Text callers may use `prompt_name`.
+Token-ID callers supply unpadded sequences including any task prefix and special
+tokens. Its stdout carries only protocol records. Device diagnostics go to stderr.
 
 The worker and probe verify the attention manifest geometry, both payload sizes
 and both SHA-256 digests at startup. They check that the attention and projection
@@ -343,6 +344,17 @@ token count and the 8,192-token limit as an invalid request. A valid Nomic
 request after that error produced the original short vector. Raw log
 `.plans/bert/npue-worker-smoke.log`, SHA-256
 `0b1ffe1006e62a3ed71a1e06d8586a82b5cfd35da8980b4b27e032957919e043`.
+
+Pretokenized inputs use the same tier selection, masks, embeddings and
+pooling as text. The offline native check loaded the extended Nomic and GTE
+Q8_0 packs. For both encoders it reproduced every token, mask and padding
+entry from their 8,192-token text fixtures. It rejected the 8,193rd input
+token, empty sequences and IDs outside each vocabulary. Raw report
+`.plans/bert/token-ids-prep.log`, SHA-256
+`bcc455644c0e580a02d81ab0603f2ee75d3d77efc3a5d811ec855d78ea082426`.
+The Phlegm HTTP test with a synthetic worker exercised 8,192 flat IDs, an
+ordered mixed-length batch and HTTP 400 at 8,193 IDs. Live vector equivalence
+through Phlegm remains to be verified on the NPU.
 
 Raw run `.plans/bert/integrated-npue-run.log`, SHA-256
 `446873b6e77e41690d294def3268e3bd83a78b19107bdb914349f0d604880fa1`.
