@@ -13,10 +13,26 @@ import gguf
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "npu_offload" / "gemm_rtp"))
-from npue import Reader, Writer
+from npue import ARCH_GTE_NEW_ROPE_GEGLU, Reader, Writer
 
 
 POSITION = "embeddings.position"
+
+
+def check_gte_rope(source, container):
+    config = container.config
+    if container.arch != ARCH_GTE_NEW_ROPE_GEGLU or config["head_dim"] != 64:
+        raise ValueError("expected a packed 64-wide GTE checkpoint")
+    if source.fields["general.name"].contents() != "Alibaba-NLP/gte-multilingual-base":
+        raise ValueError("expected the GTE embedding checkpoint")
+    if source.fields["new.rope.scaling.type"].contents() != "linear":
+        raise ValueError("expected linearly represented GTE rotary frequencies")
+    base = source.fields["new.rope.freq_base"].contents()
+    factor = source.fields["new.rope.scaling.factor"].contents()
+    expected = base ** (-np.arange(32, dtype=np.float64) / 32) / factor
+    stored = np.asarray(config["rope_inv_freq"])
+    if stored.shape != expected.shape or not np.allclose(stored, expected, rtol=2e-6, atol=0):
+        raise ValueError("GGUF rotary frequencies disagree with the original GTE pack")
 
 
 def extend(packed, weights, output, length):
@@ -37,6 +53,9 @@ def extend(packed, weights, output, length):
             table = next(t for t in source.tensors if t.name == "position_embd.weight")
             positions = gguf.dequantize(table.data, table.tensor_type)[:length]
         elif arch == "nomic-bert" and container.config.get("position_embedding_type") == "rope":
+            positions = np.zeros((length, width), dtype=np.float32)
+        elif arch == "new" and container.config.get("position_embedding_type") == "rope":
+            check_gte_rope(source, container)
             positions = np.zeros((length, width), dtype=np.float32)
         else:
             raise ValueError("GGUF architecture and packed position encoding are unsupported")

@@ -1,6 +1,7 @@
 """Stage the supported GTE embedding GGUF for the existing NPUE packer."""
 
 from argparse import ArgumentParser
+import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -20,6 +21,7 @@ def verify_metadata(reader):
     expected = {
         "general.architecture": "new",
         "general.name": MODEL_ID,
+        "general.source.url": f"https://huggingface.co/{MODEL_ID}",
         "general.file_type": int(LlamaFileType.MOSTLY_Q8_0),
         "new.attention.causal": False,
         "new.context_length": CONTEXT,
@@ -38,6 +40,12 @@ def verify_metadata(reader):
         field = reader.fields.get(key)
         if field is None or field.contents() != value:
             raise ValueError(f"unsupported GTE metadata {key}, expected {value!r}")
+
+
+def checkpoint_record(weights):
+    with weights.open("rb") as stream:
+        sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    return {"repo_id": MODEL_ID, "gguf_sha256": sha256}
 
 
 def stage(weights, output):
@@ -86,6 +94,9 @@ def stage(weights, output):
         staging.mkdir()
         (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         (staging / "tokenizer.json").write_bytes(tokenizer.encode("utf-8"))
+        (staging / "CHECKPOINT.json").write_text(
+            json.dumps(checkpoint_record(weights), indent=2) + "\n", encoding="utf-8",
+        )
         pooling = staging / "1_Pooling"
         pooling.mkdir()
         (pooling / "config.json").write_text(

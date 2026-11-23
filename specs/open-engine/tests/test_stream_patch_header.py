@@ -92,3 +92,34 @@ int main() {
     subprocess.run([compiler, "-std=c++17", "-I", str(harness), str(source),
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+def test_nomic_v15_rotary_context_boundary(tmp_path):
+    compiler = find_cxx()
+    if compiler is None:
+        pytest.skip("requires a GNU-style C++ compiler")
+    source = tmp_path / "nomic_rope.cpp"
+    source.write_text(r"""
+#include "nomic_rope.hpp"
+#include <cassert>
+
+int main() {
+    using npue::npu::nomic_v15_rope_base;
+    assert(nomic_v15_rope_base(0) == 1000.0);
+    assert(nomic_v15_rope_base(2048) == 1000.0);
+    assert(nomic_v15_rope_base(2049) > 1000.0);
+    assert(std::abs(nomic_v15_rope_base(8192) - 7453.483031811892) < 1e-9);
+    for (const auto length : {-1, 8193}) {
+        try {
+            nomic_v15_rope_base(length);
+        } catch (const std::invalid_argument&) {
+            continue;
+        }
+        assert(false && "invalid rotary context accepted");
+    }
+}
+""", encoding="utf-8")
+    runtime = Path(__file__).resolve().parents[3] / "npu_offload/gemm_rtp"
+    binary = executable_path(tmp_path / "nomic_rope")
+    subprocess.run([compiler, "-std=c++17", "-I", str(runtime), str(source),
+                    "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

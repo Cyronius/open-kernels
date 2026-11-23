@@ -276,7 +276,12 @@ scale during BF16 packing before using the checked attention image.
 The local probe built successfully with MSVC. It reuses the static rotary table
 through 2,048 tokens and builds the dynamic table once per unique longer length
 in the request. It checks a
-2,048 ? 8,192 ? 2,048 sequence within one instance. A same-binary host versus NPU timing comparison for GTE is running.
+2,048 ? 8,192 ? 2,048 sequence within one instance. The same-binary GTE comparison at 8,192 tokens measured 74.58 s with host
+attention and 1.77 s with NPU attention. The two vectors had cosine 0.999731.
+Dibs reported background compilation and another benchmark at the end of the
+paired run, so these are observed times. Raw report
+`.plans/bert/integrated-npue-match.log`, SHA-256
+`7afcf43580d67d5ccf8525aead14d92a2ae2fc5b969a85e157c99a0fc0d2fffd`.
 
 | Model | Input / capacity | Local wall ms | NPU attention ms | Attention packing and sync ms | Publisher CPU cosine |
 |---|---:|---:|---:|---:|---:|
@@ -289,6 +294,13 @@ All four local integration cases passed parity. Nomic's two 2,048-token outputs
 were byte-identical across the 2,048 ? 8,192 ? 2,048 sequence. The prototype used
 one lane and 12 host threads. It is a standalone NPUE run. The normal serving
 route still uses host attention and requires its own integration and validation.
+The [tracked attention adapter](../../npu_offload/gemm_rtp/bert_attention.hpp) and
+[per-input rotary base](../../npu_offload/gemm_rtp/nomic_rope.hpp) reproduced all
+four validated local outputs byte for byte. The adapter reads the exported device
+image and instruction stream after artifact verification, consumes the existing
+NPUE-scaled QKV layout, and returns token-major FP32. Raw replay
+`.plans/bert/tracked-npue-run.log`, SHA-256
+`604a8d1f6d2ef11a3c3438a35936aa5d04a127af31c0b337f8d91a434f2c3a0c`.
 
 Raw run `.plans/bert/integrated-npue-run.log`, SHA-256
 `446873b6e77e41690d294def3268e3bd83a78b19107bdb914349f0d604880fa1`.
@@ -408,9 +420,15 @@ The tokenizer JSON also matched the publisher bytes. The isolated model director
 initially contained only the reconstructed config, weights and tokenizer. The
 default registry compared the staging files with its entry for the original
 safetensors, redownloaded that checkpoint and its modern config, and then fell
-back to the wrong packer. That cold serve failed. A new isolated deployment with
-a local registry entry is queued to validate automatic packing of the staged
-files. Registry and automatic GGUF dispatch are still OFLM-side work.
+back to the wrong packer. With a local registry and the new provenance record,
+OFLM cold-packed all 150 tensors and generated the tokenizer table. Its automatic
+pack capped the position table at 64 rows, so startup refused the 512-token
+design. The extension utility verified the baked rotary frequencies against
+the GGUF and expanded the unused position table. The resulting 8,192-token NPUE
+was byte-identical to the separately built and served reference, SHA-256
+`ac9b5460d9a1bf4b278f03cebcd12282594cd747e60a6991b93d43950a30c9a7`.
+A 512-token serve check from this exact extended pack is queued.
+Native registry, automatic full-length packing and GGUF dispatch remain OFLM work.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
