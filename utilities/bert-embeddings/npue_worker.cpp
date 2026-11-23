@@ -2,7 +2,7 @@
 #include "npue_encoder.hpp"
 #include "bert_attention.hpp"
 #include "bert_attention_files.hpp"
-#include "nomic_matryoshka.hpp"
+#include "embedding_width.hpp"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -42,15 +42,17 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
         throw std::invalid_argument("BERT embeddings require a nonempty array of inputs");
     const auto prompt = request.value("prompt_name", std::string{});
     const auto width = static_cast<size_t>(model.hidden());
+    const bool nomic = width == 768 && is_nomic_v15(model);
+    const bool gte = width == 768 && model.source_repo() == "Alibaba-NLP/gte-multilingual-base";
     auto dimensions = width;
     if (request.contains("dimensions")) {
         const auto& requested = request.at("dimensions");
-        const bool resizable = width == 768 && is_nomic_v15(model);
-        if (!requested.is_number_integer() ||
-            (requested != width &&
-             !(resizable && (requested == 64 || requested == 128 ||
-                             requested == 256 || requested == 512)))) {
-            const auto supported = resizable ? "64, 128, 256, 512 or 768" : std::to_string(width);
+        const bool nomic_width = nomic && (requested == 64 || requested == 128 ||
+                                           requested == 256 || requested == 512);
+        const bool gte_width = gte && requested >= 128 && requested <= width;
+        if (!requested.is_number_integer() || (requested != width && !nomic_width && !gte_width)) {
+            const auto supported = nomic ? "64, 128, 256, 512 or 768" :
+                gte ? "128 through 768" : std::to_string(width);
             throw std::invalid_argument("supported dimensions are " + supported);
         }
         dimensions = requested.get<size_t>();
@@ -94,7 +96,8 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
             vectors.push_back(std::vector<float>(row, row + width));
             continue;
         }
-        vectors.push_back(npue::enc::nomic_matryoshka({row, width}, dimensions));
+        vectors.push_back(nomic ? npue::enc::nomic_matryoshka({row, width}, dimensions) :
+                                 npue::enc::normalize_embedding_prefix({row, width}, dimensions));
     }
     return {{"ok", true}, {"tokens", tokens}, {"vectors", std::move(vectors)}};
 }

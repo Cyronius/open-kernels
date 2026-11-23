@@ -566,6 +566,20 @@ Runtime parity for the extended quantized pack remains open.
   German, Spanish, Chinese and Russian passages, and unrelated English and French passages.
   The lowest CPU cosine was 0.999642 across all seven vectors. The gap between the weakest
   relevant passage and the strongest distractor was 0.2652 on NPU and 0.2634 on CPU.
+- The resident worker accepts GTE elastic dense widths from 128 through 768
+  and normalizes the requested prefix. Replaying its native postprocessing on
+  the captured NPU vectors at 512 and 8,192 tokens matched the publisher CPU
+  reference at widths 128, 129, 256, 512 and 767. The minimum cosine was
+  0.999195. Live HTTP parity remains open.
+  [GTE model card](https://huggingface.co/Alibaba-NLP/gte-multilingual-base)
+- The stock GTE NPUE pack drops the classifier that the GGUF preserves.
+  `extend_npue.py --gte-sparse-head` adds the original F32 weights and bias as
+  `sparse.weight` and `sparse.bias`. The 8,192-token pack with SHA-256
+  `0d971e06a80b016e4efa67989dec272d564ddfdd0c934d2e4ec9c8967baa7cd3`
+  preserves all 150 existing tensors byte for byte. On English and Chinese
+  fixtures, applying these tensors to the publisher CPU model's final hidden
+  states reproduced `GteForTokenClassification` logits exactly. Sparse scoring
+  from the NPU encoder's hidden states and HTTP exposure remain open.
 - Nomic accepted `search_query`, `search_document`, `clustering` and `classification`.
   All four vectors differed for the same text and matched their task-specific CPU references
   with a minimum cosine of 0.998892. Stock OFLM returned 768 values for a request
@@ -581,6 +595,10 @@ Runtime parity for the extended quantized pack remains open.
 
 Raw report `.plans/bert/features.log`, SHA-256
 `52028291087aa646355099bce62fd0a3053bfa0df835e1f21bd20ce60d224901`.
+GTE elastic replay `.plans/bert/gte-elastic-native.log`, SHA-256
+`baadf3a3268aac18b105abc485aeda045fcc7b555a6ee79d525bdb759ec180e5`.
+Classifier check `.plans/bert/gte-sparse-head-check.log`, SHA-256
+`09bea59684021247b3d9d9b82ab788c1db5c394f9488b6d7e0480f15d98e536b`.
 
 ## OFLM side
 

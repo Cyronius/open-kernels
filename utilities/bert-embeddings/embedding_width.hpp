@@ -11,14 +11,10 @@
 
 namespace npue::enc {
 
-inline std::vector<float> nomic_matryoshka(std::span<const float> full, std::size_t dimensions) {
+inline std::vector<float> normalize_embedding_prefix(
+    std::span<const float> full, std::size_t dimensions, double mean = 0.0) {
     if (dimensions == 0 || dimensions > full.size())
-        throw std::invalid_argument("invalid Nomic embedding dimensions");
-
-    // Nomic applies LayerNorm over the full embedding before taking a prefix.
-    // The final L2 normalization cancels the positive scale from LayerNorm and
-    // from any L2 normalization already applied to the full-width input.
-    const double mean = std::accumulate(full.begin(), full.end(), 0.0) / full.size();
+        throw std::invalid_argument("invalid embedding dimensions");
     auto prefix = full.first(dimensions);
     const double sum_squares = std::accumulate(
         prefix.begin(), prefix.end(), 0.0, [mean](double sum, double value) {
@@ -30,6 +26,14 @@ inline std::vector<float> nomic_matryoshka(std::span<const float> full, std::siz
     std::transform(prefix.begin(), prefix.end(), output.begin(),
                    [mean, scale](double value) { return static_cast<float>((value - mean) * scale); });
     return output;
+}
+
+inline std::vector<float> nomic_matryoshka(std::span<const float> full, std::size_t dimensions) {
+    // Final L2 normalization cancels the scale from LayerNorm and from any
+    // L2 normalization already applied to the full-width vector.
+    const double mean = full.empty() ? 0.0 :
+        std::accumulate(full.begin(), full.end(), 0.0) / full.size();
+    return normalize_embedding_prefix(full, dimensions, mean);
 }
 
 }  // namespace npue::enc

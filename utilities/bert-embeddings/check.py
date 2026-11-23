@@ -82,9 +82,11 @@ def cpu_reference(directory, prefix, max_length, dimensions=None):
 
     tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
     config = AutoConfig.from_pretrained(directory, local_files_only=True)
-    if dimensions is not None and (config.model_type != "nomic_bert" or
-                                   dimensions not in (64, 128, 256, 512, 768)):
-        raise ValueError("this CPU reference supports configurable dimensions for Nomic v1.5")
+    if dimensions is not None:
+        nomic_width = config.model_type == "nomic_bert" and dimensions in (64, 128, 256, 512, 768)
+        gte_width = config.model_type in ("gte", "new") and 128 <= dimensions <= config.hidden_size
+        if not (nomic_width or gte_width):
+            raise ValueError("unsupported configurable embedding width for this CPU reference")
     options = {}
     if config.model_type == "nomic_bert" and max_length > 2048:
         options["rope_parameters"] = {"rope_theta": 1000.0, "rope_type": "dynamic", "factor": 2.0}

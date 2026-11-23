@@ -17,6 +17,10 @@ from npue import ARCH_GTE_NEW_ROPE_GEGLU, Reader, Writer
 
 
 POSITION = "embeddings.position"
+GTE_SPARSE = {
+    "cls.output.weight": ("sparse.weight", (1, 768)),
+    "cls.output.bias": ("sparse.bias", (1,)),
+}
 
 
 def check_gte_rope(source, container):
@@ -35,11 +39,27 @@ def check_gte_rope(source, container):
         raise ValueError("GGUF rotary frequencies disagree with the original GTE pack")
 
 
-def extend(packed, weights, output, length, *, nomic_dynamic_rope=False):
+def add_gte_sparse_head(writer, source, container):
+    tensors = {tensor.name: tensor for tensor in source.tensors}
+    for name, (key, shape) in GTE_SPARSE.items():
+        tensor = tensors.get(name)
+        if (tensor is None or tensor.tensor_type != gguf.GGMLQuantizationType.F32
+                or tuple(reversed(tensor.shape)) != shape
+                or not np.isfinite(tensor.data).all()):
+            raise ValueError(f"invalid GTE sparse head tensor {name}")
+        if key in container.entries:
+            raise ValueError(f"{key} is already present in the NPUE pack")
+        writer.add(key, tensor.data.reshape(shape), "F32", "classifier", shape)
+
+
+def extend(packed, weights, output, length, *, nomic_dynamic_rope=False,
+           gte_sparse_head=False):
     if output.exists():
         raise FileExistsError(output)
     source = gguf.GGUFReader(weights)
     arch = source.fields["general.architecture"].contents()
+    if gte_sparse_head and arch != "new":
+        raise ValueError("a GTE sparse head requires the GTE embedding GGUF")
     capacity = source.fields[f"{arch}.context_length"].contents()
     with Reader(packed) as container:
         if nomic_dynamic_rope:
@@ -80,6 +100,8 @@ def extend(packed, weights, output, length, *, nomic_dynamic_rope=False):
             else:
                 writer.add(name, container.raw(name), item["dtype"], item["role"],
                            item["logical_shape"], item.get("layout"), item["padded_shape"])
+        if gte_sparse_head:
+            add_gte_sparse_head(writer, source, container)
         temporary = output.with_suffix(".npue.part")
         writer.write(temporary)
         temporary.rename(output)
@@ -93,13 +115,15 @@ def main():
     parser.add_argument("--length", type=int, required=True)
     parser.add_argument("--nomic-dynamic-rope", action="store_true",
                         help="allow Nomic v1.5's documented 8192-token dynamic RoPE context")
+    parser.add_argument("--gte-sparse-head", action="store_true",
+                        help="preserve the GTE classifier alongside its dense encoder")
     parser.add_argument("--gguf-sha256", required=True)
     args = parser.parse_args()
     with args.weights.open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != args.gguf_sha256:
             raise ValueError("GGUF SHA-256 mismatch")
     extend(args.packed, args.weights, args.output, args.length,
-           nomic_dynamic_rope=args.nomic_dynamic_rope)
+           nomic_dynamic_rope=args.nomic_dynamic_rope, gte_sparse_head=args.gte_sparse_head)
 
 
 if __name__ == "__main__":
