@@ -46,6 +46,10 @@ inputs use their exact lengths. The entire batch takes the short route
 only when every input fits. Synthetic HTTP exercised the short boundary,
 a mixed-length batch, the 8,192-token ceiling, invalid requests and
 short-long-short recovery. A synthetic benchmark recorded both routes.
+The queued HTTP run repeats the same 64-token request twice after serving
+at maximum context. It records both latencies and requires both results
+to equal the earlier short-route vector bit for bit. This measures the
+first short request after a route change against an immediate repeat.
 
 The development implementation uses two resident workers because the NPUE
 encoder geometry is process-wide. It keeps one shared Phlegm device lock
