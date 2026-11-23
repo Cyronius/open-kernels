@@ -232,16 +232,23 @@ The in-progress host profile already has a paired Nomic measurement with the sam
 2,048-token input. In five warm runs per route the 2,048-capacity view took
 1.95?2.05 s and the 8,192-capacity view took 53.28?67.20 s. The host QK and AV
 passes grew from 1.40?1.47 s to 50.06?63.78 s, while host softmax grew from
-0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. The first
-two warm calls with an exact 8,192-token input took 63.71 and 61.00 s. Host QK and AV
-took 60.46 and 57.68 s of those totals. The remaining repetitions are still running.
+0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. Five warm
+calls with an exact 8,192-token Nomic input took 61.00?63.71 s. Host QK and AV
+accounted for 57.68?60.46 s and softmax for 2.36?2.46 s. The GTE cases are still running.
 
 A local integration build is queued on the two long-context families. It routes
 post-projection Q/K/V through the NPU attention image, selects the mask from the
 actual input length, and chooses Nomic's rotary table per input. The existing NPUE
-weight layout folds the attention scale into Q. The probe reverses that power-of-two
-scale during BF16 packing before using the already checked attention image.
-The local prototype and the serving code require their own parity checks.
+weight layout folds the attention scale into Q. Detiling the first projection of
+each actual NPUE pack produced exact BF16 matches against the publisher tensors
+with Q multiplied by 1/8 and K and V unchanged. The GTE QKV bias matched the same
+scaling rule, and the Nomic bias was all zeros. The probe reverses that power-of-two
+scale during BF16 packing before using the checked attention image.
+The local probe reuses the static rotary table through 2,048 tokens and builds
+the dynamic table once per unique longer length in the request. It checks a
+2,048 ? 8,192 ? 2,048 sequence within one instance. A same-binary host versus
+NPU timing comparison for GTE is queued after end-to-end parity. The serving code
+requires its own parity checks.
 The [BERT attention exporter](../../open_kernels/export_bert_attention.py) now records
 capacity, head geometry, BF16 layout, scale, runtime length marker, and both payload
 hashes. The hardware checker uses that contract, and the integration probe checks
