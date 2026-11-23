@@ -276,9 +276,24 @@ scale during BF16 packing before using the checked attention image.
 The local probe built successfully with MSVC. It reuses the static rotary table
 through 2,048 tokens and builds the dynamic table once per unique longer length
 in the request. It checks a
-2,048 ? 8,192 ? 2,048 sequence within one instance. A same-binary host versus
-NPU timing comparison for GTE is queued after end-to-end parity. The serving code
-requires its own parity checks.
+2,048 ? 8,192 ? 2,048 sequence within one instance. A same-binary host versus NPU timing comparison for GTE is running.
+
+| Model | Input / capacity | Local wall ms | NPU attention ms | Attention packing and sync ms | Publisher CPU cosine |
+|---|---:|---:|---:|---:|---:|
+| GTE | 512 / 512 | 363.34 | 72.56 | 3.92 | 0.999194 |
+| GTE | 8192 / 8192 | 1703.32 | 673.61 | 121.95 | 0.999424 |
+| Nomic | 2048 / 8192 | 1415.95 | 672.80 | 31.81 | 0.997835 |
+| Nomic | 8192 / 8192 | 1580.31 | 676.46 | 126.37 | 0.997498 |
+
+All four local integration cases passed parity. Nomic's two 2,048-token outputs
+were byte-identical across the 2,048 ? 8,192 ? 2,048 sequence. The prototype used
+one lane and 12 host threads. It is a standalone NPUE run. The normal serving
+route still uses host attention and requires its own integration and validation.
+
+Raw run `.plans/bert/integrated-npue-run.log`, SHA-256
+`446873b6e77e41690d294def3268e3bd83a78b19107bdb914349f0d604880fa1`.
+CPU comparison `.plans/bert/integrated-npue-verify.log`, SHA-256
+`99544812427dfd9a8634b20a035ede02a4b9f66602c006925159ddf218008a09`.
 The [BERT attention exporter](../../open_kernels/export_bert_attention.py) now records
 capacity, head geometry, BF16 layout, scale, runtime length marker, and both payload
 hashes. The hardware checker uses that contract, and the integration probe checks
@@ -321,18 +336,21 @@ tracked static build matched its pre-change instruction stream and connectivity.
 The compiled PDI bytes differ between builds. The tracked 512-capacity runtime
 image passed at key lengths 259, 381 and 512 with bit-identical repeats and a minimum
 sampled row cosine of 0.999449 over all three lengths. Warm dispatch times ranged from
-1.13 to 1.28 ms. Running 8,192 capacity with a dynamic length and alternating lengths
-in one resident context remain separate checks. The harness now patches and
-syncs the same instruction buffer for each requested length after validating and
-caching all 32 tile register offsets from the original transaction. A 2,048-capacity build is queued to
-measure the intermediate route without padding attention to 8,192. The checker also
+1.13 to 1.28 ms. The 2,048-capacity runtime passed at 1,027 and 2,048 valid keys.
+Warm dispatches took 14.39 and 12.97 ms in those two cases. At capacity 8,192,
+the runtime passed at 2,051 and 8,192 valid keys with warm dispatches of 56.18 and
+58.71 ms. Alternating valid lengths in one resident context reproduced the
+isolated outputs byte for byte at capacities 512 and 8,192. The harness patches
+and syncs the same instruction buffer and caches all 32 register offsets. After
+the first lookup, the observed full-capacity patches took 0.009?0.011 ms. The checker also
 accepts captured Q/K/V in float32, comparing the device output against float64
 attention over BF16-rounded inputs and reporting the extra error due to rounding the
 original tensors. Layers 0 and 11 were captured at 512 and 8,192 tokens. In the independent CPU
 calculation, BF16 input rounding alone gave a minimum sampled row cosine of
 0.9998407 and worst head-relative L2 of 0.006247 across the four captures.
-Raw report `.plans/bert/gte-real-qkv-rounding.jsonl`. NPU replay of these captures
-and model-level quality and latency still need validation.
+Raw report `.plans/bert/gte-real-qkv-rounding.jsonl`. NPU replay of all four captures passed. The lowest sampled row cosine against the
+BF16-rounded float64 oracle was 0.997377, and the largest head-relative L2 was
+0.028853.
 
 GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
 the publisher CPU vectors with a minimum cosine of 0.999475. The observed single
@@ -376,8 +394,8 @@ and a new output path and requires the Python `gguf`, `numpy` and `safetensors` 
 
 The replayed NPUE pack served 64- and 512-token single and batch-4 requests with a
 minimum cosine of 0.999379 against the original publisher CPU model. It passed
-`oflm-test --embedding`. The first exact 8,192-token fixture scored 0.999449
-against the publisher, with 79.6 s through HTTP. The second is running. The
+`oflm-test --embedding`. Both exact 8,192-token fixtures scored at least
+0.999449 against the publisher, with 79.6 and 84.0 s through HTTP. The
 serving checker can enforce a named minimum cosine across all configured single
 and batch fixtures in addition to the token-count and input-limit checks. The new
 [GGUF staging utility](../../utilities/bert-embeddings/stage_gte_gguf.py) reconstructs
@@ -387,9 +405,12 @@ packer. Staging from GGUF alone produced the same dequantized weights as the
 validated replay, SHA-256
 `f122116c8429466db7d262be8466a366c34e7964ed3b02bd52e462587e81392e`.
 The tokenizer JSON also matched the publisher bytes. The isolated model directory
-contains only the reconstructed config, weights and tokenizer, so the queued
-512-token run will exercise a cold pack. Registry and automatic GGUF dispatch
-are still OFLM-side work.
+initially contained only the reconstructed config, weights and tokenizer. The
+default registry compared the staging files with its entry for the original
+safetensors, redownloaded that checkpoint and its modern config, and then fell
+back to the wrong packer. That cold serve failed. A new isolated deployment with
+a local registry entry is queued to validate automatic packing of the staged
+files. Registry and automatic GGUF dispatch are still OFLM-side work.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five

@@ -86,6 +86,12 @@ def stage(weights, output):
         staging.mkdir()
         (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         (staging / "tokenizer.json").write_bytes(tokenizer.encode("utf-8"))
+        pooling = staging / "1_Pooling"
+        pooling.mkdir()
+        (pooling / "config.json").write_text(
+            json.dumps({"pooling_mode_cls_token": True, "pooling_mode_mean_tokens": False}) + "\n",
+            encoding="utf-8",
+        )
         save_file(native, staging / "model.safetensors")
         staging.rename(output)
 
