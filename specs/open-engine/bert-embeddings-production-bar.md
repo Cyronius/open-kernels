@@ -752,6 +752,11 @@ parity check and baseline–candidate–baseline benchmark remain queued.
 CPU loop log `.plans/bert/npue-query-pruning-cpu.log`, SHA-256
 `3a00effd5db636c8c2f9b959ec85e6a9c125fb0ed4c2ebdab4e2699b0f63bac5`.
 
+The MiniLM comparison profiles the revised worker with one resident
+process and with the 64-token route enabled. The original single-worker
+run brackets both trials. This checks whether the short route still earns
+its extra resident memory after removing padded query work.
+
 ### Intermediate context for Nomic and GTE
 
 The current 64/8,192 route sends a 512-token input to the 8,192-token
@@ -761,6 +766,12 @@ trials per model use identical Q8_0 packs and 64- and 512-token fixtures
 at batches one and four. Runs with the existing 64-token secondary
 design bracket the two alternatives. Preflight verified that all three
 capacities use the same weight layout. Device timings are pending.
+
+Both comparisons retain the original samples and record the median of the
+per-round speedups against the geometric mean of the bracketing samples.
+The report checker verifies the fixture, full design, model hashes and
+machine settings, as well as the selected context for every sample.
+A control-median drift above 5% calls for a repeat before using the ratio.
 
 ## Cold packing from GGUF
 
