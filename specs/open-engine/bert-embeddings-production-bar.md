@@ -232,8 +232,9 @@ The in-progress host profile already has a paired Nomic measurement with the sam
 2,048-token input. In five warm runs per route the 2,048-capacity view took
 1.95?2.05 s and the 8,192-capacity view took 53.28?67.20 s. The host QK and AV
 passes grew from 1.40?1.47 s to 50.06?63.78 s, while host softmax grew from
-0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. Its remaining
-cases, including actual 8,192-token input, are still running.
+0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. The first
+two warm calls with an exact 8,192-token input took 63.71 and 61.00 s. Host QK and AV
+took 60.46 and 57.68 s of those totals. The remaining repetitions are still running.
 
 A local integration build is queued on the two long-context families. It routes
 post-projection Q/K/V through the NPU attention image, selects the mask from the
@@ -241,6 +242,12 @@ actual input length, and chooses Nomic's rotary table per input. The existing NP
 weight layout folds the attention scale into Q. The probe reverses that power-of-two
 scale during BF16 packing before using the already checked attention image.
 The local prototype and the serving code require their own parity checks.
+The [BERT attention exporter](../../open_kernels/export_bert_attention.py) now records
+capacity, head geometry, BF16 layout, scale, runtime length marker, and both payload
+hashes. The hardware checker uses that contract, and the integration probe checks
+it before starting the encoder. Offline validation accepted the two known images
+and rejected both a different requested capacity and a bit-changed instruction stream.
+An independent build through the exporter and a hardware smoke are queued.
 
 The existing bidirectional [FlashAttention design](../../open_kernels/designs/whisper_fa/README.md)
 compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder

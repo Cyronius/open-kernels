@@ -67,6 +67,12 @@ at a different length, run `utilities/bert-embeddings/check_attention.py` with
 length. Use 381 as the marker for the BERT test shapes. The shipped Whisper design
 keeps its static 1,500-frame mask.
 
+BERT builds can use `open_kernels/export_bert_attention.py --sequence 512 --out DIR`
+in the same IRON environment. The exporter also accepts lengths 2048 and 8192 and
+writes the expected geometry, layout, scale and payload hashes to `attention.json`.
+The `--check` mode verifies a staged artifact without the toolchain. The hardware
+checker reads the exported marker automatically when that metadata is present.
+
 ## Test it on hardware
 
 Real Whisper Q/K/V fixtures and the harness that checks a build against AMD's own

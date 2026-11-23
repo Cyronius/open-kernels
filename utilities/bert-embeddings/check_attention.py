@@ -4,12 +4,13 @@ import argparse
 from pathlib import Path
 import struct
 import subprocess
+import sys
 
 import numpy as np
 
 
-HEADS = 12
-WIDTH = 64
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "open_kernels"))
+from export_bert_attention import HEADS, HEAD_WIDTH as WIDTH, LENGTH_MARKER, SEQUENCES, check_artifact
 
 
 def bf16_bits(values):
@@ -91,7 +92,7 @@ def main():
     parser.add_argument("--harness", required=True, type=Path)
     parser.add_argument("--build", required=True, type=Path)
     parser.add_argument("--work", required=True, type=Path)
-    parser.add_argument("--sequence", required=True, type=int, choices=(512, 2048, 8192))
+    parser.add_argument("--sequence", required=True, type=int, choices=SEQUENCES)
     parser.add_argument("--valid-length", type=int, help="key length to test")
     parser.add_argument("--rtp-marker", type=int, help="compiled register value for a runtime-length build")
     parser.add_argument("--fixture", type=Path, help="use captured float32 Q/K/V in an NPZ file")
@@ -101,8 +102,15 @@ def main():
         parser.error("--valid-length must be at least two and within the sequence")
 
     work = args.work.resolve()
-    work.mkdir(parents=True, exist_ok=True)
     sequence = args.sequence
+    build = args.build.resolve()
+    rtp_marker = args.rtp_marker
+    if (build / "attention.json").is_file():
+        check_artifact(build, sequence)
+        if rtp_marker not in (None, LENGTH_MARKER):
+            parser.error("--rtp-marker disagrees with the exported artifact")
+        rtp_marker = LENGTH_MARKER
+    work.mkdir(parents=True, exist_ok=True)
     shape = (HEADS, sequence, WIDTH)
     original = (captured_fixture(args.fixture, shape, valid_length) if args.fixture
                 else synthetic_fixture(shape, valid_length))
@@ -113,11 +121,10 @@ def main():
         tensors.append(from_bf16(bits))
 
     size_bytes = int(np.prod(shape)) * 2
-    build = args.build.resolve()
     instructions = build / "insts.bin"
-    if args.rtp_marker is not None:
+    if rtp_marker is not None:
         patched = work / "insts-length.bin"
-        patch_key_length(instructions, patched, args.rtp_marker, valid_length)
+        patch_key_length(instructions, patched, rtp_marker, valid_length)
         instructions = patched
     config = work / "attention.cfg"
     config.write_text(
