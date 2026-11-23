@@ -212,6 +212,21 @@ the first query attends to the last valid key. A third build was started at capa
 cascade stages. NPU execution, runtime masking for ordinary shorter or mixed-length
 inputs, and integrated encoder measurements remain open.
 
+The 2,051-valid-key build completed. An isolated runtime-parameter prototype also
+compiled at 512-token capacity. It writes a length register and releases a barrier on
+each of the 32 compute tiles before those tiles run the existing key-mask arithmetic.
+The transaction verifier found 32 distinct length writes and changed the mask from
+381 to 259 valid keys without changing the xclbin (SHA-256
+`25d9aaf2737ff0c4346c6042c2853f88d052563382a6ed6e74efe4e77b7eb246`).
+This verifies how the length is conveyed in the stream. The NPU parity check must
+still establish that the new value reaches each worker on repeated dispatches.
+An 8,192-capacity runtime-parameter build is in progress.
+
+GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
+the publisher CPU vectors with a minimum cosine of 0.999475. The observed single
+request timings were 83.2?86.0 s. The raw report is
+`.plans/bert/seq8192-quality-gte-multilingual_base.log`.
+
 ## Published GGUF candidates
 
 Five pinned Q4_K_M downloads matched their Hub SHA-256. The loader's compatibility depends on the
@@ -225,6 +240,18 @@ tensor types inside each file. The tag alone does not establish that coverage.
 | BGE large | CompendiumLabs, `03b9bf10` | F32, Q4_K and Q6_K. Runtime and quantized quality still to check. |
 | Nomic | Nomic AI, `0188c9bf` | Q4_K_M includes Q5_K. |
 | GTE | No matching published GGUF found in the initial Hub search | The current NPUE GGUF adapter accepts `bert` and `nomic-bert`. GTE needs its own conversion and loader validation. |
+
+A follow-up Hub search found a related [GPUStack reranker GGUF](https://huggingface.co/gpustack/gte-multilingual-reranker-base-GGUF)
+with `general.architecture=new` and the same fused projection tensor names. It is a
+separate checkpoint with different weights and rotary metadata. The isolated quantization
+experiment uses the original embedding checkpoint, whose tokenizer has 250,002 real
+pieces and whose embedding table has 250,048 rows. The spare 46 rows are marked unused
+in the GGUF vocabulary, and the exact publisher tokenizer is retained. The
+prototype emitted 138 tensors into a 348,620,160-byte Q8_0 GGUF and verified their
+names, source shapes and finite dequantized values on readback. SHA-256 is
+`c12175db0b1b7f2dc6daacc2e72dc0203b89921433e8d4f6cc5273c76bedc574`. The readback tensors were replayed through the
+existing GTE packer to stage an NPU quality check. A direct GGUF reader and
+validation through the standard installation path are still required.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
