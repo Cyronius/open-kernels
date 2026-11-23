@@ -190,6 +190,34 @@ during both measurements. The results establish a short-input regression worth a
 The quiet-machine production rate gate remains open. Raw results are in
 `.plans/bert/bench512-quality-*.log` and `.plans/bert/measure-exact.log`.
 
+## Local encoder stage profile
+
+All 16 cases completed with five warm measurements each on the Windows Strix Point
+host documented above. The local driver used 12 host threads divided across two
+encoder lanes. Every case was a single input and used the same four NPU GEMM routes
+per layer. MiniLM used 24 dispatches, BGE-large 96, and the other models 48.
+
+| Model | Input / capacity | Wall ms | NPU GEMM wait ms | NPU sync ms | Host QK and AV ms | Host softmax ms | Host norm ms | Conversion and bias ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MiniLM | 256 / 512 | 31.56 | 6.83 | 0.62 | 16.58 | 3.47 | 1.07 | 2.50 |
+| BGE small | 512 / 512 | 167.65 | 114.64 | 1.79 | 34.85 | 7.50 | 2.31 | 4.94 |
+| BGE base | 512 / 512 | 220.29 | 142.86 | 2.44 | 53.40 | 8.18 | 3.78 | 8.59 |
+| BGE large | 512 / 512 | 761.36 | 466.87 | 6.37 | 202.37 | 25.25 | 10.28 | 24.62 |
+| Nomic | 2048 / 2048 | 2002.67 | 329.68 | 11.71 | 1422.83 | 162.73 | 14.96 | 44.53 |
+| Nomic | 2048 / 8192 | 61591.80 | 553.43 | 21.81 | 58407.00 | 2361.66 | 65.11 | 157.57 |
+| Nomic | 8192 / 8192 | 61854.60 | 560.24 | 22.33 | 58659.10 | 2398.53 | 63.80 | 154.19 |
+| GTE | 512 / 512 | 305.66 | 193.66 | 2.99 | 56.08 | 9.84 | 4.32 | 31.72 |
+| GTE | 8192 / 8192 | 59871.10 | 589.37 | 21.26 | 56155.10 | 2453.07 | 64.10 | 515.47 |
+
+Columns report separate medians. The fused activation runs in the conversion path.
+The short cases showed large variation in device wait. For example, MiniLM at 64
+tokens ranged from 7.09 to 124.02 ms wall time, and its device wait ranged from 3.61
+to 117.80 ms. At 8,192 tokens, Nomic and GTE spent over 90% of the median call in
+the host QK and AV passes. Moving those operations remains the priority for long input.
+
+Raw report `.plans/bert/profile-matrix.log`, SHA-256
+`2a683c0d4cf24737e37fee381f45ae6d11aebabef62534d91f3f30bc5a5f8ab4`.
+
 ## MiniLM cold GGUF at 256 tokens
 
 OFLM packed the public Second State Q8_0 GGUF on first use in an isolated model
@@ -234,8 +262,8 @@ The in-progress host profile already has a paired Nomic measurement with the sam
 passes grew from 1.40?1.47 s to 50.06?63.78 s, while host softmax grew from
 0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. Five warm
 calls with an exact 8,192-token Nomic input took 61.00?63.71 s. Host QK and AV
-accounted for 57.68?60.46 s and softmax for 2.36?2.46 s. The first two GTE calls at
-8,192 tokens took 60.06 and 58.28 s, with 56.44 and 54.58 s in QK and AV.
+accounted for 57.68?60.46 s and softmax for 2.36?2.46 s. Five corresponding GTE
+calls took 58.28?61.68 s, with 54.58?58.04 s in QK and AV.
 
 A local integration build is queued on the two long-context families. It routes
 post-projection Q/K/V through the NPU attention image, selects the mask from the
@@ -245,8 +273,9 @@ each actual NPUE pack produced exact BF16 matches against the publisher tensors
 with Q multiplied by 1/8 and K and V unchanged. The GTE QKV bias matched the same
 scaling rule, and the Nomic bias was all zeros. The probe reverses that power-of-two
 scale during BF16 packing before using the checked attention image.
-The local probe reuses the static rotary table through 2,048 tokens and builds
-the dynamic table once per unique longer length in the request. It checks a
+The local probe built successfully with MSVC. It reuses the static rotary table
+through 2,048 tokens and builds the dynamic table once per unique longer length
+in the request. It checks a
 2,048 ? 8,192 ? 2,048 sequence within one instance. A same-binary host versus
 NPU timing comparison for GTE is queued after end-to-end parity. The serving code
 requires its own parity checks.
@@ -347,8 +376,13 @@ minimum cosine of 0.999379 against the original publisher CPU model. It passed
 [GGUF staging utility](../../utilities/bert-embeddings/stage_gte_gguf.py) reconstructs
 the tokenizer, tensors and equivalent legacy RoPE config using the GGUF as its only
 input. This leaves native NPUE packing and tokenizer generation to the existing
-packer. A cold OFLM check from that staged directory is queued at 512 tokens.
-Registry and automatic GGUF dispatch are still OFLM-side work.
+packer. Staging from GGUF alone produced the same dequantized weights as the
+validated replay, SHA-256
+`f122116c8429466db7d262be8466a366c34e7964ed3b02bd52e462587e81392e`.
+The tokenizer JSON also matched the publisher bytes. The isolated model directory
+contains only the reconstructed config, weights and tokenizer, so the queued
+512-token run will exercise a cold pack. Registry and automatic GGUF dispatch
+are still OFLM-side work.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
