@@ -130,6 +130,7 @@ def compare(record, texts, length, cpu, server, repeats):
             norms = np.linalg.norm(reference, axis=1) * np.linalg.norm(vectors, axis=1)
             record["cosine"] = float(np.min((reference * vectors).sum(axis=1) / norms))
     print(json.dumps(record, allow_nan=False), flush=True)
+    return record.get("cosine")
 
 
 def main():
@@ -145,6 +146,8 @@ def main():
     parser.add_argument("--cpu-reference", action="store_true")
     parser.add_argument("--cpu-checkpoint", type=Path,
                         help="use a different local checkpoint directory for the reference")
+    parser.add_argument("--min-cosine", type=float,
+                        help="fail if any single or batched embedding falls below this similarity")
     parser.add_argument("--max-input", type=int,
                         help="also check that the server rejects max-input + 1 tokens")
     parser.add_argument("--repeats", type=int, default=3)
@@ -155,6 +158,9 @@ def main():
         parser.error("select a backend and at least one timed repeat")
     if args.max_input is not None and (not args.url or args.max_input not in args.lengths):
         parser.error("--max-input requires a server and a matching length to test")
+    if args.min_cosine is not None and (not args.url or not (args.cpu_reference or args.cpu_checkpoint)
+                                        or not -1 <= args.min_cosine <= 1):
+        parser.error("--min-cosine requires both backends and a threshold between -1 and 1")
     if any(batch < 1 for batch in args.batches):
         parser.error("--batches must be positive")
 
@@ -168,16 +174,24 @@ def main():
     def server(texts, length):
         return embed_server_batch(url, args.model, args.prompt_name, texts, length)
 
+    similarities = []
     for length, text in cases:
         record = {"model": args.model, "tokens": length, "tail": text.split()[-1]}
-        compare(record, [text], length, cpu, server if url else None, args.repeats)
+        similarities.append(compare(record, [text], length, cpu, server if url else None, args.repeats))
 
     for length in args.lengths:
         texts = [text for size, text in cases if size == length]
         for batch in args.batches:
             inputs = [texts[index % len(texts)] for index in range(batch)]
             record = {"model": args.model, "tokens": length, "batch": batch}
-            compare(record, inputs, length, cpu, server if url else None, args.repeats)
+            similarities.append(compare(record, inputs, length, cpu, server if url else None, args.repeats))
+
+    parity_failure = False
+    if args.min_cosine is not None:
+        worst = min(similarities)
+        parity_failure = worst < args.min_cosine
+        print(json.dumps({"model": args.model, "worst_cosine": worst, "required_cosine": args.min_cosine,
+                          "parity_pass": not parity_failure}), flush=True)
 
     if args.max_input is not None:
         length, text = next(fixtures(tokenizer, [args.max_input + 1], args.prefix, args.mixed))
@@ -191,6 +205,9 @@ def main():
                 raise ValueError("over-limit input should be rejected with HTTP 400") from exc
         else:
             raise ValueError("server accepted an over-limit input")
+
+    if parity_failure:
+        raise ValueError("embedding parity missed the requested similarity threshold")
 
 
 if __name__ == "__main__":

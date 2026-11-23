@@ -284,7 +284,8 @@ capacity, head geometry, BF16 layout, scale, runtime length marker, and both pay
 hashes. The hardware checker uses that contract, and the integration probe checks
 it before starting the encoder. Offline validation accepted the two known images
 and rejected both a different requested capacity and a bit-changed instruction stream.
-An independent build through the exporter and a hardware smoke are queued.
+An independent 512-token build through the exporter passed manifest validation
+and reproduced the earlier instruction bytes. Its NPU smoke is queued.
 
 The existing bidirectional [FlashAttention design](../../open_kernels/designs/whisper_fa/README.md)
 compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder
@@ -327,8 +328,11 @@ caching all 32 tile register offsets from the original transaction. A 2,048-capa
 measure the intermediate route without padding attention to 8,192. The checker also
 accepts captured Q/K/V in float32, comparing the device output against float64
 attention over BF16-rounded inputs and reporting the extra error due to rounding the
-original tensors. The layer 0 and 11 GTE captures are queued at 512 and 8,192 tokens.
-Model-level quality and latency still need an integrated run.
+original tensors. Layers 0 and 11 were captured at 512 and 8,192 tokens. In the independent CPU
+calculation, BF16 input rounding alone gave a minimum sampled row cosine of
+0.9998407 and worst head-relative L2 of 0.006247 across the four captures.
+Raw report `.plans/bert/gte-real-qkv-rounding.jsonl`. NPU replay of these captures
+and model-level quality and latency still need validation.
 
 GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
 the publisher CPU vectors with a minimum cosine of 0.999475. The observed single
@@ -372,7 +376,10 @@ and a new output path and requires the Python `gguf`, `numpy` and `safetensors` 
 
 The replayed NPUE pack served 64- and 512-token single and batch-4 requests with a
 minimum cosine of 0.999379 against the original publisher CPU model. It passed
-`oflm-test --embedding`. The new
+`oflm-test --embedding`. The first exact 8,192-token fixture scored 0.999449
+against the publisher, with 79.6 s through HTTP. The second is running. The
+serving checker can enforce a named minimum cosine across all configured single
+and batch fixtures in addition to the token-count and input-limit checks. The new
 [GGUF staging utility](../../utilities/bert-embeddings/stage_gte_gguf.py) reconstructs
 the tokenizer, tensors and equivalent legacy RoPE config using the GGUF as its only
 input. This leaves native NPUE packing and tokenizer generation to the existing
