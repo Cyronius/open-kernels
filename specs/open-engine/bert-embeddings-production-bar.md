@@ -732,6 +732,11 @@ Startup evidence `.plans/bert/phlegm-gguf-startup.log`, SHA-256
   0.01234. This isolates the effect of quantization before the live NPU
   comparison. Raw report `.plans/bert/gte-q8-sparse-cpu.jsonl`, SHA-256
   `2cd5d9c15392178014f3ae7d7673602460ee47e69407a72f6d207845f7ee24c1`.
+- The same CPU comparison at 8,192 tokens preserved all 54 positive token
+  IDs. Sparse cosine was 0.999975 and the maximum score difference was
+  0.01618. The fixture is the one queued for the live Phlegm sparse check.
+  Raw report `.plans/bert/gte-q8-sparse-cpu-8192.json`, SHA-256
+  `ab39a4f90b2487d6b7eb711e1f99f8bfd86bfb87b17c335ab8c708da6a529156`.
 - Nomic accepted `search_query`, `search_document`, `clustering` and `classification`.
   All four vectors differed for the same text and matched their task-specific CPU references
   with a minimum cosine of 0.998892. Stock OFLM returned 768 values for a request
