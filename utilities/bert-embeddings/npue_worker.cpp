@@ -35,7 +35,8 @@ void reply(std::FILE* out, const Json& response) {
 }
 
 Json embed(npue::enc::Embedder& model, const Json& request,
-           const std::optional<npue::enc::GteSparseHead>& sparse_head) {
+           const std::optional<npue::enc::GteSparseHead>& sparse_head,
+           npue::npu::BertAttention* attention) {
     const bool text_input = request.contains("texts");
     if (!request.is_object() || text_input == request.contains("token_ids"))
         throw std::invalid_argument("provide either texts or token_ids");
@@ -44,6 +45,7 @@ Json embed(npue::enc::Embedder& model, const Json& request,
         throw std::invalid_argument("BERT embeddings require a nonempty array of inputs");
     const auto prompt = request.value("prompt_name", std::string{});
     const bool length_only = request.value("length_only", false);
+    const bool profile = request.value("profile", false);
     if (length_only && !text_input)
         throw std::invalid_argument("length_only requires text inputs");
     const bool return_sparse = request.value("return_sparse", false);
@@ -84,6 +86,16 @@ Json embed(npue::enc::Embedder& model, const Json& request,
     }
 
     int64_t tokens = 0;
+    double encode_ms = 0.0;
+    const auto encode = [&](auto&& call) {
+        model.set_request_timing(profile);
+        if (!profile) return call();
+        if (attention) attention->io_ms = attention->dispatch_ms = 0;
+        const auto start = npue::enc::now_s();
+        auto values = call();
+        encode_ms = (npue::enc::now_s() - start) * 1000;
+        return values;
+    };
     std::vector<float> values;
     if (text_input) {
         const auto names = model.prompt_names();
@@ -93,7 +105,7 @@ Json embed(npue::enc::Embedder& model, const Json& request,
             throw std::invalid_argument("unsupported prompt_name '" + prompt + "'");
         const auto texts = inputs.get<std::vector<std::string>>();
         if (length_only) return {{"ok", true}, {"fits", model.fits_texts(texts, prompt)}};
-        values = model.embed(texts, prompt, &tokens, inspect);
+        values = encode([&] { return model.embed(texts, prompt, &tokens, inspect); });
     } else {
         if (!prompt.empty())
             throw std::invalid_argument("include the task prefix in token_ids when tokenizing");
@@ -111,7 +123,7 @@ Json embed(npue::enc::Embedder& model, const Json& request,
                 ids.push_back(token.get<int32_t>());
             }
         }
-        values = model.embed_token_ids(token_ids, &tokens, inspect);
+        values = encode([&] { return model.embed_token_ids(token_ids, &tokens, inspect); });
     }
     if (values.size() != inputs.size() * width ||
         !std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); }))
@@ -128,6 +140,29 @@ Json embed(npue::enc::Embedder& model, const Json& request,
     }
     Json output = {{"ok", true}, {"tokens", tokens}, {"vectors", std::move(vectors)}};
     if (return_sparse) output["sparse_vectors"] = std::move(sparse);
+    if (profile) {
+        const auto& device = model.last_request_timing();
+        const auto& host = model.last_host_timing();
+        output["stage_timings"] = {
+            {"context_tokens", model.seq()},
+            {"projection_dispatches", device.n_dispatch},
+            {"encode_ms", encode_ms},
+            {"stages_ms", {
+                {"input_preparation", host.prepare_s * 1000},
+                {"pooling", host.pooling_s * 1000},
+                {"projection_npu", device.t_disp * 1000},
+                {"projection_sync", (device.t_in + device.t_out) * 1000},
+                {"projection_conversion_bias", (device.t_conv + device.t_bias) * 1000},
+                {"host_attention", device.t_attn * 1000},
+                {"host_softmax", device.t_hostsm * 1000},
+                {"host_normalization", device.t_hostln * 1000},
+                {"host_activation", device.t_hostgelu * 1000},
+                {"host_rotary", device.t_rope * 1000},
+                {"attention_io", attention ? attention->io_ms : 0},
+                {"attention_npu", attention ? attention->dispatch_ms : 0},
+            }},
+        };
+    }
     return output;
 }
 }
@@ -173,7 +208,7 @@ int main(int argc, char** argv) {
                          {"length_probe", true}});
         for (std::string line; std::getline(std::cin, line);) {
             try {
-                reply(protocol, embed(model, Json::parse(line), sparse));
+                reply(protocol, embed(model, Json::parse(line), sparse, attention.get()));
             } catch (const npue::InputTooLong& error) {
                 const auto message = "input " + std::to_string(error.index) + " is " +
                     std::to_string(error.n_tokens) + " tokens. The maximum is " +

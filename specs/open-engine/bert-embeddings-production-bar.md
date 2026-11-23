@@ -53,6 +53,17 @@ and dispatches one request at a time. Measure the added resident weights
 and context-switch cost before enabling the route by default. R-0003 and
 R-0008 in xdna2-notes document the cost of adding contexts for variants.
 
+The resident worker can report per-request stage timings to Phlegm `06c3e47`.
+`phlegm bench embed` records the selected context, projection dispatch count,
+total encoder time, and stage times alongside each worker round-trip sample.
+The stages cover input preparation, rotary transforms, projections and
+synchronization, host and NPU attention, normalization, activation, and
+pooling. Stage collection is requested by the benchmark. Older workers may
+omit it. The Windows CLI accepted synthetic profiles at contexts 64 and
+8,192 and rejected an invalid timing without writing a report. The runtime
+patch applied to the pinned OFLM source and reproduced the compiled worker
+header. Stage measurements from real Phlegm NPU requests remain open.
+
 The 512-token comparison also includes MiniLM as an exploratory run. Its encoder has 512 position
 embeddings and the publisher uses a 256-token truncation limit for serving. See the
 [MiniLM model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2),

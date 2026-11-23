@@ -89,7 +89,24 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
    // Device-resident weights, one slot per layer per design, plus the bias
    // pointers straight into the mapped file. Filled by stage_all().
-@@ -2795,8 +2854,16 @@
+@@ -1499,6 +1558,7 @@
+   // (narrow-to-bf16 instead of quantise, no scale) -- one flag, two datapaths,
+   // so --no-fuse-ffn A/Bs whichever one the loaded container actually uses.
+   bool fuse_ffn_epilogue = true;
++  double t_rope = 0.0;
+   double t_hostln = 0.0, t_hostsm = 0.0, t_hostgelu = 0.0;
+
+
+@@ -1531,7 +1591,7 @@
+     // from everything printed beside it (tasks/0086).
+     t_qk = t_av = 0.0;
+     t_npu = t_attn = 0.0;
+-    t_hostln = t_hostsm = t_hostgelu = 0.0;
++    t_hostln = t_hostsm = t_hostgelu = t_rope = 0.0;
+     t_conv = t_in = t_disp = t_out = t_bias = 0.0;
+     n_dispatch = 0;
+   }
+@@ -2795,8 +2855,16 @@
      pool->run([&](int w, int nw) {
        for (int64_t row = w; row < n_rows; row += nw) {
          const int64_t s = row % g_seq;    // [b][s] row order -> s = row % seq
@@ -108,15 +125,19 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
          float *row_base = p + row * row_stride;
          for (int64_t h = 0; h < g_heads; ++h) {
            rotate_pair(row_base + h * g_head_dim, cs, sn);              // Q
-@@ -2808,6 +2875,7 @@
+@@ -2808,6 +2876,11 @@
 
    std::vector<float> run(const std::vector<float> &emb_in) {
      std::vector<float> x = emb_in;
-+    if (g_rope) prepare_dynamic_nomic_rope();
++    if (g_rope) {
++      const double rotary_start = now_s();
++      prepare_dynamic_nomic_rope();
++      t_rope += now_s() - rotary_start;
++    }
      layer_norm(x, s_ln[0]);
 
      qkvbuf.resize(rows * 3 * g_hidden);
-@@ -2816,7 +2884,7 @@
+@@ -2816,7 +2889,7 @@
      up.resize(rows * (g_gated_ffn ? 2 : 1) * g_ffn);
      if (g_gated_ffn) gated.resize(rows * g_ffn);
      down.resize(rows * g_hidden);
@@ -125,10 +146,12 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
      residual.resize(x.size());
      // Set by the PREVIOUS iteration's fused LayerNorm, which already wrote
-@@ -2835,30 +2903,34 @@
+@@ -2833,32 +2906,40 @@
+       // per-position rotation of the projected q/k, not of the input) and
+       // strictly before qk() reads them. No-op (false) for every arch=0
        // container.
-       if (g_rope) apply_rope_qkv(qkvbuf);
-
+-      if (g_rope) apply_rope_qkv(qkvbuf);
+-
 -      double ta = now_s();
 -      // QK^T per head, on the host: [64,32]x[32,64] does not tile (head_dim 32
 -      // fails the whole-array design's M % (m*4) == 0).
@@ -142,6 +165,12 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 -
 -      if (host_sm) {
 -        softmax_cpu(scores);  // applies add_mask itself
++      if (g_rope) {
++        const double rotary_start = now_s();
++        apply_rope_qkv(qkvbuf);
++        t_rope += now_s() - rotary_start;
++      }
++
 +      if (attention_probe) {
 +        attention_probe(qkvbuf, add_mask, ctx, batch);
        } else {
@@ -183,7 +212,18 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 
        gemm(attn_out, is_ao, ctx, s_ao[L], b_ao[L], proj, g_hidden,
             i8w(ws_ao, L), i8w(as_ao, L));
-@@ -4524,26 +4596,24 @@
+@@ -4504,6 +4585,10 @@
+   Encoder *lead;
+   std::vector<Encoder *> all;
+   int64_t fallback_batch;
++  struct HostTiming {
++    double prepare_s = 0.0, pooling_s = 0.0;
++  };
++  HostTiming *host_timing = nullptr;
+
+   // Greedy against the tier ladder: 64 texts with tiers {4,16,32,128}
+   // becomes 32+32, both exact, instead of one half-padded 128.
+@@ -4524,26 +4609,25 @@
      return jobs;
    }
 
@@ -204,6 +244,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +  void chunk(Encoder &e, const EncodeInput &encode_input,
 +             int64_t base, int64_t take, std::vector<float> &out,
 +             int64_t *tokens, const InspectRows &inspect) const {
++    const double prepare_start = host_timing ? now_s() : 0.0;
      const size_t row_floats = static_cast<size_t>(g_seq) * g_hidden;
      const int64_t bt = e.use_tier(take);
      std::vector<float> buf(static_cast<size_t>(bt) * row_floats, 0.f);
@@ -221,7 +262,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
        // `base + b` is the caller's own index. Tiers are an implementation
        // detail of how this runtime batches, and naming a tier-local row
        // would send someone looking at the wrong text.
-@@ -4561,18 +4631,46 @@
+@@ -4561,18 +4645,49 @@
          for (int64_t c = 0; c < g_hidden; ++c)
            dst[c] = wv[c] + pv[c] + w_typ[c];
        }
@@ -231,13 +272,16 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +      }
      }
      e.add_mask = cmask;
++    if (host_timing) host_timing->prepare_s += now_s() - prepare_start;
      auto h = e.run(buf);
 +    if (inspect) {
 +      for (int64_t b = 0; b < take; ++b)
 +        inspect(base + b, {h.data() + b * row_floats, input_ids[b].size() * g_hidden},
 +                input_ids[b]);
 +    }
++    const double pooling_start = host_timing ? now_s() : 0.0;
      pool_rows(h.data(), cam.data(), take, out.data() + base * g_hidden);
++    if (host_timing) host_timing->pooling_s += now_s() - pooling_start;
      if (tokens) *tokens += ntok;
    }
 
@@ -271,7 +315,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
      std::atomic<int64_t> tok_total{0};
      if (all.size() > 1 && jobs.size() > 1) {
        std::atomic<size_t> next{0};
-@@ -4591,8 +4689,7 @@
+@@ -4591,8 +4706,7 @@
            if (stop.load(std::memory_order_relaxed)) return;
            try {
              int64_t nt = 0;
@@ -281,7 +325,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
              tok_total += nt;
            } catch (...) {
              // First one wins. Which job reports first is a thread race, so
-@@ -4616,7 +4713,7 @@
+@@ -4616,7 +4730,7 @@
      } else {
        for (const auto &j : jobs) {
          int64_t nt = 0;
@@ -290,7 +334,7 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
          tok_total += nt;
        }
      }
-@@ -4692,15 +4789,43 @@
+@@ -4692,15 +4806,56 @@
    // allowed to be guessed.
    std::vector<float> embed(const std::vector<std::string> &texts,
                             const std::string &prompt_name = std::string(),
@@ -318,6 +362,19 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +    });
 +  }
 +
++  void set_request_timing(bool enabled) {
++    if (enabled && stack_.n_lanes != 1)
++      throw std::invalid_argument("NPUE request timing requires one encoder lane");
++    svc_.host_timing = enabled ? &host_timing_ : nullptr;
++    if (enabled) {
++      host_timing_ = {};
++      stack_.lead->reset_timers();
++    }
++  }
++
++  const Encoder &last_request_timing() const { return *stack_.lead; }
++  const EmbedService::HostTiming &last_host_timing() const { return host_timing_; }
++
 +  const npue::File &packed_model() const { return model_; }
 +  std::array<int32_t, 4> unigram_special_ids() const {
 +    const auto *tok = svc_.tok.xlmr.get();
@@ -338,3 +395,10 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
    int lanes() const { return stack_.n_lanes; }
    size_t vocab_size() const { return svc_.tok.vocab_size(); }
    std::vector<std::string> prompt_names() const { return prompt_names_sorted(); }
+@@ -4760,5 +4915,6 @@
+   npu::Device dev_;
+   Stack stack_;
+   EmbedService svc_;
++  EmbedService::HostTiming host_timing_;
+   std::mutex call_mu_;
+ };
