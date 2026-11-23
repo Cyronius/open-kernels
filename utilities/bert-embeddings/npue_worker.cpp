@@ -3,6 +3,7 @@
 #include "bert_attention.hpp"
 #include "bert_attention_files.hpp"
 #include "embedding_width.hpp"
+#include "gte_sparse.hpp"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -33,7 +34,8 @@ void reply(std::FILE* out, const Json& response) {
         throw std::runtime_error("write to the embedding client failed");
 }
 
-Json embed(npue::enc::Embedder& model, const Json& request) {
+Json embed(npue::enc::Embedder& model, const Json& request,
+           const std::optional<npue::enc::GteSparseHead>& sparse_head) {
     const bool text_input = request.contains("texts");
     if (!request.is_object() || text_input == request.contains("token_ids"))
         throw std::invalid_argument("provide either texts or token_ids");
@@ -41,6 +43,26 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
     if (!inputs.is_array() || inputs.empty())
         throw std::invalid_argument("BERT embeddings require a nonempty array of inputs");
     const auto prompt = request.value("prompt_name", std::string{});
+    const bool return_sparse = request.value("return_sparse", false);
+    if (return_sparse && !sparse_head)
+        throw std::invalid_argument("this embedding pack does not provide GTE sparse output");
+    std::vector<Json> sparse;
+    npue::enc::EmbedService::InspectRows inspect;
+    if (return_sparse) {
+        sparse.resize(inputs.size());
+        inspect = [&](size_t index, std::span<const float> hidden, std::span<const int32_t> ids) {
+            auto scores = sparse_head->score(hidden, ids);
+            std::vector<int32_t> indices;
+            std::vector<float> values;
+            indices.reserve(scores.size());
+            values.reserve(scores.size());
+            for (const auto& [id, score] : scores) {
+                indices.push_back(id);
+                values.push_back(score);
+            }
+            sparse[index] = {{"indices", std::move(indices)}, {"values", std::move(values)}};
+        };
+    }
     const auto width = static_cast<size_t>(model.hidden());
     const bool nomic = width == 768 && is_nomic_v15(model);
     const bool gte = width == 768 && model.source_repo() == "Alibaba-NLP/gte-multilingual-base";
@@ -66,7 +88,7 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
             throw std::invalid_argument("prompt_name is required. Choose from " + npue::enc::join_names(names));
         if (!prompt.empty() && std::find(names.begin(), names.end(), prompt) == names.end())
             throw std::invalid_argument("unsupported prompt_name '" + prompt + "'");
-        values = model.embed(inputs.get<std::vector<std::string>>(), prompt, &tokens);
+        values = model.embed(inputs.get<std::vector<std::string>>(), prompt, &tokens, inspect);
     } else {
         if (!prompt.empty())
             throw std::invalid_argument("include the task prefix in token_ids when tokenizing");
@@ -84,7 +106,7 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
                 ids.push_back(token.get<int32_t>());
             }
         }
-        values = model.embed_token_ids(token_ids, &tokens);
+        values = model.embed_token_ids(token_ids, &tokens, inspect);
     }
     if (values.size() != inputs.size() * width ||
         !std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); }))
@@ -99,7 +121,9 @@ Json embed(npue::enc::Embedder& model, const Json& request) {
         vectors.push_back(nomic ? npue::enc::nomic_matryoshka({row, width}, dimensions) :
                                  npue::enc::normalize_embedding_prefix({row, width}, dimensions));
     }
-    return {{"ok", true}, {"tokens", tokens}, {"vectors", std::move(vectors)}};
+    Json output = {{"ok", true}, {"tokens", tokens}, {"vectors", std::move(vectors)}};
+    if (return_sparse) output["sparse_vectors"] = std::move(sparse);
+    return output;
 }
 }
 
@@ -122,6 +146,11 @@ int main(int argc, char** argv) {
         if (argc == 4) files = npue::npu::load_bert_attention(argv[3]);
         std::unique_ptr<npue::npu::BertAttention> attention;
         npue::enc::Embedder model({argv[1], argv[2], 12, 1});
+        std::optional<npue::enc::GteSparseHead> sparse;
+        const auto& packed = model.packed_model();
+        if (model.source_repo() == "Alibaba-NLP/gte-multilingual-base" &&
+            (packed.has("sparse.weight") || packed.has("sparse.bias")))
+            sparse.emplace(packed, model.unigram_special_ids());
         if (is_nomic_v15(model)) model.enable_nomic_dynamic_rope();
         if (files) {
             if (files->sequence != model.seq())
@@ -134,10 +163,10 @@ int main(int argc, char** argv) {
         }
         reply(protocol, {{"ok", true}, {"protocol", 1}, {"dimensions", model.hidden()},
                          {"context", model.seq()}, {"npu_attention", bool(attention)},
-                         {"prompt_names", model.prompt_names()}});
+                         {"prompt_names", model.prompt_names()}, {"sparse", bool(sparse)}});
         for (std::string line; std::getline(std::cin, line);) {
             try {
-                reply(protocol, embed(model, Json::parse(line)));
+                reply(protocol, embed(model, Json::parse(line), sparse));
             } catch (const npue::InputTooLong& error) {
                 const auto message = "input " + std::to_string(error.index) + " is " +
                     std::to_string(error.n_tokens) + " tokens. The maximum is " +

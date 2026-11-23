@@ -896,6 +896,6 @@
     "files": [
       "src/open_npue/npue_encoder.hpp"
     ],
-    "scope": "NPUE encoder hooks for the BERT probe and resident worker, including NPU attention, Nomic v1.5 rotary scaling and pretokenized input"
+    "scope": "NPUE encoder hooks for the BERT probe and resident worker, including NPU attention, Nomic v1.5 rotary scaling, pretokenized input and access to final token rows for GTE sparse scoring"
   }
 }

@@ -578,8 +578,15 @@ Runtime parity for the extended quantized pack remains open.
   `0d971e06a80b016e4efa67989dec272d564ddfdd0c934d2e4ec9c8967baa7cd3`
   preserves all 150 existing tensors byte for byte. On English and Chinese
   fixtures, applying these tensors to the publisher CPU model's final hidden
-  states reproduced `GteForTokenClassification` logits exactly. Sparse scoring
-  from the NPU encoder's hidden states and HTTP exposure remain open.
+  states reproduced `GteForTokenClassification` logits exactly.
+- Phlegm accepts `return_sparse: true` for GTE packs carrying the head.
+  The worker scores occupied token rows from the resident encoder. Each item
+  returns its dense vector and `sparse_embedding` with sorted token-ID indices
+  and positive scores. Special IDs are excluded, and repeated token IDs keep
+  their highest score. The native scoring replay on publisher CPU hidden states
+  matched all positive IDs on English, Chinese and 8,192-token fixtures. The
+  maximum absolute score difference was 4.77e-7. Live sparse parity through the
+  quantized NPU route remains open.
 - Nomic accepted `search_query`, `search_document`, `clustering` and `classification`.
   All four vectors differed for the same text and matched their task-specific CPU references
   with a minimum cosine of 0.998892. Stock OFLM returned 768 values for a request
@@ -599,6 +606,8 @@ GTE elastic replay `.plans/bert/gte-elastic-native.log`, SHA-256
 `baadf3a3268aac18b105abc485aeda045fcc7b555a6ee79d525bdb759ec180e5`.
 Classifier check `.plans/bert/gte-sparse-head-check.log`, SHA-256
 `09bea59684021247b3d9d9b82ab788c1db5c394f9488b6d7e0480f15d98e536b`.
+Native sparse replay `.plans/bert/gte-sparse-native.log`, SHA-256
+`4367ef8b69b4eb553ed7a10831b095fac794cf8ead8d356ce262ea0770494f73`.
 
 ## OFLM side
 
