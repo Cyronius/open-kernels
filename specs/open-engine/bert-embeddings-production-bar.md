@@ -753,6 +753,13 @@ Startup evidence `.plans/bert/phlegm-gguf-startup.log`, SHA-256
   End-to-end Phlegm validation remains open while the Inkling run holds the
   shared NPU lock. Raw report `.plans/bert/nomic-matryoshka-native.log`, SHA-256
   `e5c0433b2b8694a3605a80b5f0f3c2a0d38f43c7046805c83c7af6444c26d0bc`.
+- A CPU replay of the publisher's Nomic Q8_0 GGUF matched the original
+  checkpoint using dynamic RoPE at 2,048 and 8,192 tokens. Across dimensions
+  64, 128, 256, 512 and 768 the minimum cosines were 0.99840 and 0.99821,
+  respectively. The GGUF has all 30,522 tokenizer IDs. The original
+  checkpoint has six additional, unassigned vocabulary padding rows.
+  Raw report `.plans/bert/nomic-q8-cpu-context-parity.json`, SHA-256
+  `13dc285fb34e1bc3f2ce297ef5a84c2e99cfe2a01a86c56c97b2931badba5f00`.
 
 Raw report `.plans/bert/features.log`, SHA-256
 `52028291087aa646355099bce62fd0a3053bfa0df835e1f21bd20ce60d224901`.
