@@ -659,6 +659,13 @@ unscaled sources. The adapter reverses the Q fold before the FlashAttention
 image applies its native scale. CPU reference captures at the first and last
 layers of all three encoders are staged for device comparison.
 
+The queued run checks each candidate independently. A candidate enters the
+serving and benchmark trials only after its synthetic mask tests and both
+layer captures pass on the device with the same artifact manifest. The run
+then pairs host and NPU attention on identical full-context fixtures at
+batch sizes one and four. Synthetic runner checks verified that a failing
+candidate and a mismatched manifest hash both keep host attention selected.
+
 The hardware accuracy, dispatch and HTTP gates remain open. Raw instruction
 and ELF report `.plans/bert/attention-shape-offline.log`, SHA-256
 `bf1ced9c0716cf7da08a6f1e92c8139bffba57f697920db5a8077fd7922710de`.
