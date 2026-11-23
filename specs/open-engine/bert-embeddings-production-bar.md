@@ -5,6 +5,10 @@ The OFLM inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`.
 `oflm bench-embed TAG` reports encoder latency and throughput across batch sizes.
 The Phlegm development route uses `phlegm serve --embed-model PACK --embed-worker EXE
 --embed-design DIR [--embed-attention DIR]`.
+`phlegm bench embed` uses the same resident adapter. Its JSON records exact
+fixture token counts, worker latency with IPC, median throughput, machine
+metadata and artifact hashes. HTTP remains separately measured with
+`utilities/bert-embeddings/check.py`.
 
 ## Production bar
 
@@ -26,6 +30,14 @@ The Phlegm development route uses `phlegm serve --embed-model PACK --embed-worke
 | `bge-large:en-v1.5` | 512 | `BERT-h1024-bfp16` |
 | `nomic-embed-text:v1.5` | 8,192 with the publisher's dynamic RoPE scaling | `BERT-h768-gated-bfp16` |
 | `gte-multilingual:base` | 8,192 | `BERT-h768-gated-bfp16` |
+
+The Phlegm `5103c86` release build passed a synthetic benchmark with text and
+8,192-ID inputs, rejecting token-count mismatches and preserving existing
+reports. The six-model hardware matrix is staged with Q8_0 packs, mixed exact
+fixtures and batches of one and four. It covers 64 tokens and the lengths in
+the table, plus 512 tokens for both long-context models. The live Inkling
+session still owns the shared NPU. Hardware results through this entry point
+remain open.
 
 The 512-token comparison also includes MiniLM as an exploratory run. Its encoder has 512 position
 embeddings and the publisher uses a 256-token truncation limit for serving. See the
