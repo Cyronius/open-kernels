@@ -57,6 +57,14 @@ and [GTE model card](https://huggingface.co/Alibaba-NLP/gte-multilingual-base).
   [revision 9bbca17](https://huggingface.co/Alibaba-NLP/gte-multilingual-base/tree/9bbca17d9273fd0d03d5725c7a4b0f6b45142062)
   exactly matches the recorded Git blob hash, `9f640b05ee684e9680fdc90000de85559061c5ef`, and the isolated
   pack succeeded with it.
+- The current publisher config encodes the same GTE rotary frequencies as the pinned config.
+  For head width 64 the legacy formula uses base `20000 * 8` and divides frequencies by
+  `8 ** (2 / 64)`. The current linear formula specifies that base and divisor directly.
+  All 32 frequencies agreed exactly in the comparison. Translating the equivalent metadata
+  in an isolated directory and running the existing packer produced the same 8,192-position
+  NPUE bytes as the pinned checkpoint. Both packs have SHA-256
+  `c4b1c592b7164de7e6559abab7e4b7f000a7c8cd0e4e6be04f97e0292d83bbdc`.
+  Raw evidence is in `.plans/bert/gte-current.log`.
 
 Use [the comparison utility](../../utilities/bert-embeddings/check.py) with a local checkpoint directory
 to make the same exact-length requests to OFLM and the checkpoint's CPU implementation. Use
@@ -128,6 +136,11 @@ coverage. Raw report `.plans/bert/seq512-quality-all-minilm_l6-v2.log`, SHA-256
 BGE small served both 512-token requests at CPU cosines 0.999982–0.999984. Its embedding suite
 passed. An exact 513-token request received HTTP 500 with a generic server error. The engine
 rejected the oversized input, and the REST layer needs to expose that as a client error.
+
+The publisher checkpoint packs for BGE-base, BGE-large, Nomic and GTE also served both
+512-token fixtures. Their minimum CPU cosines were 0.999585, 0.999442, 0.997504 and 0.999394,
+respectively. In each case the over-limit request returned HTTP 500. Raw checks are in
+`.plans/bert/seq512-quality-*.log`.
 
 The single-sequence 8,192-token Nomic/GTE experiment compiled and passed the artifact checker.
 It uses four streams and the same 8,192 total rows as the largest release tier. Its
