@@ -86,6 +86,24 @@ at 32 and 64 tokens passed the server's token-count, model identity and normaliz
 Raw reports are under `.plans/bert/release-quality-*.log` and `.plans/bert/release-oflm-test-*.log`
 in the bring-up worktree.
 
+The matched control used 64-token varied fixtures, three warmed timed requests per case, and
+batch sizes 1, 4 and 16. The CPU reference used FP32 PyTorch with four threads. This table gives
+the batch-16 median wall times and the lowest CPU cosine in each batch.
+
+| Model | OFLM HTTP, ms | CPU, ms | CPU / OFLM | Lowest cosine |
+|---|---:|---:|---:|---:|
+| MiniLM | 52.62 | 134.91 | 2.56 | 0.999559 |
+| BGE small | 123.78 | 270.79 | 2.19 | 0.999989 |
+| BGE base | 322.81 | 1,014.43 | 3.14 | 0.999789 |
+| BGE large | 575.14 | 3,156.25 | 5.49 | 0.999603 |
+| Nomic | 399.83 | 1,285.73 | 3.22 | 0.998692 |
+| GTE | 387.97 | 1,259.27 | 3.25 | 0.999531 |
+
+All six checks returned the requested 1,024 batch tokens. Dibs ended the run as NOISY and
+reported a concurrent Inkling benchmark process. Treat these timings as provisional and repeat
+the comparison on a quiet machine before closing the performance gate. Raw measurements are
+under `.plans/bert/bench64-quality-*.log`.
+
 ## 512-token candidate
 
 All five families compiled and passed the design checker on the same Windows toolchain. Each
