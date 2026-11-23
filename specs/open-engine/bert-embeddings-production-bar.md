@@ -206,12 +206,27 @@ original theta at or below 2,048 tokens and scales it as the sequence grows. A
 diagnostic pack changed only theta to 7453.483032, the value for an exact 8,192-token
 request. It reduced cosine at 2,048 tokens to 0.939621 and 0.940555, compared with
 0.997938 and 0.997862 on the original pack. On the first full-length fixture it
-restored cosine from 0.456015 to 0.997399, with all 150 packed tensor payloads
-unchanged. The second full-length control is still running. The rotary base must be
+restored cosine from 0.456015 to 0.997399. The second changed from 0.455719 to
+0.997418. All 150 packed tensor payloads were unchanged. The rotary base must be
 selected by each input's true length, across both request order and batches. For
 length L above 2048, the publisher's dynamic NTK base in this model is
 1000 ? (2L/2048 ? 1)^(64/62). At or below 2048 it is 1000.
-Raw report `.plans/bert/rope-fixed-seq8192-quality-nomic-embed-text_v1.5.log`.
+Raw report `.plans/bert/rope-fixed-seq8192-quality-nomic-embed-text_v1.5.log`,
+SHA-256 `c7ae0cb66d7f9b44e7838660c31f8f096b56fd8093987e2449570c19df79dda3`.
+
+The in-progress host profile already has a paired Nomic measurement with the same
+2,048-token input. In five warm runs the 2,048-capacity view took 1.95?2.05 s. Two
+warm runs padded to 8,192 took 53.28 and 57.65 s. The host QK and AV passes grew from
+1.40?1.47 s to 50.06 and 54.50 s, while host softmax grew from 0.16?0.18 s to
+2.38 and 2.33 s. The profile measures a local encoder call. Its remaining
+cases, including actual 8,192-token input, are still running.
+
+A local integration build is queued on the two long-context families. It routes
+post-projection Q/K/V through the NPU attention image, selects the mask from the
+actual input length, and chooses Nomic's rotary table per input. The existing NPUE
+weight layout folds the attention scale into Q. The probe reverses that power-of-two
+scale during BF16 packing before using the already checked attention image.
+The local prototype and the serving code require their own parity checks.
 
 The existing bidirectional [FlashAttention design](../../open_kernels/designs/whisper_fa/README.md)
 compiled at 512 and 8,192 tokens with 12 heads and head width 64, the gated encoder
