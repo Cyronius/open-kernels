@@ -600,6 +600,21 @@ MiniLM's 512-token run is exploratory beyond its published 256-token serving lim
 are under `.plans/bert/q8-long-quality-*.log`. This verifies the staged weights and kernels
 while the automatic release pack still needs to preserve those position rows.
 
+The CPU replay also compared these four Q8_0 GGUFs with their publisher
+checkpoints at the serving limits. Each comparison used two mixed inputs.
+Every tokenizer ID matched the rebuilt WordPiece vocabulary. The comparison
+pools the final hidden states, so the original classifier pooler is unused.
+
+| Model | Input tokens | Minimum cosine |
+|---|---:|---:|
+| MiniLM | 256 | 0.999767 |
+| BGE small | 512 | 0.999891 |
+| BGE base | 512 | 0.999900 |
+| BGE large | 512 | 0.999910 |
+
+Raw report `.plans/bert/bert-absolute-q8-cpu-limit-parity.json`, SHA-256
+`071b2f20cfbb63c67ada7416b20dae9a196dc766df465e43c54d38a681a752ca`.
+
 The staged Nomic Q8_0 pack also served exact 512-token singles and batch 4 with
 `search_document`. The minimum CPU cosine was 0.997649. The unmodified OFLM test suite
 still failed its generic requests without the required prompt. This run covers 512 tokens
