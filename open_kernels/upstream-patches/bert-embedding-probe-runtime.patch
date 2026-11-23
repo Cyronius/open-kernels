@@ -1,0 +1,153 @@
+diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
+--- a/src/open_npue/npue_encoder.hpp
++++ b/src/open_npue/npue_encoder.hpp
+@@ -38,6 +38,8 @@
+ // main.cpp, where its only callers (`--bench`) live.
+
+ #pragma once
++
++#include "nomic_rope.hpp"
+
+ #include <algorithm>
+ #include <array>
+@@ -1445,6 +1447,8 @@
+   // MB of allocate-and-touch per encode at batch 128, and ~280 MB at
+   // bge-large's width. resize() after the first call is a no-op.
+   std::vector<float> qkvbuf, ctx, proj, up, down, scores;
++  std::function<void(const std::vector<float>&, const std::vector<float>&,
++                     std::vector<float>&, int64_t)> attention_probe;
+   // arch=2 only: swiglu_cpu()'s output, [rows][g_ffn] -- a separate buffer
+   // from `up` because an in-place version of this compaction is NOT safe
+   // under threading (see swiglu_cpu's own comment). Empty/unused for every
+@@ -1460,6 +1464,37 @@
+   // duplicating it for a second arch would be the actual mistake.
+   std::vector<float> rope_cos, rope_sin;
+   bool rope_ready = false;
++  using RotaryTable = std::pair<std::vector<float>, std::vector<float>>;
++  std::map<int64_t, RotaryTable> rotary_tables;
++  std::vector<const RotaryTable*> rotary_by_input;
++
++  void prepare_dynamic_nomic_rope() {
++    rotary_by_input.clear();
++    rotary_tables.clear();
++    const char* opt = std::getenv("NPUE_NOMIC_DYNAMIC_ROPE");
++    if (!opt || std::string(opt) != "1" || g_rope_theta != 1000.0 ||
++        model.config_string("arch") != "nomic_bert_rope_swiglu")
++      return;
++    constexpr int64_t original_context = 2048;
++    if (add_mask.size() != static_cast<size_t>(batch * g_seq))
++      throw std::runtime_error("Nomic rotary mask shape disagrees with the batch");
++    rotary_by_input.resize(batch, nullptr);
++    for (int64_t b = 0; b < batch; ++b) {
++      const auto begin = add_mask.begin() + b * g_seq;
++      const int64_t context = std::count(begin, begin + g_seq, 0.0f);
++      if (context <= original_context) continue;
++      auto [table, added] = rotary_tables.try_emplace(context);
++      rotary_by_input[b] = &table->second;
++      if (added) {
++        auto &[cosine, sine] = table->second;
++        cosine.resize(g_seq * g_head_dim);
++        sine.resize(g_seq * g_head_dim);
++        const auto theta = npue::npu::nomic_v15_rope_base(context);
++        npue::gemma_rope_tables(g_seq, g_head_dim, theta, cosine.data(), sine.data());
++      }
++    }
++    if (rotary_tables.empty()) rotary_by_input.clear();
++  }
+
+   // Device-resident weights, one slot per layer per design, plus the bias
+   // pointers straight into the mapped file. Filled by stage_all().
+@@ -2795,8 +2830,16 @@
+     pool->run([&](int w, int nw) {
+       for (int64_t row = w; row < n_rows; row += nw) {
+         const int64_t s = row % g_seq;    // [b][s] row order -> s = row % seq
+-        const float *cs = cos_p + s * g_head_dim;
+-        const float *sn = sin_p + s * g_head_dim;
++        const float* cos_base = cos_p;
++        const float* sin_base = sin_p;
++        if (!rotary_by_input.empty()) {
++          if (const auto* table = rotary_by_input[row / g_seq]) {
++            cos_base = table->first.data();
++            sin_base = table->second.data();
++          }
++        }
++        const float *cs = cos_base + s * g_head_dim;
++        const float *sn = sin_base + s * g_head_dim;
+         float *row_base = p + row * row_stride;
+         for (int64_t h = 0; h < g_heads; ++h) {
+           rotate_pair(row_base + h * g_head_dim, cs, sn);              // Q
+@@ -2808,6 +2851,7 @@
+
+   std::vector<float> run(const std::vector<float> &emb_in) {
+     std::vector<float> x = emb_in;
++    if (g_rope) prepare_dynamic_nomic_rope();
+     layer_norm(x, s_ln[0]);
+
+     qkvbuf.resize(rows * 3 * g_hidden);
+@@ -2816,7 +2860,7 @@
+     up.resize(rows * (g_gated_ffn ? 2 : 1) * g_ffn);
+     if (g_gated_ffn) gated.resize(rows * g_ffn);
+     down.resize(rows * g_hidden);
+-    scores.resize(batch * g_heads * g_seq * g_seq);
++    if (!attention_probe) scores.resize(batch * g_heads * g_seq * g_seq);
+
+     residual.resize(x.size());
+     // Set by the PREVIOUS iteration's fused LayerNorm, which already wrote
+@@ -2835,30 +2879,34 @@
+       // container.
+       if (g_rope) apply_rope_qkv(qkvbuf);
+
+-      double ta = now_s();
+-      // QK^T per head, on the host: [64,32]x[32,64] does not tile (head_dim 32
+-      // fails the whole-array design's M % (m*4) == 0).
+-      // 1/sqrt(head_dim) is already folded into Q by the .npue.
+-      //
+-      // head_dim is 32 = four AVX2 vectors, and the 32 floats of one head ARE
+-      // contiguous even though consecutive rows are 3*hidden apart. So the dot
+-      // product vectorises without any repacking.
+-      qk(qkvbuf, scores);
+-      t_attn += now_s() - ta; t_qk += now_s() - ta;
+-
+-      if (host_sm) {
+-        softmax_cpu(scores);  // applies add_mask itself
++      if (attention_probe) {
++        attention_probe(qkvbuf, add_mask, ctx, batch);
+       } else {
+-        add_additive_mask(scores);
+-        eltwise(softmax, scores.data(), scores.size());
+-      }
+-
+-      ta = now_s();
+-      // A.V. Each (b, h, i) owns its own 32 output floats, so this accumulates
+-      // in registers and stores once -- no zero-fill of ctx needed, and no
+-      // sharing between threads.
+-      av(scores, qkvbuf, ctx);
+-      t_attn += now_s() - ta; t_av += now_s() - ta;
++        double ta = now_s();
++        // QK^T per head, on the host: [64,32]x[32,64] does not tile (head_dim 32
++        // fails the whole-array design's M % (m*4) == 0).
++        // 1/sqrt(head_dim) is already folded into Q by the .npue.
++        //
++        // head_dim is 32 = four AVX2 vectors, and the 32 floats of one head ARE
++        // contiguous even though consecutive rows are 3*hidden apart. So the dot
++        // product vectorises without any repacking.
++        qk(qkvbuf, scores);
++        t_attn += now_s() - ta; t_qk += now_s() - ta;
++
++        if (host_sm) {
++          softmax_cpu(scores);  // applies add_mask itself
++        } else {
++          add_additive_mask(scores);
++          eltwise(softmax, scores.data(), scores.size());
++        }
++
++        ta = now_s();
++        // A.V. Each (b, h, i) owns its own 32 output floats, so this accumulates
++        // in registers and stores once -- no zero-fill of ctx needed, and no
++        // sharing between threads.
++        av(scores, qkvbuf, ctx);
++        t_attn += now_s() - ta; t_av += now_s() - ta;
++      }
+
+       gemm(attn_out, is_ao, ctx, s_ao[L], b_ao[L], proj, g_hidden,
+            i8w(ws_ao, L), i8w(as_ao, L));

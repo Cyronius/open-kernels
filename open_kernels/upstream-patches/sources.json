@@ -889,5 +889,13 @@
       "src/open_qwen36/gguf_pack_test.cpp": "bbbc51d51b13fd8db21fc39d1119c691738736c12b8358ec3dcfa69728976969"
     },
     "note": "P5 S1, OPEN-GGUF-DENSE: code-preserving Q4_K with f32 scale products and one RNE bf16 rounding; GGUF q8_perm uses existing padded 5120-byte half-tiles, keeps Q8_0 codes and requantizes Q6_K per 32 at bf16(amax/127). Higher-precision inputs to std_perm_gguf are refused rather than refitted to four bits. Existing lmhead_q8 reciprocal arithmetic and subnormal fix unchanged. No manifest ABI, dispatch, DIT7 or probability-hi/lo change. Applies to a reflink copy of nanbeige-runtime at target/npu-dev/p5/runtime; round trip verified, bridge in p5/bridges/dense. Per-layer export remains blocked pending S2; offline tests do not accept NPU execution."
+  },
+  "bert_embedding_probe": {
+    "source_head": "9b1409d3e150e3602936307f5ff725c7bb4ac8af",
+    "patch": "bert-embedding-probe-runtime.patch",
+    "files": [
+      "src/open_npue/npue_encoder.hpp"
+    ],
+    "scope": "Opt-in NPUE benchmark hooks for NPU attention and Nomic v1.5 rotary scaling; no serving changes"
   }
 }

@@ -302,6 +302,22 @@ NPUE-scaled QKV layout, and returns token-major FP32. Raw replay
 `.plans/bert/tracked-npue-run.log`, SHA-256
 `604a8d1f6d2ef11a3c3438a35936aa5d04a127af31c0b337f8d91a434f2c3a0c`.
 
+The [NPUE probe build](../../utilities/bert-embeddings/build_npue_probe.py) builds
+the same route from tracked sources in an x64 MSVC developer shell. It archives
+`src/open_npue` from OFLM commit `9b1409d3e150e3602936307f5ff725c7bb4ac8af`
+and applies the [encoder patch](../../open_kernels/upstream-patches/bert-embedding-probe-runtime.patch)
+in a temporary directory. Use `--oflm` for a checkout containing that commit,
+`--xrt-include` for the XRT core include directory, `--xrt-lib` for the coreutil
+import library, `--boost-include` for the Boost headers, and `--output` for the
+executable. Put the matching XRT runtime libraries on `PATH` for execution.
+
+Verify the attention directory with `export_bert_attention.py --check --sequence`
+and `--out` before setting `NPUE_BERT_ATTENTION_PROBE` to it. Set
+`NPUE_NOMIC_DYNAMIC_ROPE=1` for Nomic v1.5. Run the executable with `PACK DESIGN
+FIXTURE PREFIX OUTPUT` and append `FIXTURE OUTPUT` pairs to reuse the resident
+encoder. The build replay matched all four recorded vectors byte for byte and
+again produced identical Nomic outputs before and after the 8,192-token request.
+
 Raw run `.plans/bert/integrated-npue-run.log`, SHA-256
 `446873b6e77e41690d294def3268e3bd83a78b19107bdb914349f0d604880fa1`.
 CPU comparison `.plans/bert/integrated-npue-verify.log`, SHA-256
@@ -427,7 +443,16 @@ design. The extension utility verified the baked rotary frequencies against
 the GGUF and expanded the unused position table. The resulting 8,192-token NPUE
 was byte-identical to the separately built and served reference, SHA-256
 `ac9b5460d9a1bf4b278f03cebcd12282594cd747e60a6991b93d43950a30c9a7`.
-A 512-token serve check from this exact extended pack is queued.
+Stock `oflm serve` loaded this exact extended pack with the 512-token design and
+the local registry. Two single requests and one batch of four at each of 64 and
+512 tokens passed the CPU comparison, with minimum cosine 0.999379 against the
+0.995 gate. `oflm-test --embedding` passed all nine applicable checks. The suite
+skipped its bundled reference and task prompt checks for this model. The separate
+CPU comparison supplies the numerical reference. Raw logs under `.plans/bert/`
+are `gte-gguf-local-extended-quality-gte-multilingual_base.log` (SHA-256
+`bcab236ad34a0e5bc587a8fcc7750bb612389aea3a01adb2b295c27421d59d58`) and
+`gte-gguf-local-extended-oflm-test-gte-multilingual_base.log` (SHA-256
+`ffbe16050dd30e677e6a5f537647231fceeb1a2a7078da28c02db884d1472203`).
 Native registry, automatic full-length packing and GGUF dispatch remain OFLM work.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
