@@ -10,7 +10,7 @@ The inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`. The be
 |---|---|
 | Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
 | Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
-| Context | Release designs process 64 tokens per sequence. Staged publisher packs served exact 512-token fixtures. Nomic served exact 8,192 tokens but missed publisher parity. GTE's first exact 8,192-token fixture matched the publisher. Repeated maximum-length checks and kernel selection by request length remain open. |
+| Context | Release designs process 64 tokens per sequence. Staged publisher packs served exact 512-token fixtures. Nomic served exact 8,192 tokens but missed publisher parity. Two exact GTE 8,192-token fixtures matched the publisher. The deployment still needs request-length routing and the correct error for over-limit input. |
 | NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. Tokenization, embedding lookup, attention/softmax, normalization, activation, and pooling are host stages. Stage costs over long inputs remain open. |
 | Speculative decode | Not applicable to an encoder. |
 | Published input weights | The present registry pulls and packs publisher safetensors into the tiled NPUE format. Establish published GGUF coverage per checkpoint and compare quality before choosing the default quant. |
@@ -220,13 +220,21 @@ The transaction verifier found 32 distinct length writes and changed the mask fr
 `25d9aaf2737ff0c4346c6042c2853f88d052563382a6ed6e74efe4e77b7eb246`).
 This verifies how the length is conveyed in the stream. The NPU parity check must
 still establish that the new value reaches each worker on repeated dispatches.
-The 8,192-capacity prototype also compiled. The same verifier patched 32 writes to set 2,051 valid keys without changing its xclbin.
+The 8,192-capacity prototype also compiled. The same verifier patched all 32 tile
+writes to set 2,051 valid keys without changing its xclbin. The optional
+`FA_RUNTIME_VALID_LEN` path is now in the shared design. At 512 capacity the tracked
+runtime build matched the prototype's instruction stream and XRT connectivity. The
+tracked static build matched its pre-change instruction stream and connectivity.
+The compiled PDI bytes differ between builds. Both runtime lengths require fresh
+hardware checks with the tracked build.
 
 GTE served both 2,048-token fixtures on the 8,192-capacity encoder and matched
 the publisher CPU vectors with a minimum cosine of 0.999475. The observed single
-request timings were 83.2?86.0 s. The first exact 8,192-token request scored 0.999570,
-taking 93.6 s through HTTP compared with 26.1 s for the reference. The raw report is
-`.plans/bert/seq8192-quality-gte-multilingual_base.log`.
+request timings were 83.2?86.0 s. The two exact 8,192-token requests scored 0.999570
+and 0.999543, taking 93.6 and 81.8 s through HTTP compared with 26.1 and 28.0 s for the
+CPU references. The exact 8,193-token request returned HTTP 500. Raw results are in
+`.plans/bert/seq8192-quality-gte-multilingual_base.log`, SHA-256
+`7698157fba16eb420f7e7dd3a82e41c11fdf7f604ea6c93e9ccb5fe5a6325daf`.
 
 ## Published GGUF candidates
 

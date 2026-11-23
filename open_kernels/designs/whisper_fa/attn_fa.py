@@ -109,6 +109,7 @@ from aie.iron import (
     Runtime,
     TaskGroup,
     Worker,
+    WorkerRuntimeBarrier,
 )
 from aie.iron.controlflow import range_
 from aie.iron.device import Tile, from_name
@@ -254,6 +255,7 @@ def flash_attn(
     num_cascade_stages: CompileTime[int],
     valid_len: CompileTime[int],
     attention_scale_one: CompileTime[bool] = False,
+    runtime_valid_len: CompileTime[bool] = False,
 ):
     NQ = 4  # q-tile columns per head-group -- fixed, matches attn_npu2.py main()
     NS = num_cascade_stages
@@ -310,6 +312,7 @@ def flash_attn(
         f"-Ddv={dv}",
         f"-Ddv_full={dv}",
         f"-Dvalid_len={valid_len}",
+        f"-DFA_RUNTIME_VALID_LEN={int(runtime_valid_len)}",
         "-DFP32_STATE=1",
         "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         "-DROUND_CONV_EVEN",
@@ -378,7 +381,10 @@ def flash_attn(
     vector_copy = Kernel(
         "vector_copy_32elems", obj, [np.int32, state_bf_ty, state_bf_ty]
     )
-    apply_length_mask = Kernel("apply_length_mask", obj, [g_ty, np.int32])
+    length_mask_args = [g_ty, np.int32]
+    if runtime_valid_len:
+        length_mask_args.append(np.int32)
+    apply_length_mask = Kernel("apply_length_mask", obj, length_mask_args)
     fused_softmax = Kernel(
         "fused_softmax", obj, [g_ty, state_bf_ty, state_bf_ty, state_bf_ty]
     )
@@ -606,8 +612,12 @@ def flash_attn(
     # below are plain lists in a FIXED order, unpacked by position; a list
     # (not a dict) because fn_args nesting only flattens
     # lists/tuples for registration (Worker.__init__'s own comment).
+    length_regs = {}
+    length_barriers = {}
+    length_ty = np.ndarray[(1,), np.dtype[np.int32]]
+
     def make_local_bufs(c, s):
-        return [
+        buffers = [
             Buffer(qk_ty, name=f"q_saved_{c}_{s}"),
             Buffer(g_ty, name=f"g_{c}_{s}"),
             Buffer(gp_ty, name=f"gp_{c}_{s}"),
@@ -617,6 +627,14 @@ def flash_attn(
             Buffer(state_bf_ty, name=f"r_tmp_{c}_{s}"),
             Buffer(state_f32_ty, name=f"s_tmp_f32_{c}_{s}"),
         ]
+        if runtime_valid_len:
+            length = Buffer(length_ty, name=f"key_length_{c}_{s}",
+                            initial_value=np.zeros(1, dtype=np.int32), use_write_rtp=True)
+            barrier = WorkerRuntimeBarrier()
+            length_regs[c, s] = length
+            length_barriers[c, s] = barrier
+            buffers.extend([length, barrier])
+        return buffers
 
     def make_merge_bufs(c, s):
         return [
@@ -664,7 +682,7 @@ def flash_attn(
         a correctness fix: previously only the last lx's result could ever
         reach the cascade or the output at all.
         """
-        q_saved, g, gp, up, sp, s_tmp, r_tmp, s_tmp_f32 = lb
+        q_saved, g, gp, up, sp, s_tmp, r_tmp, s_tmp_f32 = lb[:8]
 
         # Q selective capture (attn_npu2.py herd body, verbatim mechanism):
         # qk_in is this stage's broadcast fifo -- NQ Q elements (one per
@@ -699,7 +717,10 @@ def flash_attn(
             matmul_a_b(q_saved, ke, g)
 
             kv_block = s * chunks_per_stage + chunk
-            apply_length_mask(g, kv_block)
+            if runtime_valid_len:
+                apply_length_mask(g, kv_block, lb[-2][0])
+            else:
+                apply_length_mask(g, kv_block)
             fused_softmax(g, up, s_tmp, r_tmp)
             mul_r_gp(r_tmp, gp)
             matmul_g_b(g, ve, gp)
@@ -747,6 +768,8 @@ def flash_attn(
         """ty == NS - 1 (physical row 5): put_only -- no neighbour yet."""
 
         def fn(qk_in, v_in, _kernels, lb):
+            if runtime_valid_len:
+                lb[-1].wait_for_value(1)
             for _ in range_(num_head_groups):
                 for _ in range_(num_lq_iters):
                     gp, up, sp = local_compute_one(tx, s, qk_in, v_in, lb)
@@ -758,6 +781,8 @@ def flash_attn(
         """0 < ty < NS - 1: put_get -- merge, forward the merged partial."""
 
         def fn(qk_in, v_in, _kernels, lb, mb):
+            if runtime_valid_len:
+                lb[-1].wait_for_value(1)
             for _ in range_(num_head_groups):
                 for _ in range_(num_lq_iters):
                     gp, up, sp = local_compute_one(tx, s, qk_in, v_in, lb)
@@ -770,6 +795,8 @@ def flash_attn(
         """ty == 0 (physical row 2): get_only -- merge, normalise, drain."""
 
         def fn(qk_in, v_in, gp_out, _kernels, lb, mb):
+            if runtime_valid_len:
+                lb[-1].wait_for_value(1)
             for _ in range_(num_head_groups):
                 for _ in range_(num_lq_iters):
                     gp, up, sp = local_compute_one(tx, s, qk_in, v_in, lb)
@@ -848,6 +875,10 @@ def flash_attn(
     GP_conses = [GP_l2l3[c].cons(tile=Tile(c, 0)) for c in range(n_cols)]
 
     def sequence(Q, K, V, GP, qk_hs, v_hs, gp_hs):
+        for length in length_regs.values():
+            length[0] = valid_len
+        for barrier in length_barriers.values():
+            barrier.set(1)
         # RuntimeData (Q/K/V/GP here) is not Python-sliceable (compile_attempt7
         # .log: "'RuntimeData' object is not subscriptable") -- fill()/drain()
         # take offset/sizes/strides (or an equivalent `tap=`) directly instead.
@@ -939,6 +970,7 @@ SPECIALIZE = dict(
     num_cascade_stages=int(os.environ.get("FA_CASCADE_STAGES", 4)),
     valid_len=int(os.environ.get("FA_VALID_LEN", 1500)),
     attention_scale_one=bool(int(os.environ.get("FA_SCALE_ONE", "0"))),
+    runtime_valid_len=bool(int(os.environ.get("FA_RUNTIME_VALID_LEN", "0"))),
 )
 
 

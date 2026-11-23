@@ -25,10 +25,9 @@ valid_len = 1500, fp32 running-sum state, bf16-via-bfp16-emulation matmul.
   the sibling `NpuEmbeddings` repo is that failures are the valuable part of a record,
   and every one of these was silent (wrong output or a hang with no diagnostic, not a
   compile error).
-- `attn_npu2.cc` -- AMD's compute kernels (matmul, softmax, merge arithmetic), vendored
-  unmodified at the C++ source level. `attn_fa.py`'s IRON topology calls these exact
-  functions; the port changed nothing inside this file. See its own header for what
-  changed around it.
+- `attn_npu2.cc` -- AMD's compute kernels (matmul, softmax, merge arithmetic)
+  with the Whisper key-length mask. The mask accepts an optional per-dispatch length
+  for BERT. The other compute routines are shared with the static Whisper build.
 - `zero.cc` -- AMD's zero/neg-inf fill helpers, vendored unmodified, from the same
   upstream directory as `attn_npu2.cc` (`#include "zero.cc"`, quote-form: this
   directory, not `mlir-aie`'s own `aie_kernels/aie2p/zero.cc`, which is a different
@@ -59,6 +58,14 @@ shipped kernel set always builds the production shape.
 `FA_SCALE_ONE=1` compiles the same attention primitive with unit softmax scale
 for Gemma 4 vision attention; the unset default retains Whisper's
 `1/sqrt(head_dim)` scaling.
+
+For BERT attention prototypes, `FA_RUNTIME_VALID_LEN=1` emits a key-length write
+per compute tile. `FA_VALID_LEN` supplies the compiled register value. The stream
+writes all 32 registers at dispatch in the default two-head, four-stage geometry. A barrier orders the writes before the workers start. To check the stream
+at a different length, run `utilities/bert-embeddings/check_attention.py` with
+`--rtp-marker` set to the compiled value and `--valid-length` set to the requested
+length. Use 381 as the marker for the BERT test shapes. The shipped Whisper design
+keeps its static 1,500-frame mask.
 
 ## Test it on hardware
 

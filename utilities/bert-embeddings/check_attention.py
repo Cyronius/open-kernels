@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+import struct
 import subprocess
 
 import numpy as np
@@ -29,13 +30,44 @@ def reference(query, key, value, rows):
     return weights @ value.astype(np.float64)
 
 
+# The compiled mlir-aie transaction uses WRITE32 operations for length registers.
+# Word layout follows open_kernels/harness/stream_patch.hpp.
+def patch_key_length(source, target, marker, length):
+    stream = bytearray(source.read_bytes())
+    _, _, operation_count, stream_size = struct.unpack_from("<4I", stream)
+    if stream_size != len(stream):
+        raise ValueError("length register patch needs a complete instruction transaction")
+    operation_sizes = {0: 24, 1: 48, 3: 28, 0x80: 16, 0x81: 48}
+    writes = {}
+    expected_tiles = {(col, row) for col in range(8) for row in range(2, 6)}
+    offset = 16
+    for _ in range(operation_count):
+        opcode, = struct.unpack_from("<I", stream, offset)
+        if opcode == 0:
+            _, _, low_address, high_address, value, size = struct.unpack_from("<6I", stream, offset)
+            if size != operation_sizes[opcode]:
+                raise ValueError("unexpected WRITE32 size")
+            if value == marker:
+                tile = (low_address >> 25, (low_address >> 20) & 31)
+                if high_address or tile not in expected_tiles or tile in writes:
+                    raise ValueError("invalid or duplicate compute-tile length register write")
+                writes[tile] = offset + 16
+        offset += operation_sizes[opcode]
+    if offset != len(stream) or writes.keys() != expected_tiles:
+        raise ValueError(f"expected one length register write per compute tile, found {len(writes)}")
+    for value_offset in writes.values():
+        struct.pack_into("<I", stream, value_offset, length)
+    target.write_bytes(stream)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--harness", required=True, type=Path)
     parser.add_argument("--build", required=True, type=Path)
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--sequence", required=True, type=int, choices=(512, 8192))
-    parser.add_argument("--valid-length", type=int, help="key length compiled into the design")
+    parser.add_argument("--valid-length", type=int, help="key length to test")
+    parser.add_argument("--rtp-marker", type=int, help="compiled register value for a runtime-length build")
     args = parser.parse_args()
     valid_length = args.sequence if args.valid_length is None else args.valid_length
     if not 2 <= valid_length <= args.sequence:
@@ -64,15 +96,24 @@ def main():
 
     size_bytes = int(np.prod(shape)) * 2
     build = args.build.resolve()
+    instructions = build / "insts.bin"
+    if args.rtp_marker is not None:
+        patched = work / "insts-length.bin"
+        patch_key_length(instructions, patched, args.rtp_marker, valid_length)
+        instructions = patched
     config = work / "attention.cfg"
     config.write_text(
-        f"device\nxclbin G {build / 'final.xclbin'}\nkernelx k G {build / 'insts.bin'}\n"
+        f"device\nxclbin G {build / 'final.xclbin'}\nkernelx k G {instructions}\n"
         f"buf q {size_bytes} query.bin\nbuf kb {size_bytes} key.bin\nbuf v {size_bytes} value.bin\n"
-        f"buf o {size_bytes}\nrun k q kb v o\nrun k q kb v o\ndump o output.bin {size_bytes}\n",
+        f"buf o {size_bytes}\nrun k q kb v o\ndump o output-first.bin {size_bytes}\n"
+        f"run k q kb v o\ndump o output.bin {size_bytes}\n",
         encoding="ascii",
     )
     subprocess.run([str(args.harness.resolve()), config.name], cwd=work, check=True, timeout=400)
-    output = from_bf16(np.fromfile(work / "output.bin", dtype="<u2")).reshape(shape)
+    first = np.fromfile(work / "output-first.bin", dtype="<u2")
+    second = np.fromfile(work / "output.bin", dtype="<u2")
+    repeatable = np.array_equal(first, second)
+    output = from_bf16(second).reshape(shape)
 
     # Sample both sides of each query-tile boundary and the last query.
     tile_boundary_rows = {row for edge in range(256, valid_length, 256) for row in (edge - 1, edge)}
@@ -85,10 +126,11 @@ def main():
     actual, expected = actual[:, 1:], expected[:, 1:]
     relative_l2 = np.linalg.norm(actual - expected, axis=(1, 2)) / np.linalg.norm(expected, axis=(1, 2))
     cosine = (actual * expected).sum(axis=2) / (np.linalg.norm(actual, axis=2) * np.linalg.norm(expected, axis=2))
-    print(f"sequence={sequence} valid_keys={valid_length} heads={HEADS} sampled_rows={len(rows)} finite={finite} "
+    print(f"sequence={sequence} valid_keys={valid_length} heads={HEADS} sampled_rows={len(rows)} "
+          f"finite={finite} repeatable={repeatable} "
           f"worst_head_relative_l2={relative_l2.max():.6g} min_row_cosine={cosine.min():.8f} "
           f"last_key_error={tail_error:.6g} last_key_min_output={output[:, 0, 0].min():.6g}")
-    passed = finite and relative_l2.max() < 0.03 and cosine.min() > 0.995 and tail_error < 0.1
+    passed = finite and repeatable and relative_l2.max() < 0.03 and cosine.min() > 0.995 and tail_error < 0.1
     return 0 if passed else 1
 
 

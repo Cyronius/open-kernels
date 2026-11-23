@@ -10,9 +10,9 @@
 // MIT. See open_kernels/PROVENANCE.md.
 //
 // MODIFIED for Whisper's encoder (NpuEmbeddings tasks/0180 Parts 5 and 7):
-//   - apply_length_mask(): a key-length mask (compile-time valid_len, 1500 of
-//     1536 rows), run unconditionally on the non-causal path. Upstream masks
-//     only causally, so zero-padded keys took softmax mass.
+//   - apply_length_mask(): a key-length mask (1500 of 1536 rows for Whisper,
+//     with an optional runtime length for other encoders). The noncausal path
+//     uses it to prevent zero-padded keys from taking softmax mass.
 //   - FP32_STATE: the online-softmax running sum kept in fp32 (sp and its
 //     cascade-merge copies; zero_fill_sp_f32, widen_bf16_to_f32,
 //     vector_copy_32elems_f32, accum_sp_r_s_f32, div_gp_sp_f32), and the
@@ -1138,7 +1138,12 @@ void add_gp_g(bfloat16 *gp, bfloat16 *g) {
 #ifndef valid_len
 #define valid_len 2147483647 // INT32_MAX: effectively unmasked if unset
 #endif
+#if defined(FA_RUNTIME_VALID_LEN) && FA_RUNTIME_VALID_LEN
+void apply_length_mask(bfloat16 *g, int32_t kv_block_idx, int32_t key_length) {
+#else
 void apply_length_mask(bfloat16 *g, int32_t kv_block_idx) {
+  constexpr int32_t key_length = valid_len;
+#endif
   SET_ROUNDING();
   uint16_t neg_inf_u16 = (uint16_t)0xff80;
   bfloat16 neg_inf_val = *(bfloat16 *)&neg_inf_u16;
@@ -1147,7 +1152,7 @@ void apply_length_mask(bfloat16 *g, int32_t kv_block_idx) {
   const int32_t block_start = kv_block_idx * lkp;
 
   // 1. Whole block past the valid length: all -inf.
-  if (block_start >= valid_len) {
+  if (block_start >= key_length) {
     constexpr int VecLen = 32;
     aie::vector<bfloat16, VecLen> neg_inf_vec =
         aie::broadcast<bfloat16, VecLen>(neg_inf_val);
@@ -1160,7 +1165,7 @@ void apply_length_mask(bfloat16 *g, int32_t kv_block_idx) {
   }
 
   // 2. Whole block fully inside the valid length: nothing to mask.
-  if (block_start + lkp <= valid_len) {
+  if (block_start + lkp <= key_length) {
     return;
   }
 
@@ -1170,7 +1175,7 @@ void apply_length_mask(bfloat16 *g, int32_t kv_block_idx) {
   // follow-up could precompute sel_bits per col_blk once, outside the row
   // loop, since it never varies with `row` -- left as a documented
   // opportunity rather than taken, to keep this change small and reviewable.
-  const int32_t local_bound = valid_len - block_start; // 0 < local_bound < lkp
+  const int32_t local_bound = key_length - block_start; // 0 < local_bound < lkp
   aie::vector<bfloat16, BlkDim> mask_vec =
       aie::broadcast<bfloat16, BlkDim>(neg_inf_val);
 
