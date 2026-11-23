@@ -49,8 +49,12 @@ short-long-short recovery. A synthetic benchmark recorded both routes.
 
 The development implementation uses two resident workers because the NPUE
 encoder geometry is process-wide. It keeps one shared Phlegm device lock
-and dispatches one request at a time. Measure the added resident weights
-and context-switch cost before enabling the route by default. R-0003 and
+and dispatches one request at a time. The queued serving check records each
+worker's private bytes and working set after startup, with and without the
+short route. A Windows dry run using synthetic workers verified the one- and
+two-process snapshots. The counters cover the worker processes. The totals
+for working sets may count shared pages twice. Measure on hardware and check
+the context-switch cost before enabling the route by default. R-0003 and
 R-0008 in xdna2-notes document the cost of adding contexts for variants.
 
 The resident worker can report per-request stage timings to Phlegm `06c3e47`.
