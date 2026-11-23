@@ -732,6 +732,14 @@ a repeat under controlled load before release. Raw log
 `dc3df8689291a2f8c740e49c84a4789e37fc17c422bcef7470196f2c88b25073`.
 MiniLM matrix SHA-256 `109c331e3d502071f707030c1630f6e61e80a3eb34c3e41b5f23c4ffdeef7866`.
 
+The BGE-small retry passed its routed Q8_0 HTTP checks. Minimum cosine
+against the publisher was 0.999866 across the three cases. The 512-token
+single request took 96.04 ms, the 513-token request returned HTTP 400, and
+both repeats of the short request after the full-route call matched the
+earlier vector. The remaining timing controls waited on a competing Phlegm
+job. HTTP records `.plans/bert/bge-small-gguf-http.jsonl`, SHA-256
+`aed769d10551e04474c48bf13ea30cb7a73a2ff6d6294b47cc68f9aa1d1e12fc`.
+
 ### Skipping padded host queries
 
 The resident embedding service supplies each lane's occupied row count to
@@ -781,6 +789,11 @@ per-round speedups against the geometric mean of the bracketing samples.
 The report checker verifies the fixture, full design, model hashes and
 machine settings, as well as the selected context for every sample.
 A control-median drift above 5% calls for a repeat before using the ratio.
+The paired runners acquire the shared NPU lock before the first control
+and hold it through the final control. Their Phlegm children serialize on
+a lock scoped to the acquired lease. A Windows synthetic test verified
+that acquisition waited for an external holder and that the shared lock
+was released after both a passing and a failing trial.
 
 ## Cold packing from GGUF
 
