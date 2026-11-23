@@ -76,7 +76,8 @@ def extend(packed, weights, output, length, *, nomic_dynamic_rope=False,
         old_length, width = entry["logical_shape"]
         if old_length != container.config["max_seq_len"] or entry["dtype"] != "F32":
             raise ValueError("packed position tensor disagrees with its declared capacity")
-        if not old_length < length <= capacity:
+        same_length_sparse = gte_sparse_head and old_length == length
+        if length > capacity or (not same_length_sparse and length <= old_length):
             raise ValueError(f"requested length must be above {old_length} and at most {capacity}")
         old = container.raw(POSITION).reshape(old_length, width)
         if arch == "bert" and container.config.get("position_embedding_type") is None:

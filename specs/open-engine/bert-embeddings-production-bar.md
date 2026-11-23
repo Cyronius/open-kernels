@@ -19,7 +19,7 @@ metadata and artifact hashes. HTTP remains separately measured with
 | Context | MiniLM served its published 256-token limit and BGE served 512-token inputs. GTE matched the publisher at 8,192 tokens. Nomic passed local publisher parity at 8,192 tokens with dynamic RoPE. Phlegm's length routing needs hardware parity and measurement. |
 | NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. The local GTE and Nomic worker also dispatches attention and softmax to the NPU. Tokenization, embedding lookup, normalization, activation, and pooling remain on the host. Release serving integration and profiling are open. |
 | Speculative decode | Not applicable to an encoder. |
-| Published input weights | The registry currently pulls safetensors. The provisional Q8_0 selection has serving evidence through 256 for MiniLM and through 512 for BGE, GTE and Nomic. The new 8,192-token Nomic Q8_0 pack needs runtime parity. GTE still needs a direct GGUF reader and automatic full-length packing. |
+| Published input weights | The registry currently pulls safetensors. The cold tool rebuilt all six Q8_0 candidates directly from GGUF. Serving evidence covers MiniLM at 256 and BGE, GTE and Nomic at 512. The long quantized Phlegm runs and automatic registry installation remain open. |
 | Serving and features | Run `oflm-test --embedding` on each tag. Exercise Nomic task prefixes and GTE multilingual inputs. Check GTE sparse output support and the publishers' elastic dimensions separately from full-width dense vectors. |
 
 | Tag | Published input length to verify | Design family |
@@ -585,6 +585,31 @@ produced an 8,192-position NPUE pack with SHA-256
 The 149 non-position tensors were byte-identical to the 512-token GGUF pack.
 The utility rejected 8,192 without the option and 8,193 with it.
 Runtime parity for the extended quantized pack remains open.
+
+## Cold packing from GGUF
+
+Build the CPU-only packer from an x64 MSVC developer shell with
+`build_npue_probe.py --packer --oflm CHECKOUT --output pack-npue.exe`.
+`pack_gguf.py WEIGHTS DESIGN OUTPUT --packer EXE --gguf-sha256 HASH` converts
+one of the six Q8_0 files to a deployable NPUE container. The input directory
+needs only the GGUF, and the tool rebuilds the tokenizer and staged tensors.
+The projection design supplies sequence capacity and tile dimensions. GTE
+includes its F32 sparse head, and Nomic packs the published dynamic context.
+
+All six cold packs matched the corresponding staged packs in every tensor.
+GTE was byte-identical as a container. MiniLM, BGE and Nomic have different
+staged safetensors hashes. BGE records the corrected 512-position slice in its
+fusion metadata. Nomic keeps the GGUF's layer-norm epsilon metadata, which
+the current native runtime implements as 1e-12.
+
+The output is still an explicit input to `phlegm serve --embed-model`.
+Automatic packaging at install or startup and live cold-pack NPU parity
+remain open. A second cold run reproduced all six file hashes. The tool
+refused a mismatched GGUF checksum, a 512-token MiniLM design and a gated
+layout for ungated BGE. Raw comparison `.plans/bert/direct-gguf-parity.log`
+has SHA-256 `b7ebe567465027be4ce6d691ad9aa8d436d70c184ede5258ccdb5d5b0e5a6da3`.
+Raw replay `.plans/bert/direct-gguf-replay.log` has SHA-256
+`d7893f5073b26f9e1e0aecce514ea169746be943a67f792438da5e00babe1ac8`.
 
 ## Model features
 
