@@ -680,6 +680,14 @@ MiniLM GGUF, then a native test worker opened the pack and returned a
 reported the GGUF and NPUE hashes. Device parity and performance on the
 GGUF startup route remain open.
 
+The Windows benchmark environment rebuilt MiniLM's 256-token pack in the
+same cache used by the queued run. The verified warm lookup returned the
+same bytes as the independent cold pack, SHA-256
+`82da004f2857af6d0a764b316c119260707f75eb361e1e9f123f90285f3992cd`.
+Preflight checked that both projection designs for each encoder use the
+same packed weight layout and that the reference checkpoint metadata is
+available.
+
 Cache evidence `.plans/bert/cached-gguf-pack.log`, SHA-256
 `2dd1a76b18adc918abd7fa7261d1774367d57650e7766294743ad3709d6384ec`.
 Startup evidence `.plans/bert/phlegm-gguf-startup.log`, SHA-256
@@ -712,6 +720,12 @@ Startup evidence `.plans/bert/phlegm-gguf-startup.log`, SHA-256
   matched all positive IDs on English, Chinese and 8,192-token fixtures. The
   maximum absolute score difference was 4.77e-7. Live sparse parity through the
   quantized NPU route remains open.
+- Replaying the converted Q8_0 weights on the CPU preserved the positive
+  token IDs for the short English and Chinese probes. Sparse cosine was
+  0.999995 and 0.999998, with maximum score differences of 0.00704 and
+  0.01234. This isolates the effect of quantization before the live NPU
+  comparison. Raw report `.plans/bert/gte-q8-sparse-cpu.jsonl`, SHA-256
+  `2cd5d9c15392178014f3ae7d7673602460ee47e69407a72f6d207845f7ee24c1`.
 - Nomic accepted `search_query`, `search_document`, `clustering` and `classification`.
   All four vectors differed for the same text and matched their task-specific CPU references
   with a minimum cosine of 0.998892. Stock OFLM returned 768 values for a request
