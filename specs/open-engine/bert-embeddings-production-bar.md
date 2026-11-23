@@ -63,6 +63,10 @@ omit it. The Windows CLI accepted synthetic profiles at contexts 64 and
 8,192 and rejected an invalid timing without writing a report. The runtime
 patch applied to the pinned OFLM source and reproduced the compiled worker
 header. Stage measurements from real Phlegm NPU requests remain open.
+Phlegm `f124813` verifies the reported context against the route expected
+for each fixture. The pending short-input comparison uses the same two
+64-token cases (batch sizes one and four) with and without length routing
+for each model, followed by the full context sweep.
 
 The 512-token comparison also includes MiniLM as an exploratory run. Its encoder has 512 position
 embeddings and the publisher uses a 256-token truncation limit for serving. See the
