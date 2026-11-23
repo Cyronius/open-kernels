@@ -774,6 +774,17 @@ process and with the 64-token route enabled. The original single-worker
 run brackets both trials. This checks whether the short route still earns
 its extra resident memory after removing padded query work.
 
+The compact host layout stores each head's occupied queries by its
+rounded key span. Full-length requests and device softmax retain fixed
+strides. A fresh score buffer for four 64-token MiniLM inputs on the
+256-token design needs 0.75 MiB instead of 12 MiB. The buffer-size
+check for one 64-token input on an 8,192-token host design was 192 KiB
+instead of 3 GiB. Resident buffers can retain capacity after a longer
+request. The AVX2 replays, including short–full–short reuse, matched
+every occupied output byte. The matched MiniLM run includes this variant.
+Raw log `.plans/bert/npue-compact-scores-cpu.log`, SHA-256
+`07b9db36d33cef5a823a74e8539fb3cdea486f14c0ede9ca8a4bbb273db6ee41`.
+
 ### Intermediate context for Nomic and GTE
 
 The current 64/8,192 route sends a 512-token input to the 8,192-token
