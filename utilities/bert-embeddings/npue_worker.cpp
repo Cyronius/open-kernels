@@ -158,10 +158,11 @@ int main(int argc, char** argv) {
             sparse.emplace(packed, model.unigram_special_ids());
         if (is_nomic_v15(model)) model.enable_nomic_dynamic_rope();
         if (files) {
-            if (files->sequence != model.seq())
-                throw std::runtime_error("BERT attention and projection designs differ in sequence length");
+            if (files->sequence != model.seq() || files->heads != npue::enc::g_heads ||
+                files->head_width != npue::enc::g_head_dim)
+                throw std::runtime_error("BERT attention geometry disagrees with the encoder");
             attention = std::make_unique<npue::npu::BertAttention>(
-                files->image, files->instructions, model.seq(),
+                files->image, files->instructions, model.seq(), files->heads, files->head_width,
                 npue::enc::bf16_fill, npue::enc::bf16_read);
             model.set_attention_probe(std::ref(*attention));
             files.reset();

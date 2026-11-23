@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "bert_attention_geometry.hpp"
+
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +25,8 @@ namespace npue::npu {
 
 struct BertAttentionFiles {
     int64_t sequence;
+    int64_t heads;
+    int64_t head_width;
     std::vector<char> image;
     std::vector<char> instructions;
 };
@@ -60,10 +64,11 @@ inline BertAttentionFiles load_bert_attention(const std::filesystem::path& direc
     auto manifest = nlohmann::json::parse(input);
     const auto& files = manifest.at("files");
     const auto sequence = manifest.at("sequence");
+    const auto heads = manifest.at("heads");
+    const auto width = manifest.at("head_width");
     if (manifest.at("format") != "bert-attention-v1" ||
-        !sequence.is_number_integer() ||
-        (sequence != 512 && sequence != 2048 && sequence != 8192) ||
-        manifest.at("heads") != 12 || manifest.at("head_width") != 64 ||
+        !sequence.is_number_integer() || !heads.is_number_integer() || !width.is_number_integer() ||
+        !bert_attention_geometry(sequence.get<int64_t>(), heads.get<int64_t>(), width.get<int64_t>()) ||
         manifest.at("length_marker") != 381 || manifest.at("dtype") != "bf16" ||
         manifest.at("layout") != "head_sequence_width" ||
         manifest.at("attention_scale") != "inverse_sqrt_head_width")
@@ -73,7 +78,8 @@ inline BertAttentionFiles load_bert_attention(const std::filesystem::path& direc
     auto instructions = read_attention_payload(directory / "insts.bin", files.at("insts.bin"));
     if (instructions.size() % sizeof(uint32_t))
         throw std::runtime_error("BERT attention instruction stream is not word-aligned");
-    return {sequence.get<int64_t>(), std::move(image), std::move(instructions)};
+    return {sequence.get<int64_t>(), heads.get<int64_t>(), width.get<int64_t>(),
+            std::move(image), std::move(instructions)};
 }
 
 }  // namespace npue::npu

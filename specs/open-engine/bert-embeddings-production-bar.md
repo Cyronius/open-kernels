@@ -586,6 +586,37 @@ The 149 non-position tensors were byte-identical to the 512-token GGUF pack.
 The utility rejected 8,192 without the option and 8,193 with it.
 Runtime parity for the extended quantized pack remains open.
 
+## Attention candidates for MiniLM and BGE
+
+The runtime-length design now compiles 12 heads of width 32 for MiniLM at
+256 tokens and BGE-small at 512 tokens, and 16 heads of width 64 for BGE-large
+at 512 tokens. The binary loader verifies these manifest geometries and
+requires them to agree with the selected encoder. The worker and profiler
+both build with the new shapes. The original 12-by-64 format remains readable.
+Its 512-token control rebuild reproduced the recorded instruction bytes.
+
+The instruction checker found one runtime length update on each of the
+32 compute tiles for all three new images. A separate 512-token rebuild
+reproduced the instruction stream for each geometry. The linked core
+programs and allocated local-memory window fit the R-0001 budgets.
+
+| Geometry and capacity | Largest program | Stack reservation | Largest reserved local extent plus static data |
+|---|---:|---:|---:|
+| 12 × 32 at 512 | 13,904 B | 2,048 B | 31,620 B |
+| 16 × 64 at 512 | 14,992 B | 2,048 B | 62,340 B |
+
+An offline check of each first-layer GGUF-derived QKV pack found the expected
+`1/sqrt(head_width)` fold on Q weights and biases. K and V matched their
+unscaled sources. The adapter reverses the Q fold before the FlashAttention
+image applies its native scale. CPU reference captures at the first and last
+layers of all three encoders are staged for device comparison.
+
+The hardware accuracy, dispatch and HTTP gates remain open. Raw instruction
+and ELF report `.plans/bert/attention-shape-offline.log`, SHA-256
+`bf1ced9c0716cf7da08a6f1e92c8139bffba57f697920db5a8077fd7922710de`.
+Packed operand check `.plans/bert/attention-shape-qkv.log`, SHA-256
+`e4483d1d655843795702cc042153ffe21660bd7140cc1647a16b555ab3d271b4`.
+
 ## Cold packing from GGUF
 
 Build the CPU-only packer from an x64 MSVC developer shell with

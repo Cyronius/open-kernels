@@ -331,8 +331,8 @@ diff --git a/src/open_npue/npue_encoder.hpp b/src/open_npue/npue_encoder.hpp
 +    stack_.lead->nomic_dynamic_rope = true;
 +  }
 +  void set_attention_probe(decltype(Encoder::attention_probe) callback) {
-+    if (stack_.n_lanes != 1 || g_heads != 12 || g_head_dim != 64)
-+      throw std::invalid_argument("BERT NPU attention requires one lane and 12 heads of width 64");
++    if (stack_.n_lanes != 1)
++      throw std::invalid_argument("BERT NPU attention requires one lane");
 +    stack_.lead->attention_probe = std::move(callback);
 +  }
    int lanes() const { return stack_.n_lanes; }

@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
 
+#include "bert_attention_geometry.hpp"
 #include "../../open_kernels/harness/stream_patch.hpp"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -20,7 +22,7 @@
 namespace npue::npu {
 
 // The caller supplies the checked xclbin and instruction bytes. This
-// adapter consumes the 12-by-64 NPUE projection where Q already carries 1/8.
+// adapter consumes the NPUE projection where Q already carries the attention scale.
 // Use one instance per serialized NPU route.
 class BertAttention {
 public:
@@ -28,7 +30,7 @@ public:
     using Widen = void (*)(float*, const void*, size_t);
 
 private:
-    static constexpr int64_t width = 768, head_dim = 64;
+    static constexpr int64_t max_head_dim = 64;
     static constexpr uint32_t marker = 381;
 
     xrt::device device{0u};
@@ -37,7 +39,8 @@ private:
     xrt::bo instructions;
     std::array<xrt::bo, 4> tensor;
     std::vector<size_t> patches;
-    const int64_t capacity;
+    const int64_t capacity, head_dim, width;
+    const float undo_q_scale;
     Narrow narrow;
     Widen widen;
     uint32_t instruction_count = 0;
@@ -50,10 +53,13 @@ private:
 public:
     double io_ms = 0, dispatch_ms = 0;
     BertAttention(const std::vector<char>& image_bytes, const std::vector<char>& bytes,
-                  int64_t sequence,
+                  int64_t sequence, int64_t heads, int64_t head_width,
                   Narrow narrow_bf16, Widen widen_bf16)
-        : capacity(sequence), narrow(narrow_bf16), widen(widen_bf16) {
-        if ((capacity != 512 && capacity != 2048 && capacity != 8192) || !narrow || !widen)
+        : capacity(sequence), head_dim(head_width),
+          width(bert_attention_geometry(sequence, heads, head_width) ? heads * head_width : 0),
+          undo_q_scale(std::sqrt(static_cast<float>(head_width))),
+          narrow(narrow_bf16), widen(widen_bf16) {
+        if (!width || !narrow || !widen)
             throw std::invalid_argument("unsupported BERT attention geometry or conversion");
         if (bytes.empty() || bytes.size() % sizeof(uint32_t) ||
                 bytes.size() / sizeof(uint32_t) > static_cast<size_t>((std::numeric_limits<int>::max)()))
@@ -106,8 +112,8 @@ public:
                 for (int64_t t = 0; t < length; ++t) {
                     const auto* src = qkv.data() + ((b * capacity + t) * 3 * width + h * head_dim);
                     const auto to = (h * capacity + t) * head_dim;
-                    float query[head_dim];
-                    std::transform(src, src + head_dim, query, [](float v) { return v * 8.f; });
+                    float query[max_head_dim];
+                    std::transform(src, src + head_dim, query, [this](float v) { return v * undo_q_scale; });
                     narrow(mapped[0] + to, query, head_dim);
                     narrow(mapped[1] + to, src + width, head_dim);
                     narrow(mapped[2] + to, src + 2 * width, head_dim);

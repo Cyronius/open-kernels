@@ -1,4 +1,4 @@
-"""Check a 12-head bidirectional FlashAttention build with the Windows harness."""
+"""Check a bidirectional BERT attention build with the Windows harness."""
 
 import argparse
 from pathlib import Path
@@ -10,7 +10,7 @@ import numpy as np
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "open_kernels"))
-from export_bert_attention import HEADS, HEAD_WIDTH as WIDTH, LENGTH_MARKER, SEQUENCES, check_artifact
+from export_bert_attention import HEADS, HEAD_WIDTH, LENGTH_MARKER, SEQUENCES, check_artifact, validate_geometry
 
 
 def bf16_bits(values):
@@ -25,7 +25,7 @@ def from_bf16(bits):
 
 def reference(query, key, value, rows):
     scores = query[:, rows].astype(np.float64) @ key.astype(np.float64).swapaxes(1, 2)
-    scores /= np.sqrt(WIDTH)
+    scores /= np.sqrt(query.shape[-1])
     weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
     weights /= weights.sum(axis=-1, keepdims=True)
     return weights @ value.astype(np.float64)
@@ -79,7 +79,7 @@ def synthetic_fixture(shape, valid_length):
 def captured_fixture(path, shape, valid_length):
     with np.load(path, allow_pickle=False) as data:
         tensors = tuple(data[name] for name in ("query", "key", "value"))
-    if any(tensor.shape != (HEADS, valid_length, WIDTH) or tensor.dtype != np.float32
+    if any(tensor.shape != (shape[0], valid_length, shape[2]) or tensor.dtype != np.float32
            or not np.isfinite(tensor).all()
            for tensor in tensors):
         raise ValueError("Q/K/V captures must be finite float32 arrays shaped [heads, valid_length, width]")
@@ -93,6 +93,8 @@ def main():
     parser.add_argument("--build", required=True, type=Path)
     parser.add_argument("--work", required=True, type=Path)
     parser.add_argument("--sequence", required=True, type=int, choices=SEQUENCES)
+    parser.add_argument("--heads", type=int, default=HEADS)
+    parser.add_argument("--head-width", type=int, default=HEAD_WIDTH)
     parser.add_argument("--valid-length", type=int, help="key length to test")
     parser.add_argument("--rtp-marker", type=int, help="compiled register value for a runtime-length build")
     parser.add_argument("--fixture", type=Path, help="use captured float32 Q/K/V in an NPZ file")
@@ -103,15 +105,16 @@ def main():
 
     work = args.work.resolve()
     sequence = args.sequence
+    validate_geometry(sequence, args.heads, args.head_width)
     build = args.build.resolve()
     rtp_marker = args.rtp_marker
     if (build / "attention.json").is_file():
-        check_artifact(build, sequence)
+        check_artifact(build, sequence, args.heads, args.head_width)
         if rtp_marker not in (None, LENGTH_MARKER):
             parser.error("--rtp-marker disagrees with the exported artifact")
         rtp_marker = LENGTH_MARKER
     work.mkdir(parents=True, exist_ok=True)
-    shape = (HEADS, sequence, WIDTH)
+    shape = (args.heads, sequence, args.head_width)
     original = (captured_fixture(args.fixture, shape, valid_length) if args.fixture
                 else synthetic_fixture(shape, valid_length))
     tensors = []
@@ -161,7 +164,8 @@ def main():
         actual, expected = actual[:, 1:], expected[:, 1:]
     relative_l2 = np.linalg.norm(actual - expected, axis=(1, 2)) / np.linalg.norm(expected, axis=(1, 2))
     cosine = (actual * expected).sum(axis=2) / (np.linalg.norm(actual, axis=2) * np.linalg.norm(expected, axis=2))
-    print(f"sequence={sequence} valid_keys={valid_length} heads={HEADS} sampled_rows={len(rows)} "
+    print(f"sequence={sequence} valid_keys={valid_length} heads={args.heads} "
+          f"head_width={args.head_width} sampled_rows={len(rows)} "
           f"finite={finite} repeatable={repeatable} "
           f"worst_head_relative_l2={relative_l2.max():.6g} min_row_cosine={cosine.min():.8f} "
           f"{fixture_stats}")

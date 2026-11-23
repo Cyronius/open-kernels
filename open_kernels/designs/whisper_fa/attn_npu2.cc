@@ -345,12 +345,13 @@ matmul_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA,
 #define dk_full dk
 #endif
 
-constexpr double constexpr_sqrt_dk = (dk_full == 64)    ? 8.0
+constexpr double constexpr_sqrt_dk = (dk_full == 32)    ? 5.656854249492381
+                                     : (dk_full == 64)  ? 8.0
                                      : (dk_full == 128) ? 11.313708498984761
                                      : (dk_full == 256) ? 16.0
                                      : (dk_full == 512) ? 22.627416997969522
                                                         : 8.0;
-static_assert(dk_full == 64 || dk_full == 128 || dk_full == 256 ||
+static_assert(dk_full == 32 || dk_full == 64 || dk_full == 128 || dk_full == 256 ||
                   dk_full == 512,
               "Unsupported dk_full value: update constexpr_sqrt_dk");
 

@@ -18,13 +18,12 @@ int main(int argc, char **argv) {
         npue::enc::Stack stack(device, model, argv[2], options);
         std::unique_ptr<npue::npu::BertAttention> attention;
         if (const auto* path = std::getenv("NPUE_BERT_ATTENTION_PROBE")) {
-            if (npue::enc::g_heads != 12 || npue::enc::g_head_dim != 64)
-                throw std::runtime_error("BERT NPU attention requires 12 heads of width 64");
             const auto files = npue::npu::load_bert_attention(path);
-            if (files.sequence != npue::enc::g_seq)
-                throw std::runtime_error("BERT attention and projection designs differ in sequence length");
+            if (files.sequence != npue::enc::g_seq || files.heads != npue::enc::g_heads ||
+                files.head_width != npue::enc::g_head_dim)
+                throw std::runtime_error("BERT attention geometry disagrees with the encoder");
             attention = std::make_unique<npue::npu::BertAttention>(
-                files.image, files.instructions, npue::enc::g_seq,
+                files.image, files.instructions, files.sequence, files.heads, files.head_width,
                 npue::enc::bf16_fill, npue::enc::bf16_read);
             stack.lead->attention_probe = std::ref(*attention);
         }
