@@ -67,7 +67,7 @@ def main():
             f"/I{NPUE}", f"/I{xrt_include}", f"/I{boost_include}",
             f"/I{REPO / 'npu_offload' / 'gemm_rtp'}",
             f"/I{REPO / 'src' / 'include'}",
-            str(Path(__file__).with_name(program)), *sources, str(xrt_lib),
+            str(Path(__file__).with_name(program)), *sources, str(xrt_lib), "bcrypt.lib",
             f"/Fe{output}",
         ], cwd=stage, check=True)
 

@@ -6,11 +6,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <limits>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "../../open_kernels/harness/stream_patch.hpp"
@@ -22,7 +19,7 @@
 
 namespace npue::npu {
 
-// The caller checks attention.json before constructing the context. This
+// The caller supplies the checked xclbin and instruction bytes. This
 // adapter consumes the 12-by-64 NPUE projection where Q already carries 1/8.
 // Use one instance per serialized NPU route.
 class BertAttention {
@@ -52,13 +49,12 @@ private:
 
 public:
     double io_ms = 0, dispatch_ms = 0;
-    BertAttention(const std::string& artifact, int64_t sequence,
+    BertAttention(const std::vector<char>& image_bytes, const std::vector<char>& bytes,
+                  int64_t sequence,
                   Narrow narrow_bf16, Widen widen_bf16)
         : capacity(sequence), narrow(narrow_bf16), widen(widen_bf16) {
         if ((capacity != 512 && capacity != 2048 && capacity != 8192) || !narrow || !widen)
             throw std::invalid_argument("unsupported BERT attention geometry or conversion");
-        std::ifstream file(artifact + "/insts.bin", std::ios::binary);
-        const std::vector<char> bytes{std::istreambuf_iterator<char>(file), {}};
         if (bytes.empty() || bytes.size() % sizeof(uint32_t) ||
                 bytes.size() / sizeof(uint32_t) > static_cast<size_t>((std::numeric_limits<int>::max)()))
             throw std::runtime_error("invalid BERT attention stream");
@@ -66,7 +62,7 @@ public:
         std::memcpy(words.data(), bytes.data(), bytes.size());
         patches = stream_patch::bert_length_table(words, marker);
         instruction_count = static_cast<uint32_t>(words.size());
-        auto image = xrt::xclbin(artifact + "/final.xclbin");
+        auto image = xrt::xclbin(image_bytes);
         context = xrt::hw_context(device, device.register_xclbin(image));
         kernel = xrt::kernel(context, "MLIR_AIE");
         instructions = xrt::bo(device, bytes.size(), xrt::bo::flags::cacheable, kernel.group_id(1));

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 #include "bert_attention.hpp"
+#include "bert_attention_files.hpp"
 
 int main(int argc, char **argv) {
     try {
@@ -19,7 +20,12 @@ int main(int argc, char **argv) {
         if (const auto* path = std::getenv("NPUE_BERT_ATTENTION_PROBE")) {
             if (npue::enc::g_heads != 12 || npue::enc::g_head_dim != 64)
                 throw std::runtime_error("BERT NPU attention requires 12 heads of width 64");
-            attention = std::make_unique<npue::npu::BertAttention>(path, npue::enc::g_seq, npue::enc::bf16_fill, npue::enc::bf16_read);
+            const auto files = npue::npu::load_bert_attention(path);
+            if (files.sequence != npue::enc::g_seq)
+                throw std::runtime_error("BERT attention and projection designs differ in sequence length");
+            attention = std::make_unique<npue::npu::BertAttention>(
+                files.image, files.instructions, npue::enc::g_seq,
+                npue::enc::bf16_fill, npue::enc::bf16_read);
             stack.lead->attention_probe = std::ref(*attention);
         }
         npue::enc::EmbedService service{

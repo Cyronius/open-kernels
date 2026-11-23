@@ -313,19 +313,28 @@ in a temporary directory. Use `--oflm` for a checkout containing that commit,
 import library, `--boost-include` for the Boost headers, and `--output` for the
 executable. Put the matching XRT runtime libraries on `PATH` for execution.
 
-Verify the attention directory with `export_bert_attention.py --check --sequence`
-and `--out` before setting `NPUE_BERT_ATTENTION_PROBE` to it. Set
+Set `NPUE_BERT_ATTENTION_PROBE` to an exported attention directory. Set
 `NPUE_NOMIC_DYNAMIC_ROPE=1` for Nomic v1.5. Run the executable with `PACK DESIGN
 FIXTURE PREFIX OUTPUT` and append `FIXTURE OUTPUT` pairs to reuse the resident
 encoder. The build replay matched all four recorded vectors byte for byte and
 again produced identical Nomic outputs before and after the 8,192-token request.
 
 Pass `--worker` to the same build command to build the resident NPUE text
-worker. Run it with `PACK DESIGN [VERIFIED-ATTENTION-DIRECTORY]`. The worker
+worker. Run it with `PACK DESIGN [ATTENTION-DIRECTORY]`. The worker
 loads one model, enables Nomic v1.5's per-input rotary scaling, reports its
 capacity and prompt names in a protocol-1 greeting, and accepts newline-delimited
 JSON requests with `texts` and optional `prompt_name`. Its stdout carries only
 protocol records. Device diagnostics go to stderr.
+
+The worker and probe verify the attention manifest geometry, both payload sizes
+and both SHA-256 digests at startup. They check that the attention and projection
+designs have the same sequence length, then give XRT the checked bytes from
+memory. The native loader accepted the 512-, 2,048- and 8,192-capacity exports
+and XRT read the same xclbin UUIDs from memory and disk. The worker refused
+a bit change in either payload, a shortened instruction stream, a changed
+runtime marker and a missing manifest before opening the model. Raw report
+`.plans/bert/native-attention-loader.log`, SHA-256
+`7f196a767250d44d143facb3025870d84b3ff2d43e2779f829c0d3d6a6f6e1ea`.
 
 On the Strix Point NPU, the built worker returned byte-identical vectors for
 GTE at 8,192 tokens and Nomic at 2,048 and 8,192 tokens. It preserved the Nomic

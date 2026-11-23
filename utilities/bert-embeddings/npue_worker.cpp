@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "npue_encoder.hpp"
 #include "bert_attention.hpp"
+#include "bert_attention_files.hpp"
 #include "nomic_matryoshka.hpp"
 #include <nlohmann/json.hpp>
 
@@ -10,6 +11,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -89,14 +91,20 @@ int main(int argc, char** argv) {
     auto* protocol = pipe.get();
     try {
         if (argc != 3 && argc != 4)
-            throw std::invalid_argument("usage: npue-worker PACK DESIGN [VERIFIED-ATTENTION-DIRECTORY]");
+            throw std::invalid_argument("usage: npue-worker PACK DESIGN [ATTENTION-DIRECTORY]");
+        std::optional<npue::npu::BertAttentionFiles> files;
+        if (argc == 4) files = npue::npu::load_bert_attention(argv[3]);
         std::unique_ptr<npue::npu::BertAttention> attention;
         npue::enc::Embedder model({argv[1], argv[2], 12, 1});
         if (is_nomic_v15(model)) model.enable_nomic_dynamic_rope();
-        if (argc == 4) {
+        if (files) {
+            if (files->sequence != model.seq())
+                throw std::runtime_error("BERT attention and projection designs differ in sequence length");
             attention = std::make_unique<npue::npu::BertAttention>(
-                argv[3], model.seq(), npue::enc::bf16_fill, npue::enc::bf16_read);
+                files->image, files->instructions, model.seq(),
+                npue::enc::bf16_fill, npue::enc::bf16_read);
             model.set_attention_probe(std::ref(*attention));
+            files.reset();
         }
         reply(protocol, {{"ok", true}, {"protocol", 1}, {"dimensions", model.hidden()},
                          {"context", model.seq()}, {"npu_attention", bool(attention)},
