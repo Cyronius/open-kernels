@@ -94,8 +94,7 @@ def tensor_mapping():
     return mapping
 
 
-def add_tokenizer(writer, source):
-    text = source.read_bytes().decode("utf-8")
+def tokenizer_parts(text):
     tokenizer = json.loads(text)
     model = tokenizer["model"]
     normalizer = tokenizer["normalizer"]
@@ -107,6 +106,13 @@ def add_tokenizer(writer, source):
     special = {item["content"]: item["id"] for item in tokenizer["added_tokens"] if item["special"]}
     if special != {"<s>": 0, "<pad>": 1, "</s>": 2, "<unk>": 3, "<mask>": 250001}:
         raise ValueError("Tokenizer special IDs differ from the publisher checkpoint")
+    charsmap = b64decode(normalizer["precompiled_charsmap"], validate=True)
+    return vocab, scores, special, charsmap
+
+
+def add_tokenizer(writer, source):
+    text = source.read_bytes().decode("utf-8")
+    vocab, scores, special, charsmap = tokenizer_parts(text)
     padding = range(len(vocab), VOCAB_SIZE)
     types = [TokenType.NORMAL] * len(vocab) + [TokenType.UNUSED] * len(padding)
     for piece, index in special.items():
@@ -118,7 +124,7 @@ def add_tokenizer(writer, source):
     writer.add_token_scores(scores + (0.0,) * len(padding))
     writer.add_token_types(types)
     writer.add_token_type_count(1)
-    writer.add_precompiled_charsmap(b64decode(normalizer["precompiled_charsmap"], validate=True))
+    writer.add_precompiled_charsmap(charsmap)
     writer.add_bos_token_id(special["<s>"])
     writer.add_eos_token_id(special["</s>"])
     writer.add_sep_token_id(special["</s>"])

@@ -234,7 +234,8 @@ The in-progress host profile already has a paired Nomic measurement with the sam
 passes grew from 1.40?1.47 s to 50.06?63.78 s, while host softmax grew from
 0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. Five warm
 calls with an exact 8,192-token Nomic input took 61.00?63.71 s. Host QK and AV
-accounted for 57.68?60.46 s and softmax for 2.36?2.46 s. The GTE cases are still running.
+accounted for 57.68?60.46 s and softmax for 2.36?2.46 s. The first two GTE calls at
+8,192 tokens took 60.06 and 58.28 s, with 56.44 and 54.58 s in QK and AV.
 
 A local integration build is queued on the two long-context families. It routes
 post-projection Q/K/V through the NPU attention image, selects the mask from the
@@ -342,8 +343,12 @@ and a new output path and requires the Python `gguf`, `numpy` and `safetensors` 
 
 The replayed NPUE pack served 64- and 512-token single and batch-4 requests with a
 minimum cosine of 0.999379 against the original publisher CPU model. It passed
-`oflm-test --embedding`. A direct GGUF reader and validation through the standard
-installation path are still required.
+`oflm-test --embedding`. The new
+[GGUF staging utility](../../utilities/bert-embeddings/stage_gte_gguf.py) reconstructs
+the tokenizer, tensors and equivalent legacy RoPE config using the GGUF as its only
+input. This leaves native NPUE packing and tokenizer generation to the existing
+packer. A cold OFLM check from that staged directory is queued at 512 tokens.
+Registry and automatic GGUF dispatch are still OFLM-side work.
 
 OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
 and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
