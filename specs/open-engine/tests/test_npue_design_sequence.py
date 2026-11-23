@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import runpy
 import sys
 
 import pytest
@@ -54,3 +55,35 @@ def test_design_sequence_matches_export_flags_and_stream_rows(
         str(CHECKER), "--xclbins", str(root), "--spec", str(family_spec), "--only", "bert",
     ])
     assert checker.main() == expected_exit
+
+
+def test_derive_sequence_reuses_the_image_and_compiled_rows(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(CHECKER.parent))
+    derive = runpy.run_path(str(CHECKER.with_name("derive_sequence.py")))["derive"]
+    source = tmp_path / "source"
+    bundle = source / "gemm_rtp"
+    bundle.mkdir(parents=True)
+    (bundle / "final.xclbin").write_bytes(b"static image")
+    (bundle / "insts.bin").write_bytes(b"bootstrap")
+    streams = []
+    for slot, op in enumerate(("qkv", "attn_out", "ffn_up", "ffn_down"), start=1):
+        filename = f"insts_{op}_b8.bin"
+        (bundle / filename).write_bytes(op.encode())
+        streams.append(dict(op=op, M=512, K=384, N=384, batch=8, slot=slot, file=filename))
+    design = dict(M=512, seq=64, batch=8, tiers=[8], streams=streams)
+    (bundle / "design.json").write_text(json.dumps(design), encoding="utf-8")
+
+    output = tmp_path / "derived"
+    with pytest.raises(ValueError, match="no compiled stream"):
+        derive(source, output, 256, [1, 2])
+    assert not output.exists()
+
+    derive(source, output, 512, [1])
+    result = output / "gemm_rtp"
+    derived = json.loads((result / "design.json").read_text(encoding="utf-8"))
+    assert (derived["M"], derived["seq"], derived["batch"], derived["tiers"]) == (512, 512, 1, [1])
+    assert (result / "final.xclbin").read_bytes() == (bundle / "final.xclbin").read_bytes()
+    assert (result / "insts.bin").read_bytes() == (bundle / "insts.bin").read_bytes()
+    for old, new in zip(streams, derived["streams"], strict=True):
+        assert new == dict(old, batch=1, file=f"insts_{old['op']}_b1.bin")
+        assert (result / new["file"]).read_bytes() == (bundle / old["file"]).read_bytes()

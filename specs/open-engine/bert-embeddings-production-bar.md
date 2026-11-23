@@ -134,6 +134,17 @@ It uses four streams and the same 8,192 total rows as the largest release tier. 
 `design.json` SHA-256 is `b73db99879c4bb42d194caf781cd43f7523f3e76fa491ff554e5dbf55f4f67a3`.
 Runtime and Nomic dynamic RoPE parity are separate checks.
 
+The [sequence derivation tool](../../npu_offload/gemm_rtp/derive_sequence.py) also generated
+an 8,192-token design directly from the 512-token design's batch-16 streams. Its xclbin and
+bootstrap instructions are byte-identical to the source 512-token design. Its four per-operation
+instruction files are byte-identical to the independently built 8,192-token instructions.
+The derived artifact passed the checker. A separate hardware comparison is queued.
+
+The 64- and 512-token artifacts have eight shared streams for each family. All 40 corresponding
+instruction pairs were byte-identical. The gated family's AIE partition payload, connectivity,
+IP layout and memory topology matched using `xclbinutil`. The other four AIE partitions
+differed, so this audit does not treat arbitrary release xclbins as interchangeable.
+
 A standalone MiniLM profile using the same 512-token design dispatched four GEMMs per layer
 (24 total). Five warm runs measured host attention at 18.1–21.7 ms, softmax at 3.9–5.2 ms,
 normalization at 1.5–1.7 ms, conversions and bias at 2.9–4.0 ms, and buffer sync at 0.8–1.5 ms.
@@ -236,3 +247,6 @@ Raw report `.plans/bert/features.log`, SHA-256
   GGUF quant in the registry metadata and report the runtime packing format separately.
 - Honor and validate supported embedding dimensions. Expose GTE's sparse output or document
   the dense-only route and its reason.
+- Keep the 64-token throughput route and select larger compiled rows for longer inputs.
+  Cache compatible sequences in one context where the physical image matches. Measure the
+  steady-state dispatch path across length changes before promoting a release default.
