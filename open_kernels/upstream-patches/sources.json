@@ -893,9 +893,16 @@
   "bert_embedding_probe": {
     "source_head": "9b1409d3e150e3602936307f5ff725c7bb4ac8af",
     "patch": "bert-embedding-probe-runtime.patch",
+    "patch_sha256": "ad3efcdc7a3820202f8cb1ebe570ec31c8ed4a8aea238c00e384c54c53d1d966",
     "files": [
       "src/open_npue/npue_encoder.hpp"
     ],
-    "scope": "NPUE encoder hooks for the BERT probe and resident worker, including NPU attention, Nomic v1.5 rotary scaling, pretokenized input, text length routing and final token rows for sparse scoring"
+    "base_file_sha256": {
+      "src/open_npue/npue_encoder.hpp": "5bf7f4c91da9f73512b502ae206b170f837514993174144fe52c76723e61494e"
+    },
+    "result_file_sha256": {
+      "src/open_npue/npue_encoder.hpp": "3bdfc7cd75051dfffa9071ad6132f92dcd9dde6fe062f557bb830e18de5bad6f"
+    },
+    "scope": "NPUE encoder hooks for the BERT probe and resident worker, including NPU attention, Nomic v1.5 rotary scaling, pretokenized input, text length routing, final token rows for sparse scoring and per-request stage timings"
   }
 }

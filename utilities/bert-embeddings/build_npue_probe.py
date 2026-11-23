@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
@@ -30,6 +31,25 @@ PACKER_SOURCES = (
     "xlmr_tokenizer_gen.cpp",
     "bbpe_tokenizer_gen.cpp",
 )
+
+
+def require_sha256(content, expected, path):
+    # Git archive can apply Windows checkout line endings to a source file.
+    canonical = content.replace(b"\r\n", b"\n")
+    if hashlib.sha256(canonical).hexdigest() != expected:
+        raise ValueError(f"NPUE runtime SHA-256 mismatch: {path}")
+
+
+def apply_runtime_patch(stage, entry):
+    patch_path = PATCH_DIR / entry["patch"]
+    # Apply the same LF patch bytes on Windows and Linux checkouts.
+    patch = patch_path.read_text(encoding="utf-8").encode("utf-8")
+    require_sha256(patch, entry["patch_sha256"], patch_path)
+    for name, checksum in entry["base_file_sha256"].items():
+        require_sha256((stage / name).read_bytes(), checksum, name)
+    subprocess.run(["git", "apply", "-"], input=patch, cwd=stage, check=True)
+    for name, checksum in entry["result_file_sha256"].items():
+        require_sha256((stage / name).read_bytes(), checksum, name)
 
 
 def main():
@@ -79,8 +99,7 @@ def main():
         if args.packer:
             program, source_names = "pack_npue.cpp", PACKER_SOURCES
         else:
-            patch = (PATCH_DIR / entry["patch"]).read_text(encoding="utf-8")
-            subprocess.run(["git", "apply", "-"], input=patch.encode("utf-8"), cwd=stage, check=True)
+            apply_runtime_patch(stage, entry)
             program = "npue_worker.cpp" if args.worker else "profile_npue.cpp"
             source_names = SOURCES
         sources = [str(NPUE / name) for name in source_names]

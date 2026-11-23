@@ -357,7 +357,9 @@ The [NPUE probe build](../../utilities/bert-embeddings/build_npue_probe.py) buil
 the same route from tracked sources in an x64 MSVC developer shell. It archives
 `src/open_npue` from OFLM commit `9b1409d3e150e3602936307f5ff725c7bb4ac8af`
 and applies the [encoder patch](../../open_kernels/upstream-patches/bert-embedding-probe-runtime.patch)
-in a temporary directory. Use `--oflm` for a checkout containing that commit,
+in a temporary directory. The build checks the patch and both versions of the
+encoder header against the SHA-256 values in `open_kernels/upstream-patches/sources.json`,
+using LF line endings for the hashes. Use `--oflm` for a checkout containing that commit,
 `--xrt-include` for the XRT core include directory, `--xrt-lib` for the coreutil
 import library, `--boost-include` for the Boost headers, and `--output` for the
 executable. Put the matching XRT runtime libraries on `PATH` for execution.
