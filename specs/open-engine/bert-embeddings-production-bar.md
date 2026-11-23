@@ -1,0 +1,126 @@
+# BERT embedding production audit
+
+This audit covers the six encoders in [OFLM #240](https://github.com/Atomic-Germ/OpenFlowLM-Next/issues/240).
+The inference entry point is `oflm serve --embed 1 --embeddingmodel TAG`. The benchmark entry point is
+`oflm bench-embed TAG`, which reports encoder latency and throughput across batch sizes.
+
+## Production bar
+
+| Gate | Evidence and remaining work |
+|---|---|
+| Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
+| Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
+| Context | The release designs process 64 tokens per sequence. The 512-token build is a candidate. Check real token counts and the over-limit response before comparing vectors or timing any longer request. |
+| NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. Tokenization, embedding lookup, attention/softmax, normalization, activation, and pooling are host stages. Stage costs over long inputs remain open. |
+| Speculative decode | Not applicable to an encoder. |
+| Published input weights | The present registry pulls and packs publisher safetensors into the tiled NPUE format. Establish published GGUF coverage per checkpoint and compare quality before choosing the default quant. |
+| Serving and features | Run `oflm-test --embedding` on each tag. Exercise Nomic task prefixes and GTE multilingual inputs. Check GTE sparse output support and the publishers' elastic dimensions separately from full-width dense vectors. |
+
+| Tag | Published input length to verify | Design family |
+|---|---:|---|
+| `all-minilm:l6-v2` | 256 in the published Sentence Transformers configuration | `BERT-h384-bfp16` |
+| `bge-small:en-v1.5` | 512 | `BERT-h384-bf16` |
+| `bge-base:en-v1.5` | 512 | `BERT-h768-bfp16` |
+| `bge-large:en-v1.5` | 512 | `BERT-h1024-bfp16` |
+| `nomic-embed-text:v1.5` | 8,192 with the publisher's dynamic RoPE scaling | `BERT-h768-gated-bfp16` |
+| `gte-multilingual:base` | 8,192 | `BERT-h768-gated-bfp16` |
+
+The 512-token comparison also includes MiniLM as an exploratory run. Its encoder has 512 position
+embeddings and the publisher uses a 256-token truncation limit for serving. See the
+[MiniLM model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2),
+[Nomic model card](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5#long-context),
+and [GTE model card](https://huggingface.co/Alibaba-NLP/gte-multilingual-base).
+
+## Artifact and input checks
+
+- All five design families from [OFLM pre-v.0.1.0](https://github.com/Atomic-Germ/OpenFlowLM-Next/releases/tag/pre-v.0.1.0)
+  passed `check_design_sets.py`. Linux tarball SHA-256
+  `58997fb7115bf40903e3edda8184d4ced749a4c622d3c2e53f09f5c0ebf50a13`.
+- The extended comparison uses `--seq 512 --batch 16 --batches 1,4,16`, keeping the largest
+  stream at the release design's 8,192 rows. The original batch-multiple-of-four guard rejected
+  the one-sequence tier. Its matrix has 512 rows, which meets the exporter's actual 256-row
+  tile requirement. The audit still needs to verify the resulting artifact on hardware.
+- A standalone build of OFLM's NPUE packer packed all six checkpoints at the lengths needed for
+  the extended comparison. The automatic pack path uses 256 positions for BERT and Nomic and
+  64 for GTE. The isolated comparison directories carry separately generated containers, with
+  512 positions for BERT and 8,192 for the two RoPE models. Container length alone does not
+  prove that an encoder computes the publisher's long-context RoPE.
+- GTE's live `config.json` changed its model type from `new` to `gte` at
+  [publisher commit 6dde5e2](https://huggingface.co/Alibaba-NLP/gte-multilingual-base/commit/6dde5e2ebcac02a5459a3cf310346901fa1dc8ff).
+  OFLM's downloader fetched the new file and warned about a hash mismatch. The existing automatic
+  packer selects the GTE path by `model_type == "new"`. A subsequent cold-pack probe failed
+  with missing `embeddings.word_embeddings.weight` after the config fell through to the BERT
+  packer. The config from
+  [revision 9bbca17](https://huggingface.co/Alibaba-NLP/gte-multilingual-base/tree/9bbca17d9273fd0d03d5725c7a4b0f6b45142062)
+  exactly matches the recorded Git blob hash, `9f640b05ee684e9680fdc90000de85559061c5ef`, and the isolated
+  pack succeeded with it.
+
+Use [the comparison utility](../../utilities/bert-embeddings/check.py) with a local checkpoint directory
+to make the same exact-length requests to OFLM and the checkpoint's CPU implementation. Use
+`--prompt-name document --prefix "search_document: "` for Nomic serving. The utility checks the
+server's model identity, processed token count, and vector normalization before recording the
+comparison. Long-input performance needs a quiet-machine repeat with the driver and design named.
+
+## Release design control
+
+Windows OFLM v0.1.0 development binary, performance power mode, release xclbins and independently
+packed publisher checkpoints. The control ran during a compiler build, so these records establish
+vector quality and serving behavior. The timings are exploratory. For each model, both fixtures
+at 32 and 64 tokens passed the server's token-count, model identity and normalization checks.
+
+| Model | CPU cosine range, four requests | `oflm-test --embedding` |
+|---|---:|---|
+| MiniLM | 0.999593–0.999741 | Pass |
+| BGE small | 0.999987–0.999993 | Pass |
+| BGE base | 0.999715–0.999806 | Pass |
+| BGE large | 0.999750–0.999783 | Pass |
+| Nomic | Pending | Eight errors. The suite sends its normal requests without `prompt_name` and the server requires it. Explicit `document` requests passed both lengths. |
+| GTE | Pending | Pass with the pinned source config and separately packed container |
+
+Raw reports are under `.plans/bert/release-quality-*.log` and `.plans/bert/release-oflm-test-*.log`
+in the bring-up worktree.
+
+## 512-token candidate
+
+MiniLM's re-export loaded on the NPU with 12 instruction streams and batch tiers 1, 4 and 16.
+`oflm-test --embedding` passed. Both 256-token probes agreed with the publisher CPU reference at
+cosines 0.999015–0.999122. Both 512-token probes returned a 512-token usage count and agreed at
+0.999020–0.999065. The comparison was run during a compiler build, so use it for quality and
+coverage. Raw report `.plans/bert/seq512-quality-all-minilm_l6-v2.log`, SHA-256
+`2bd1b7d74f209070f95011a4a5b74ce23c19861c164e89292221f0d41fb5257c`.
+
+BGE small served both 512-token requests at CPU cosines 0.999982–0.999984. Its embedding suite
+passed. An exact 513-token request received HTTP 500 with a generic server error. The engine
+rejected the oversized input, and the REST layer needs to expose that as a client error.
+
+A standalone MiniLM profile using the same 512-token design dispatched four GEMMs per layer
+(24 total). Five warm runs measured host attention at 18.1–21.7 ms, softmax at 3.9–5.2 ms,
+normalization at 1.5–1.7 ms, conversions and bias at 2.9–4.0 ms, and buffer sync at 0.8–1.5 ms.
+GELU ran in the fused host packing path. Kernel dispatch and wait took 9.2–10.7 ms for the first
+three runs and rose to 71.5 and 116.6 ms during the last two. Collect a quiet-machine repeat
+before using these figures as performance claims.
+
+## Published GGUF candidates
+
+Five pinned Q4_K_M downloads matched their Hub SHA-256. The loader's compatibility depends on the
+tensor types inside each file. The tag alone does not establish that coverage.
+
+| Model | Candidate source | Input check |
+|---|---|---|
+| MiniLM | Jarbas, `cd9d5518` | Contains Q5_0 tensors. OFLM add refuses this file. Second State's Q8_0 passed the dry-run preflight. |
+| BGE small | CompendiumLabs, `d32f8c04` | Contains Q5_0 tensors. Check the Q8_0 variant. |
+| BGE base | CompendiumLabs, `24914efd` | F32, Q4_K and Q6_K. Runtime and quantized quality still to check. |
+| BGE large | CompendiumLabs, `03b9bf10` | F32, Q4_K and Q6_K. Runtime and quantized quality still to check. |
+| Nomic | Nomic AI, `0188c9bf` | Q4_K_M includes Q5_K. Check the publisher's compatible alternative. |
+| GTE | No matching published GGUF found in the initial Hub search | The current NPUE GGUF adapter accepts `bert` and `nomic-bert`. GTE needs its own conversion and loader validation. |
+
+## OFLM side
+
+- Make a clean GTE pull reproducible by pinning the known config revision or accepting and
+  validating the publisher's updated metadata. Demonstrate a cold pull and pack on the chosen route.
+- Keep the declared model lengths, packed position capacity and shipped design coverage aligned.
+  Verify `oflm serve`, `oflm-test --embedding`, the benchmark page, the Recommended models table,
+  and the requested published-GGUF setup for each tag.
+- Teach the embedding test suite to send a supported task prompt for its ordinary Nomic requests.
+  Keep its separate task and error-path coverage.
+- Map the encoder's over-limit error to an HTTP 400 with the input length and supported limit.

@@ -377,8 +377,8 @@ def main() -> int:
              else [args.batch])
     tiers = sorted(set(tiers))
     for b in tiers:
-        if b % 4:
-            raise SystemExit(f"batch {b}: must be a multiple of 4")
+        if b <= 0:
+            raise SystemExit(f"batch {b}: must be positive")
     if max(tiers) != args.batch:
         raise SystemExit(f"--batch {args.batch} must be the largest tier "
                          f"(tiers are {tiers})")
@@ -397,7 +397,7 @@ def main() -> int:
             raise SystemExit(
                 f"--seq {args.seq} x batch tier {b} gives M = {b * args.seq}, "
                 f"which is not a multiple of m*rows = {args.m * 4}. Pick a "
-                f"tier or a seq whose product divides it.")
+                "tier or sequence length that aligns the row count.")
     if args.seq != DEFAULT_SEQ:
         print(f"  seq        {args.seq} (default {DEFAULT_SEQ}). M = "
               f"batch*seq, so tiers {tiers} give "

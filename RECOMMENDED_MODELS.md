@@ -19,7 +19,7 @@ Update this file in the same commit as the evidence. Each model's full audit is 
 | flux2-klein:4b | n/a | done | n/a | done | n/a | done (Q8_0) | **passes** (Linux GGUF run open) |
 | Granite 4.2 3B | done (`attn_fa` to 131k) | open (decode at its floor to 2k, 1.15x at 8k, 1.4x at 32k; prefill 2.2-2.9x the old default, 0.89-1.07x Vulkan) | done (131k runs; needle = llama.cpp to 64k) | done (host stages named) | done (lookup) | done (IBM Q4_1 GGUF) | open: decode attention past 8k ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GRANITE) |
 | Gemma 4 E2B / E4B | done for E4B text (#238); E2B not rerun | open (unprofiled; prefill fell 85 to 62 tok/s) | open (32k once, not repeated) | open (towers refused) | open (Unsloth MTP, prompt lookup) | open (Google QAT Q4_0; Unsloth reason to record) | [planned](specs/open-engine/plans/gemma4e-production-bar.md); vision, video, audio not open |
-| BERT embeddings (bge x3, minilm, nomic, gte) | ? | ? | ? | ? | n/a | ? | not started |
+| BERT embeddings (bge x3, minilm, nomic, gte) | done (batch encoder) | open (matched-length timings and host profile) | open (release 64; 512 candidate) | open (host stages named, long-input costs pending) | n/a | open (publisher safetensors path verified) | [in validation](specs/open-engine/bert-embeddings-production-bar.md) |
 | whisper-v3:turbo | ? | ? | ? | open (decoder on host) | ? | ? | not started |
 | qwen3.6-moe:35b-a3b | ? | ? | open (32k test) | ? | open (DFlash planned) | ? | not started |
 | gpt-oss:20b | done (`attn_fa_gx` to 131k) | done, rest named (decode 82-84 ms short; 409 ms a step at 131k, compute-bound over a 170 ms stream floor) | done (needle at 130,500) | done (host stages named) | done (measured rejection: prompt lookup, DFlash) | done (ggml-org MXFP4 GGUF) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GPTOSS); bench is a development run |
@@ -84,11 +84,18 @@ Audit: `spec.md` OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b" (2026-11-21).
   for a publishable bench report.
 - OFLM side: registry entry (MXFP4 GGUF, gptoss, 131,072); `oflm add` / `serve` / `bench`; benchmark page; README row.
 
+### BERT embeddings
+
+The five release design families passed the artifact check. MiniLM passed the OFLM embedding
+suite and matched the publisher checkpoint's CPU vectors at 32 and 64 tokens. The current
+release route processes up to 64 tokens. The [production audit](specs/open-engine/bert-embeddings-production-bar.md)
+tracks the longer designs, published weight formats, and the GTE config change affecting clean installs.
+
 ### Others
 
 Not audited. Local evidence to start from:
 
-- BERT embeddings, whisper-v3:turbo: no spec here; FLM rows in
+- whisper-v3:turbo: no spec here; FLM rows in
   [flm-kernel-matrix.md](specs/open-engine/flm-kernel-matrix.md).
 - qwen3.6-moe:35b-a3b: OPEN-FAMILY-QWEN36MOE-GGUF;
   [dflash-drafters.md](specs/open-engine/plans/dflash-drafters.md).

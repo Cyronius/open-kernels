@@ -31,6 +31,8 @@ param(
     [string] $Only = "",
     # Where the sets go. Defaults to the tree this script lives in.
     [string] $Dst = "",
+    # Alternative family spec for experimental sequence lengths.
+    [string] $Spec = "",
     # Rebuild even if the set is already there.
     [switch] $Force
 )
@@ -39,9 +41,11 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 if (-not $Dst) { $Dst = (Join-Path $here '..\..\src\xclbins') }
 $Dst = [IO.Path]::GetFullPath($Dst)
+if (-not $Spec) { $Spec = (Join-Path $here 'families.json') }
+$Spec = [IO.Path]::GetFullPath($Spec)
 
-$spec = Get-Content (Join-Path $here 'families.json') -Raw | ConvertFrom-Json
-$common = $spec.common
+$familySpec = Get-Content -LiteralPath $Spec -Raw | ConvertFrom-Json
+$common = $familySpec.common
 
 # The IRON toolchain, checked before four minutes of work rather than after.
 # Without `. .\iron_env.ps1` the failure is `ModuleNotFoundError: No module
@@ -59,12 +63,12 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-$families = $spec.families
+$families = $familySpec.families
 if ($Only) {
     $families = @($families | Where-Object { $_.name -eq $Only })
     if (-not $families) {
         Write-Host "No family named '$Only'. Known:" -ForegroundColor Red
-        $spec.families | ForEach-Object { Write-Host "  $($_.name)" }
+        $familySpec.families | ForEach-Object { Write-Host "  $($_.name)" }
         exit 1
     }
 }
@@ -122,9 +126,9 @@ if ($failed.Count) {
 # The spec and the sets it produced must agree. This catches a flag edited in
 # families.json without a rebuild, and a set built by some other route.
 Write-Host ""
-Write-Host "Checking the built sets against families.json:"
+Write-Host "Checking the built sets against $Spec"
 Push-Location $here
-& python check_design_sets.py --xclbins $Dst
+& python check_design_sets.py --xclbins $Dst --spec $Spec
 $rc = $LASTEXITCODE
 Pop-Location
 exit $rc

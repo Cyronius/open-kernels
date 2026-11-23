@@ -33,11 +33,14 @@ Exits non-zero on any disagreement, and on a family that is not built.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_SEQ = 64
+STREAM_OPS = ("qkv", "attn_out", "ffn_up", "ffn_down")
 
 
 def expected(argv: list[str]) -> dict:
@@ -60,6 +63,7 @@ def expected(argv: list[str]) -> dict:
         "c_dtype": "bf16" if "--c-bf16" in argv else "f32",
         "tile_n": val("-n", int, 48),
         "cols": val("--cols", int, 8),
+        "seq": val("--seq", int, DEFAULT_SEQ),
         # --batches defaults to "just --batch". THAT DEFAULT is the one-tier
         # bug above: omit the flag and you silently get a single tier.
         "tiers": sorted(int(b) for b in batches.split(",")) if batches else [batch],
@@ -78,6 +82,7 @@ def actual(d: dict) -> dict:
         "c_dtype": d.get("c_dtype", "f32"),
         "tile_n": (d.get("tile") or {}).get("n"),
         "cols": d.get("cols"),
+        "seq": d.get("seq", DEFAULT_SEQ),
         "tiers": sorted(d.get("tiers") or []),
         "tg_depth": d.get("tg_depth"),
         "a_dtype": d.get("a_dtype", "bf16"),
@@ -105,15 +110,32 @@ def main() -> int:
             bad += 1
             continue
         want = expected(list(fam["args"]) + list(common))
-        got = actual(json.loads(dj.read_text(encoding="utf-8")))
+        design = json.loads(dj.read_text(encoding="utf-8"))
+        got = actual(design)
         diff = {k: (want[k], got[k]) for k in want
                 if want[k] is not None and want[k] != got[k]}
-        if diff:
+        streams = design.get("streams", [])
+        wanted_streams = Counter((op, batch) for batch in want["tiers"] for op in STREAM_OPS)
+        found_streams = Counter((stream.get("op"), stream.get("batch")) for stream in streams)
+        wrong_rows = [
+            stream for stream in streams
+            if stream.get("batch") not in want["tiers"]
+            or stream.get("M") != stream["batch"] * want["seq"]
+        ]
+        if diff or wrong_rows or found_streams != wanted_streams:
             bad += 1
             print(f"MISMATCH {name}:")
             for k, (w, g) in sorted(diff.items()):
                 print(f"           {k}: families.json says {w!r}, "
                       f"design.json says {g!r}")
+            for name, streams_diff in (("missing", wanted_streams - found_streams),
+                                       ("unexpected", found_streams - wanted_streams)):
+                for (op, batch), count in streams_diff.items():
+                    print(f"           {name}: {count} {op} stream(s) for tier {batch}")
+            for stream in wrong_rows:
+                batch = stream.get("batch")
+                print(f"           {stream.get('op')} tier {batch}: "
+                      f"M={stream.get('M')} must equal a declared tier times seq={want['seq']}")
         else:
             print(f"ok       {name}")
 
