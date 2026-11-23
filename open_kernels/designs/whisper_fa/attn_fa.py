@@ -269,6 +269,7 @@ def flash_attn(
     assert lk % lkp == 0
     assert lk % (lkp * NS) == 0
     tile_size_q = lqp // NQ  # == attn_npu2.cc's `lqp` macro
+    assert lqp == NQ * lkp, "shared Q/K FIFO requires equally sized Q and K tiles"
     assert dk == lkp, "this port assumes dk_chunks == 1 (dk == lkp)"
     assert dv == lkp, "this port assumes dv_chunks == 1 (dv == lkp)"
     num_lq_iters = lq // lqp

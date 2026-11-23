@@ -672,6 +672,48 @@ and ELF report `.plans/bert/attention-shape-offline.log`, SHA-256
 Packed operand check `.plans/bert/attention-shape-qkv.log`, SHA-256
 `e4483d1d655843795702cc042153ffe21660bd7140cc1647a16b555ab3d271b4`.
 
+The first device run failed every 12-by-32 dispatch with XRT state 8.
+That export used a 64-row Q tile and a 32-row K tile in one FIFO. The
+replacement gives both tiles 32 rows and checks that invariant at build
+time. Both corrected capacities built twice with identical instruction
+streams and passed the 32-tile length-patch check. The largest program
+was 13,136 bytes and the largest reserved local extent plus static data
+was 17,860 bytes. The existing 12-by-64 control reproduced its instruction
+stream unchanged. Device parity for the corrected geometry remains open.
+The 16-by-64 BGE-large image passed
+both captured layers and the 257-key mask test. Its 512-key synthetic
+worst-head relative L2 was 0.038506 against a 0.03 limit, so it stayed on
+host attention. The remaining 16-by-64 gate needs a precision investigation.
+
+## First live Phlegm performance run
+
+On Ryzen AI 9 HX PRO 370 with Windows 26200, NPU driver 32.0.20102.3930
+and the Windows Balanced power scheme, MiniLM served directly from its
+Q8_0 GGUF. Minimum HTTP cosine was 0.999391 and a 257-token request
+returned HTTP 400. Each benchmark median used three warm samples.
+
+| Tokens per input | Batch | Routed latency, ms | Input tokens/s |
+|---|---:|---:|---:|
+| 64 | 1 | 11.95 | 5,358 |
+| 64 | 4 | 12.74 | 20,092 |
+| 256 | 1 | 18.87 | 13,563 |
+| 256 | 4 | 40.32 | 25,397 |
+
+On the paired 64-token controls, routing reduced latency from 13.83 to
+11.98 ms for batch one and from 37.17 to 12.42 ms for batch four. Private
+worker memory at startup grew from 146.6 MB to 293.1 MB. At the 256-token
+limit, batch four spent 15.43 ms in host attention and softmax combined,
+11.32 ms in projection dispatch and wait, and 4.83 ms in conversion and
+bias. The host attention path remains a target for this workload.
+
+GTE and Nomic also passed the resident FP-pack HTTP parity at 8,192 tokens.
+The remaining five GGUF benchmarks hit shared NPU lock contention during
+server startup. The timings above are development measurements and need
+a repeat under controlled load before release. Raw log
+`.plans/bert/hardware-gates.log`, SHA-256
+`dc3df8689291a2f8c740e49c84a4789e37fc17c422bcef7470196f2c88b25073`.
+MiniLM matrix SHA-256 `109c331e3d502071f707030c1630f6e61e80a3eb34c3e41b5f23c4ffdeef7866`.
+
 ## Cold packing from GGUF
 
 Build the CPU-only packer from an x64 MSVC developer shell with

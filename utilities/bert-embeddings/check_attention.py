@@ -144,7 +144,10 @@ def main():
     output = from_bf16(second).reshape(shape)
 
     # Sample both sides of each query-tile boundary and the last query.
-    tile_boundary_rows = {row for edge in range(256, valid_length, 256) for row in (edge - 1, edge)}
+    query_group = 4 * args.head_width
+    tile_boundary_rows = {
+        row for edge in range(query_group, valid_length, query_group) for row in (edge - 1, edge)
+    }
     rows = sorted(tile_boundary_rows | {row for row in (0, 1, 63, 64, valid_length - 1) if row < valid_length})
     query, key, value = tensors
     expected = reference(query, key[:, :valid_length], value[:, :valid_length], rows)

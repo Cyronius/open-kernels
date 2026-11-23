@@ -64,7 +64,7 @@ def build(path, sequence, heads=HEADS, head_width=HEAD_WIDTH):
         **os.environ,
         "FA_LQ": str(sequence),
         "FA_LK": str(sequence),
-        "FA_LQP": "256",
+        "FA_LQP": str(4 * head_width),
         "FA_LKP": str(head_width),
         "FA_DK": str(head_width),
         "FA_DV": str(head_width),
