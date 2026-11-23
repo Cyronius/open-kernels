@@ -107,12 +107,22 @@ tensor types inside each file. The tag alone does not establish that coverage.
 
 | Model | Candidate source | Input check |
 |---|---|---|
-| MiniLM | Jarbas, `cd9d5518` | Contains Q5_0 tensors. OFLM add refuses this file. Second State's Q8_0 passed the dry-run preflight. |
-| BGE small | CompendiumLabs, `d32f8c04` | Contains Q5_0 tensors. Check the Q8_0 variant. |
+| MiniLM | Jarbas, `cd9d5518` | Contains Q5_0 tensors. OFLM add refuses this file. |
+| BGE small | CompendiumLabs, `d32f8c04` | Contains Q5_0 tensors. |
 | BGE base | CompendiumLabs, `24914efd` | F32, Q4_K and Q6_K. Runtime and quantized quality still to check. |
 | BGE large | CompendiumLabs, `03b9bf10` | F32, Q4_K and Q6_K. Runtime and quantized quality still to check. |
-| Nomic | Nomic AI, `0188c9bf` | Q4_K_M includes Q5_K. Check the publisher's compatible alternative. |
+| Nomic | Nomic AI, `0188c9bf` | Q4_K_M includes Q5_K. |
 | GTE | No matching published GGUF found in the initial Hub search | The current NPUE GGUF adapter accepts `bert` and `nomic-bert`. GTE needs its own conversion and loader validation. |
+
+OFLM add installed Q8_0 for MiniLM from Second State, BGE small/base/large from CompendiumLabs,
+and Nomic from the original publisher. Each file was checked as GGUF file type 7. The five
+models loaded from GGUF and passed the batch-4 bit-identity gate on the 64-token release design.
+Nomic needed `--prompt-name document`. These runs used an isolated registry overlay with the
+canonical tags because the installed backend rejects custom embedding tags even after the
+installer registers them. The generated entries label Q8_0 weights as bf16. The local
+overlay records Q8_0 and leaves the user registry alone. Accuracy against the publisher weights
+and longer-context validation are still open for the quantized route. Raw logs are
+`.plans/bert/smoke-gguf-canonical.log` and `.plans/bert/nomic-gguf-document.log`.
 
 ## OFLM side
 
@@ -124,3 +134,5 @@ tensor types inside each file. The tag alone does not establish that coverage.
 - Teach the embedding test suite to send a supported task prompt for its ordinary Nomic requests.
   Keep its separate task and error-path coverage.
 - Map the encoder's over-limit error to an HTTP 400 with the input length and supported limit.
+- Route registered embedding entries to NPUE by declared family and design. Keep the actual
+  GGUF quant in the registry metadata and report the runtime packing format separately.
