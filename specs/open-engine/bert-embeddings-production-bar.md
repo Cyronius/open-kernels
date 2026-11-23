@@ -190,6 +190,20 @@ during both measurements. The results establish a short-input regression worth a
 The quiet-machine production rate gate remains open. Raw results are in
 `.plans/bert/bench512-quality-*.log` and `.plans/bert/measure-exact.log`.
 
+## MiniLM cold GGUF at 256 tokens
+
+OFLM packed the public Second State Q8_0 GGUF on first use in an isolated model
+directory and loaded the 256-token view of the release GEMM image. It loaded 16
+streams over batch tiers 1, 4, 8 and 32. Single and batch-4/16 requests at 64, 128
+and 256 tokens matched the publisher CPU model. The minimum cosine at 256 was
+0.999477. The batch of 16 took 195.2 ms through OFLM and 568.9 ms on the CPU
+reference in this run. The ordinary embedding suite passed its nine applicable
+checks. The exact 257-token request produced HTTP 500 and failed the separate
+over-limit gate.
+
+Raw report `.plans/bert/minilm256-quality-all-minilm_l6-v2.log`, SHA-256
+`3d64db2c1488c83950d45ae6ab5694935454eda5e2c9df348d07663558c9cc63`.
+
 ## Long-context Nomic and bidirectional attention
 
 The 8,192-token design served exact Nomic inputs through `oflm serve` with the staged
@@ -215,10 +229,10 @@ Raw report `.plans/bert/rope-fixed-seq8192-quality-nomic-embed-text_v1.5.log`,
 SHA-256 `c7ae0cb66d7f9b44e7838660c31f8f096b56fd8093987e2449570c19df79dda3`.
 
 The in-progress host profile already has a paired Nomic measurement with the same
-2,048-token input. In five warm runs the 2,048-capacity view took 1.95?2.05 s. Two
-warm runs padded to 8,192 took 53.28 and 57.65 s. The host QK and AV passes grew from
-1.40?1.47 s to 50.06 and 54.50 s, while host softmax grew from 0.16?0.18 s to
-2.38 and 2.33 s. The profile measures a local encoder call. Its remaining
+2,048-token input. In five warm runs per route the 2,048-capacity view took
+1.95?2.05 s and the 8,192-capacity view took 53.28?67.20 s. The host QK and AV
+passes grew from 1.40?1.47 s to 50.06?63.78 s, while host softmax grew from
+0.16?0.18 s to 2.33?2.52 s. The profile measures a local encoder call. Its remaining
 cases, including actual 8,192-token input, are still running.
 
 A local integration build is queued on the two long-context families. It routes
