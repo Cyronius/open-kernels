@@ -68,6 +68,9 @@ def kernel_builds(wide_old_attention=False, head_pair=False, singleton_decode=Fa
         yield f"rows-{rows}", "attn_fa/attn_fa.py", dict(
             AF_MODE="attn", AF_L=rows, AF_HEADS=16, AF_KV_HEADS=16, AF_MAX_ROWS=42496,
             AF_KV_LD=4096, AF_BIDIR=1, AF_QSPLIT=1, AF_KSPLIT=1, AF_VSPLIT=1, AF_PSPLIT=1)
+    for name, count, first in (("qkv", 3, 0), ("ffn", 1, 3)):
+        yield f"controller-{name}", "inkling2/loop_controller.py", dict(
+            INKLING2_CONTROLLER_COUNT=count, INKLING2_CONTROLLER_FIRST=first)
     if near_attention:
         yield "near-attention", "inkling2/near_attention.py", dict(INKLING2_NEAR_CHUNKS=NEAR_ATTENTION_CHUNKS)
     if wide_old_attention:
@@ -92,7 +95,8 @@ def package(build_dir: Path, out: Path, wide_old_attention=False, head_pair=Fals
         command = [sys.executable, HERE / "recipes/inkling2_routed.py", build_dir, staged,
                    "--compact", "--shared-attention", "--grouped-blocks", build_dir,
                    "--dense", build_dir, "--head", build_dir / "head", "--vision-gemm", build_dir,
-                   "--vision-attention", build_dir, "--vision-split-keys", "--vision-split-values"]
+                   "--vision-attention", build_dir, "--vision-split-keys", "--vision-split-values",
+                   "--loop-controller", build_dir]
         if wide_old_attention:
             command.extend(["--wide-old-attention", build_dir])
         if reclaim_packed_keys:

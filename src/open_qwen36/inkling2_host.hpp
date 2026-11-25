@@ -71,6 +71,10 @@ public:
     virtual bool project_attention_inputs(const GgufFile&, size_t, size_t, const std::array<const float*, 3>&,
                                           const Inkling2AttentionProjections&) { return false; }
     virtual bool project_attention_output(const GgufFile&, size_t, size_t, const float*, float*) { return false; }
+    // Loop controllers first .. first + count - 1 (q, k, v, ffn) of a core layer over token rows:
+    // out[n] = x[n] updated from message[n]. out[n] may equal x[n]. False selects the host route.
+    virtual bool apply_loop_controllers(const GgufFile&, size_t, size_t, size_t, size_t, float,
+                                        const float* const*, const float* const*, float* const*) { return false; }
     // Returns token-major attention rows, or an empty vector for the host route.
     virtual void reset_attention_cache(uint64_t) noexcept {}
     virtual std::vector<float> project_attention(const Inkling2AttentionView&) { return {}; }

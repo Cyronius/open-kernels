@@ -28,6 +28,8 @@ constexpr size_t heads = 24, kv_heads = 8, dim = 128, rel_dim = 16;
 constexpr size_t q_width = heads * dim, kv_width = kv_heads * dim;
 constexpr size_t taps = 4, rank = 64, window = 1024, extent = 1024;
 constexpr size_t core_start = 6, core_end = 18, passes = 3, block_size = 6;
+// Decode and verify passes keep the host loop controller; the NPU one runs whole 256-row blocks.
+constexpr size_t device_controller_rows = 64;
 constexpr size_t visits = layers + (passes - 1) * (core_end - core_start);
 constexpr size_t padded_vocab = 201024, vocab = Inkling2Host::vocabulary_size;
 using inkling2_cpu::Type;
@@ -736,9 +738,25 @@ struct Inkling2Host::Impl {
             return result;
         };
         const bool shared_input = l.sliding && messages.empty();
+        const bool device_controllers = !messages.empty() && x.count() >= device_controller_rows &&
+                                        expert_projector;
+        std::array<Rows, 3> controlled;
+        bool controlled_on_device = false;
+        if (device_controllers) {
+            std::array<const float*, 3> sources{}, notes{};
+            std::array<float*, 3> outputs{};
+            for (size_t n = 0; n < controlled.size(); ++n) {
+                controlled[n] = Rows(x.count(), hidden);
+                sources[n] = inputs[l.sliding ? 0 : n].data.data();
+                notes[n] = messages[n].data.data();
+                outputs[n] = controlled[n].data.data();
+            }
+            controlled_on_device = expert_projector->apply_loop_controllers(
+                file, i, 0, controlled.size(), x.count(), eps, sources.data(), notes.data(), outputs.data());
+        }
         const auto normalized_input = [&](size_t n) {
-            Rows u = inputs[l.sliding ? 0 : n];
-            if (!messages.empty()) l.controller[n].apply(u, messages[n], eps);
+            Rows u = controlled_on_device ? std::move(controlled[n]) : inputs[l.sliding ? 0 : n];
+            if (!messages.empty() && !controlled_on_device) l.controller[n].apply(u, messages[n], eps);
             norm(u, eps, l.attn_norm[n]);
             return u;
         };
@@ -845,7 +863,15 @@ struct Inkling2Host::Impl {
         else
             for (size_t j = 0; j < a.data.size(); ++j) a.data[j] += x.data[j];
         Rows f = std::move(mix(blocks, a, l.ffn_query, eps).front());
-        if (!messages.empty()) l.controller[3].apply(f, messages[3], eps);
+        if (!messages.empty()) {
+            const float* source = f.data.data();
+            const float* note = messages[3].data.data();
+            float* output = f.data.data();
+            bool on_device = false;
+            if (device_controllers)
+                on_device = expert_projector->apply_loop_controllers(file, i, 3, 1, f.count(), eps, &source, &note, &output);
+            if (!on_device) l.controller[3].apply(f, messages[3], eps);
+        }
         norm(f, eps, l.ffn_norm);
         if (match_singleton && l.gate_up.file->tensor(l.gate_up.name).type == GgufFile::Type::Q8_0) {
             Rows projected(f.count(), hidden), row(1, hidden);

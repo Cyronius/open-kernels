@@ -17,6 +17,8 @@ WIDE_OLD_ATTENTION_KEYS = (4096, 16384)
 WIDE_OLD_ATTENTION_FORMAT = "bfp16-qk-pv-v1"
 NEAR_ATTENTION_FORMAT = "inkling2-near-v1"
 NEAR_ATTENTION_CHUNKS = 80
+LOOP_CONTROLLER_FORMAT = "inkling2-controller-v1"
+LOOP_CONTROLLER_STREAMS = ("qkv", "ffn")
 
 
 def image_parts(root, pattern):
@@ -146,6 +148,8 @@ def main():
     parser.add_argument("--near-attention", type=Path, help="build of the 256-row near-range attention stream")
     parser.add_argument("--reclaim-packed-keys", action="store_true", help="retain exact copies of retired raw keys")
     parser.add_argument("--singleton-decode", type=Path, help="parent of the shared singleton builds")
+    parser.add_argument("--loop-controller", type=Path,
+                        help="parent of the controller-{qkv,ffn} builds: loop controllers of prefill blocks on the NPU")
     parser.add_argument("--split-prefill-q8", action="store_true",
                         help="the prefill-q8 streams read the split-scale experts that singleton decode packs")
     args = parser.parse_args()
@@ -360,6 +364,23 @@ def main():
         }
         if args.split_prefill_q8:
             manifest["shared_prefill_q8"] = True
+    if args.loop_controller:
+        roots = {name: args.loop_controller / f"controller-{name}" for name in LOOP_CONTROLLER_STREAMS}
+        if check_image(roots) != 32:
+            raise ValueError("the loop controller requires 32 worker cores")
+        shutil.copyfile(roots["qkv"] / "final.xclbin", args.output / "controller.xclbin")
+        for name, root in roots.items():
+            shutil.copyfile(root / "insts.bin", args.output / f"controller-{name}.bin")
+        eps = {int(e) for root in roots.values() for e in re.findall(
+            r"aiex\.npu\.rtp_write\(@params_\d+_\d+, 1, %c(-?\d+)_i32\)",
+            (root / "final.prj/input_with_addresses.mlir").read_text(encoding="utf-8"))}
+        if len(eps) != 1:
+            raise ValueError("loop controller streams must share one epsilon")
+        manifest["loop_controller"] = {
+            "format": LOOP_CONTROLLER_FORMAT, "image": "controller.xclbin", "rows": 256,
+            "streams": {name: f"controller-{name}.bin" for name in LOOP_CONTROLLER_STREAMS},
+            "eps_bits": eps.pop(),
+        }
     manifest["abi"] = f"inkling2-routed-v{version}"
     (args.output / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
