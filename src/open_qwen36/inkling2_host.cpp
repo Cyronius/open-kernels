@@ -719,7 +719,9 @@ struct Inkling2Host::Impl {
         std::vector<Rows> messages;
         if (previous_end.width) messages = mix(previous, previous_end, l.msg_query, eps);
         // Match singleton target projections during batched verification on the aligned image.
-        const bool verify_dense = verify && x.count() > 1 && expert_projector && expert_projector->aligned_attention_chunks();
+        // Wider passes use the block arithmetic of prefill.
+        const bool verify_dense = verify && x.count() > 1 && x.count() <= Inkling2Host::verify_limit &&
+                                  expert_projector && expert_projector->aligned_attention_chunks();
         const bool singleton = expert_projector && expert_projector->singleton_attention_available();
         const bool match_singleton = singleton && verify_dense;
         const bool dense = (x.count() > 1 || singleton) && (!verify_dense || match_singleton) &&
@@ -899,7 +901,7 @@ struct Inkling2Host::Impl {
 
     std::vector<float> verify(const std::vector<int>& ids, std::vector<float>* draft_features) {
         require_idle();
-        if (ids.empty() || ids.size() > verify_limit) fail("invalid verify block width");
+        if (ids.empty() || ids.size() > wide_verify_limit) fail("invalid verify block width");
         return append_rows(embed(ids), true, {}, true, draft_features);
     }
 

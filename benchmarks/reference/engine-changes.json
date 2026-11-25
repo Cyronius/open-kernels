@@ -504,6 +504,14 @@
         "src/open_qwen36/inkling2_cpu.hpp": "77ed5b0b0af0978104e87365b895ed673a77bf1070ef26ebab690dfc11fccf61",
         "src/open_qwen36/inkling2_wide_attention.hpp": "2560f760e6e1ea0fbd055c716c3eeb12d1a858ab97474cff1dedada4faf5417d"
       }
+    },
+    {
+      "id": "inkling2-wide-verify",
+      "origin": "open-kernels: verify passes of 9 to 64 rows use the prefill block arithmetic (wide_verify_limit), for long prompt-lookup drafts",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "a8f4510a79655ab7973040f8c9bed0e060c045f244be03512105c787486e2017",
+        "src/open_qwen36/inkling2_host.hpp": "8fb9abea7ea6f27b031501fc7804968dfc652dd17dd138629bb5a75802fb41b3"
+      }
     }
   ]
 }

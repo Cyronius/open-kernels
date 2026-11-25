@@ -89,6 +89,8 @@ public:
     static constexpr size_t vocabulary_size = 200058;
     static constexpr size_t max_context = 1048576;
     static constexpr size_t verify_limit = 8;
+    // Verify passes wider than verify_limit use the block route: close to decode, not bit-equal.
+    static constexpr size_t wide_verify_limit = 64;
     static constexpr size_t draft_feature_width = 4 * embedding_width;
     using VisitObserver = std::function<void(size_t visit, size_t layer, const std::vector<float>& residual)>;
 
@@ -105,7 +107,7 @@ public:
     /// Append token-major rows from the image projector directly to the residual stream.
     std::vector<float> append_embeddings(std::vector<float> embeddings, bool logits = true,
                                          const VisitObserver& observe = {}, std::vector<float>* draft_features = nullptr);
-    /// Evaluate up to verify_limit tokens and return every row's logits. State stays tentative until accept().
+    /// Evaluate up to wide_verify_limit tokens and return every row's logits. State stays tentative until accept().
     /// Only pass features from the accepted prefix to the drafter.
     std::vector<float> verify(const std::vector<int>& ids, std::vector<float>* draft_features = nullptr);
     void accept(size_t count);
