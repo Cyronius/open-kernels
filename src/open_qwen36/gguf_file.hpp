@@ -35,7 +35,7 @@ public:
         Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
         IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20,
         IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, I8 = 24, I16 = 25, I32 = 26,
-        I64 = 27, F64 = 28, IQ1_M = 29, BF16 = 30, MXFP4 = 39,
+        I64 = 27, F64 = 28, IQ1_M = 29, BF16 = 30, MXFP4 = 39, NVFP4 = 40,
     };
 
     struct TensorInfo {
@@ -43,6 +43,11 @@ public:
         std::vector<uint64_t> dims;      // fastest first, as GGUF stores them
         uint64_t offset = 0;             // relative to the (aligned) data section
         uint64_t nvalues() const { uint64_t n = 1; for (uint64_t d : dims) n *= d; return n; }
+        uint64_t nrows() const {
+            uint64_t n = 1;
+            for (size_t i = 1; i < dims.size(); ++i) n *= dims[i];
+            return n;
+        }
     };
 
     explicit GgufFile(const std::string& path);
@@ -53,7 +58,8 @@ public:
     bool has(const std::string& name) const override { return tensors_.count(gguf_name(name, sandwich_)) != 0; }
     /// Raw bytes of a tensor (the GGUF's own block layout; a view into the mapping).
     const uint8_t* raw(const std::string& name, size_t* nbytes = nullptr) const override;
-    /// One embedding row as f32, dequantized from whatever type stores it.
+    /// One row as f32. The fastest dimension is the row width. Outer
+    /// dimensions, including the expert dimension, form a flat row index.
     void embed_row(const std::string& name, size_t row, size_t dim, float* out) const override;
     /// The whole tensor decoded to f32 (f32/f16/bf16 exact, quantized via row dequant).
     std::vector<float> bf16(const std::string& name) const override;
@@ -76,6 +82,8 @@ public:
     bool kv_has(const std::string& key) const { return meta_.count(key) != 0; }
     std::string kv_str(const std::string& key) const;
     uint64_t kv_u64(const std::string& key) const;
+    /// A GGUF array of nonnegative 32-bit integers or booleans, decoded on demand.
+    std::vector<uint32_t> kv_u32_array(const std::string& key) const;
     double kv_f64(const std::string& key) const;
     /// A float metadata value exactly as stored (kv_f64 parses a six-decimal string).
     double kv_float(const std::string& key) const;
@@ -98,6 +106,7 @@ private:
     mutable std::map<std::string, TensorMeta> meta_cache_;  // row-major shapes, built on demand
     std::map<std::string, std::string> meta_;       // everything as strings (the derivation's view)
     std::map<std::string, double> num_;             // float keys, exact
+    std::map<std::string, size_t> arrays_;           // file offsets of typed array values
     std::map<std::string, float> folds_;
 #ifdef _WIN32
     void* file_ = nullptr;

@@ -241,8 +241,8 @@ def dequant_iq4_nl(raw: np.ndarray) -> np.ndarray:
     n, nb, _ = raw.shape
     d = np.ascontiguousarray(raw[..., 0:2]).view(np.float16).reshape(n, nb).astype(np.float32)
     qs = raw[..., 2:18]
-    q = np.concatenate([qs & 0xF, qs >> 4], axis=-1).reshape(n, nb * 32)
-    return d[:, :, None] * IQ4_NL_VALUES[q].astype(np.float32)
+    q = np.concatenate([qs & 0xF, qs >> 4], axis=-1)
+    return (d[:, :, None] * IQ4_NL_VALUES[q]).reshape(n, nb * 32)
 
 
 def dequant_iq4_xs(raw: np.ndarray) -> np.ndarray:

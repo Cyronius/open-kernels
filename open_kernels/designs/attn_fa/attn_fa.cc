@@ -40,16 +40,28 @@
 #ifndef AF_PSPLIT
 #define AF_PSPLIT 0
 #endif
+#ifndef AF_BIDIR
+#define AF_BIDIR 0
+#endif
+#ifndef AF_KSPLIT
+#define AF_KSPLIT 0
+#endif
+#ifndef AF_VSPLIT
+#define AF_VSPLIT 0
+#endif
 #ifndef AF_ABL
 #define AF_ABL 0   // ablation (timing only): 1 skips S = QK, 2 the softmax, 4 O += PV
 #endif
 #ifndef AF_SMU
 #define AF_SMU 2   // keys an iteration of the softmax's exponential loop: 4 spilled more (19.9 against 19.1 ms at L 8192)
 #endif
+#ifndef AF_WIDE_OLD
+#define AF_WIDE_OLD 0
+#endif
 
 constexpr int TQ = 32;
-constexpr int LKP = 64;
-constexpr int HD = 64;
+constexpr int LKP = AF_WIDE_OLD ? 32 : 64;
+constexpr int HD = AF_WIDE_OLD ? 128 : 64;
 constexpr int ST_M = 0, ST_L = 32, ST_I = 64;
 constexpr float NEG = -1.0e30f;
 
@@ -223,7 +235,7 @@ static inline void qk_t(const bfloat16 *__restrict qh, const bfloat16 *__restric
     const bfloat16 *__restrict k1 = k0 + HD;
     af32 a0 = aie::zeros<accfloat, 32>(), a1 = aie::zeros<accfloat, 32>();
     af32 c0 = aie::zeros<accfloat, 32>(), c1 = aie::zeros<accfloat, 32>();
-    for (int half = 0; half < 2; half++) {
+    for (int half = 0; half < HD / 32; half++) {
       const dup d0 = dbl(aie::load_v<32>(k0 + half * 32)), d1 = dbl(aie::load_v<32>(k1 + half * 32));
 #pragma clang loop unroll(full)
       for (int part = 0; part < 2; part++) {
@@ -249,7 +261,7 @@ static inline void qk_t(const bfloat16 *__restrict qh, const bfloat16 *__restric
   for (int j = 0; j < LKP; j += 4) {
     af32 a0 = aie::zeros<accfloat, 32>(), a1 = aie::zeros<accfloat, 32>();
     af32 a2 = aie::zeros<accfloat, 32>(), a3 = aie::zeros<accfloat, 32>();
-    for (int half = 0; half < 2; half++) {
+    for (int half = 0; half < HD / 32; half++) {
       const dup d0 = dbl(aie::load_v<32>(k + j * HD + half * 32)), d1 = dbl(aie::load_v<32>(k + (j + 1) * HD + half * 32));
       const dup d2 = dbl(aie::load_v<32>(k + (j + 2) * HD + half * 32)), d3 = dbl(aie::load_v<32>(k + (j + 3) * HD + half * 32));
 #pragma clang loop unroll(full)
@@ -275,8 +287,65 @@ static inline void qk_t(const bfloat16 *__restrict qh, const bfloat16 *__restric
 #endif
 }
 
+#if AF_KSPLIT
+// Add Q_hi·K_lo before the mask and softmax. Q_lo·K_lo is below the precision of the split operands.
+static inline void qk_key_residual(const bfloat16 *__restrict q, const bfloat16 *__restrict k, float *__restrict s) {
+  for (int j = 0; j < LKP; j += 2) {
+    af32 a0, a1;
+    a0.from_vector(aie::load_v<32>(s + j * TQ));
+    a1.from_vector(aie::load_v<32>(s + (j + 1) * TQ));
+    for (int half = 0; half < HD / 32; half++) {
+      const dup d0 = dbl(aie::load_v<32>(k + j * HD + half * 32));
+      const dup d1 = dbl(aie::load_v<32>(k + (j + 1) * HD + half * 32));
+#pragma clang loop unroll(full)
+      for (int part = 0; part < 2; part++) {
+        const vb k0 = part ? d0.hi : d0.lo, k1 = part ? d1.hi : d1.lo;
+        const bfloat16 *rows = q + (half * 32 + part * 16) * TQ;
+#pragma clang loop unroll_count(4)
+        for (int d = 0; d < 16; d++) {
+          const vb qr = aie::load_v<32>(rows + d * TQ);
+          a0 = aie::mac(a0, bc16(k0, d), qr);
+          a1 = aie::mac(a1, bc16(k1, d), qr);
+        }
+      }
+    }
+    aie::store_v(s + j * TQ, a0.template to_vector<float>());
+    aie::store_v(s + (j + 1) * TQ, a1.template to_vector<float>());
+  }
+}
+#endif
+
+#if AF_WIDE_OLD
+static inline void pv_t(const bfloat16 *__restrict p, const bfloat16 *__restrict v,
+                        float *__restrict o, const bfloat16 *__restrict pl) {
+  for (int r = 0; r < TQ; r += 2) {
+    const bfloat16 *pr = p + (r / 16) * 32;
+    for (int d = 0; d < HD; d += 32) {
+      float *o0 = o + r * HD + d, *o1 = o0 + HD;
+      af32 a0, a1;
+      a0.from_vector(aie::load_v<32>(o0));
+      a1.from_vector(aie::load_v<32>(o1));
+#pragma clang loop unroll_count(4)
+      for (int j = 0; j < LKP; ++j) {
+        const auto high = aie::load_v<32>(pr + j * 2 * TQ);
+        const auto low = dbl(aie::load_v<32>(pl + j * TQ));
+        const auto value = aie::load_v<32>(v + j * HD + d);
+        a0 = aie::mac(a0, bc16(high, r & 15), value);
+        a1 = aie::mac(a1, bc16(high, (r & 15) + 1), value);
+        a0 = aie::mac(a0, bc(low, r), value);
+        a1 = aie::mac(a1, bc(low, r + 1), value);
+      }
+      aie::store_v(o0, a0.template to_vector<float>());
+      aie::store_v(o1, a1.template to_vector<float>());
+    }
+  }
+}
+#else
 // O[r] += sum_j P[j][r] V[j], two rows a pass so each V load feeds two MACs. P is stored doubled
 // ([key][64]: rows 0..15 then 16..31, each value twice) so a row's value is one 32-bit broadcast.
+#if AF_PSPLIT
+template <bool probability_residual = true>
+#endif
 static inline void pv_t(const bfloat16 *__restrict p, const bfloat16 *__restrict v, float *__restrict o
 #if AF_PSPLIT
                         , const bfloat16 *__restrict pl
@@ -302,12 +371,14 @@ static inline void pv_t(const bfloat16 *__restrict p, const bfloat16 *__restrict
       a10 = aie::mac(a10, b1, v0);
       a11 = aie::mac(a11, b1, v1);
 #if AF_PSPLIT
-      const dup lp = dbl(aie::load_v<32>(pl + j * TQ));
-      const vb l0 = bc(lp, r), l1 = bc(lp, r + 1);
-      a00 = aie::mac(a00, l0, v0);
-      a01 = aie::mac(a01, l0, v1);
-      a10 = aie::mac(a10, l1, v0);
-      a11 = aie::mac(a11, l1, v1);
+      if constexpr (probability_residual) {
+        const dup lp = dbl(aie::load_v<32>(pl + j * TQ));
+        const vb l0 = bc(lp, r), l1 = bc(lp, r + 1);
+        a00 = aie::mac(a00, l0, v0);
+        a01 = aie::mac(a01, l0, v1);
+        a10 = aie::mac(a10, l1, v0);
+        a11 = aie::mac(a11, l1, v1);
+      }
 #endif
     }
     aie::store_v(o0, a00.template to_vector<float>());
@@ -324,13 +395,14 @@ static inline void rope_row(const float *__restrict x, const float *__restrict t
   r0 = fsub(fmul(x0, c), fmul(x1, s));
   r1 = fadd(fmul(x1, c), fmul(x0, s));
 }
+#endif
 
 alignas(64) static const int32_t k_iota[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
                                                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
 
 extern "C" {
 
-// the pass's record, the first words of the meta element: p0 = the block's first position
+// The first word is the block's first position, or the last valid key in bidirectional mode.
 void af_meta(bfloat16 *__restrict e, float *__restrict st) {
   int32_t *si = reinterpret_cast<int32_t *>(st + ST_I);
   si[0] = reinterpret_cast<const int32_t *>(e)[0];
@@ -356,14 +428,26 @@ void af_qk(bfloat16 *__restrict qh, bfloat16 *__restrict ql, bfloat16 *__restric
            float *__restrict st, int32_t tok0, int32_t chunk) {
   SET_ROUNDING();
   int32_t *si = reinterpret_cast<int32_t *>(st + ST_I);
-  const int32_t first = si[0] + tok0;   // the last key row 0 sees
   const int32_t k0 = chunk * LKP;
-  const int32_t status = k0 > first + TQ - 1 ? 0 : (k0 + LKP - 1 <= first ? 1 : 2);
+#if AF_BIDIR
+  const int32_t first = si[0], last = first;
+#else
+  const int32_t first = si[0] + tok0, last = first + TQ - 1;
+#endif
+  const int32_t status = k0 > last ? 0 : (k0 + LKP - 1 <= first ? 1 : 2);
   si[1] = status;
   if (status == 0 || (AF_ABL & 1))
     return;
   qk_t(qh, ql, k, s);
 }
+
+#if AF_KSPLIT
+void af_qk_low(bfloat16 *__restrict qh, bfloat16 *__restrict k, float *__restrict s, float *__restrict st) {
+  const int32_t *si = reinterpret_cast<const int32_t *>(st + ST_I);
+  if (si[1] != 0 && !(AF_ABL & 1))
+    qk_key_residual(qh, k, s);
+}
+#endif
 
 // mask, lazy rescale, P^T = 2^(S^T - m) in place as bf16, l += rowsum(P)
 void af_sm(float *s, float *__restrict st, float *__restrict o,
@@ -377,8 +461,11 @@ void af_sm(float *s, float *__restrict st, float *__restrict o,
   if (status == 0 || (AF_ABL & 2))
     return;
   if (status == 2) {
-    // key j of the chunk is visible to row r when j <= p0 + tok0 + r - 64 chunk
+#if AF_BIDIR
+    const vi bound = aie::broadcast<int32_t, 32>(si[0] - chunk * LKP);
+#else
     const vi bound = aie::add(aie::load_v<32>(k_iota), aie::broadcast<int32_t, 32>(si[0] + tok0 - chunk * LKP));
+#endif
     for (int j = 0; j < LKP; j++) {
       float *ps = s + j * TQ;
       aie::store_v(ps, aie::select(aie::load_v<32>(ps), aie::broadcast<float, 32>(NEG),
@@ -407,8 +494,13 @@ void af_sm(float *s, float *__restrict st, float *__restrict o,
     for (int r = 0; r < TQ; r++) {
       const vb b = bc(fd, r);
       float *po = o + r * HD;
+#if AF_WIDE_OLD
+      for (int d = 0; d < HD; d += 32)
+        aie::store_v(po + d, fmul_hl(aie::load_v<32>(po + d), b, zero));
+#else
       aie::store_v(po, fmul_hl(aie::load_v<32>(po), b, zero));
       aie::store_v(po + 32, fmul_hl(aie::load_v<32>(po + 32), b, zero));
+#endif
     }
     aie::store_v(st + ST_L, fmul_hl(aie::load_v<32>(st + ST_L), fac, zero));
     aie::store_v(st + ST_M, mn);
@@ -475,6 +567,17 @@ void af_pv(float *__restrict s, bfloat16 *__restrict v, float *__restrict o, flo
        );
 }
 
+#if AF_VSPLIT
+void af_pv_low(float *__restrict s, bfloat16 *__restrict v, float *__restrict o, float *__restrict st) {
+  const int32_t *si = reinterpret_cast<const int32_t *>(st + ST_I);
+  if (si[1] != 0 && !(AF_ABL & 4))
+    pv_t<false>(reinterpret_cast<const bfloat16 *>(s), v, o, nullptr);
+}
+#endif
+
+#if AF_WIDE_OLD
+#include "wide_old_attention_bfp.inc"
+#else
 // O /= l, row by row
 void af_fin(float *__restrict o, float *__restrict st) {
   SET_ROUNDING();
@@ -568,4 +671,5 @@ void af_prep_kv(float *__restrict rk, float *__restrict rv, float *__restrict tb
     aie::store_v(ov + j, to_bf(aie::load_v<32>(rv + j)));
 }
 
+#endif
 } // extern "C"

@@ -116,6 +116,9 @@ kernels that shipped.
 hyperparameter tuple for every supported family; an unknown family or a
 missing key is an error naming it.
 
+The dedicated fixed-loop Inkling GGUF reader validates its geometry under
+OPEN-FAMILY-INKLING2.
+
 **The weight format is per role, and only the model FILE says what it is.**
 `config.json` does not record whether a projection is stored at q4_1 or q8, so
 `ModelSpec.quant` is a map over the roles `attn`, `linear`, `linear_out`,
@@ -6286,6 +6289,117 @@ hands the bridge. An 8-token prompt through `--gemm-block` then equals the seque
 
 Open: the sequential route's distance to fp64 (2.5e-4) is ~2.7x the control's (9e-5) -- not yet attributed (the block route sits at 1.5e-4); the llama.cpp gap above and a Vulkan control; xmb's 8 token lanes a visit (the routed experts are ~45% of a block prefill; wider slots need a native-shape mmul, mbl.h's notes); the GEMMs' bf16-rounded dequantised weights (rel 1.5e-3 a product, against the GEMVs' 8e-6); mbl / mb4's first-dispatch rounding in the other families' block routes (UPSTREAM.md); an NPU attention kernel for the absorbed shape; mHC on the device to cut decode's host round trips (four dispatches and seven host steps a layer); the MTP layer as a drafter; a clean benchmark.
 
+### OPEN-FAMILY-INKLING2: fixed-loop Inkling 2 Mini from GGUF
+**Applies to:** open-kernels (`open_kernels/recipes/inkling2_routed.py`, `src/open_qwen36/inkling2_host.cpp`, `src/open_qwen36/inkling2_npu.cpp`), Phlegm reference bridge
+**Test category:** unit, model-backed, manual hardware
+**Tests:** `tests/test_inkling2_reference.py`, `src/open_qwen36/inkling2_host_check.cpp`, `src/open_qwen36/inkling2_verify_check.cpp`, Phlegm model-backed procedures in the [production audit](plans/inkling2-mini-production-bar.md)
+
+The reader accepts the published fixed-loop `inkling2_loop` geometry and validates the GGUF metadata,
+tensor dimensions, data types and sliding pattern before execution. The shipping candidate is ggml-org
+IQ4_NL with Q8_0 stages. It loads directly as `model.gguf`. Physical layers 6 through 17, zero-based,
+run three times, so the 24 physical layers produce 48 chronological visits. Expert weights belong
+to physical layers, and each visit owns its attention K/V and short-convolution histories. The loop
+controllers use rank-64 projections. Full-attention visits apply the learned dynamic K/V convolution
+taps. The output vocabulary has 200,058 usable IDs.
+
+The host reference also reads Unsloth's mixed NVFP4 and Q8_0 GGUF. An NVFP4 block stores
+64 values as four groups of 16 E2M1 codes with one UE4M3 scale per group. The host requires
+a finite, positive F32 scale for each physical expert. It applies that scale to the fused
+gate/up output before SITU and to the down output before routed accumulation. The same
+scale table follows the physical weights across all loop passes.
+
+**Acceptance criteria:**
+
+- The native host reference reproduces the published tensor operations, routed expert weights, chronological
+  visit order and greedy trace against pinned reference captures. Wrong loop bounds, head counts, vocabulary
+  or relative-position geometry are rejected. Phlegm reads the GGUF tokenizer for a bare model during
+  serving and benchmarking.
+- The declared text context is 1,048,576 tokens. Verify recall at 10%, 50% and 90% within 8K, 32K and 131K,
+  then run a midpoint needle near the full context with its time and memory recorded. The prompt and continuation
+  together fit the declared capacity. The final emitted token can use the prediction from the last processed row.
+- Promote the model after the [production bar](plans/inkling2-mini-production-bar.md#production-bar) has evidence
+  for block prefill, representative performance and quality, residency, speculation, the shipping quant,
+  Phlegm integration and benchmarks, and model features. Record measured exceptions and their costs.
+
+### OPEN-PREFILL-INKLING2: layer-major prefill on the routed bundle
+**Applies to:** open-kernels (`open_kernels/recipes/inkling2_routed.py`, `src/open_qwen36/inkling2_host.cpp`, `src/open_qwen36/inkling2_npu.cpp`)
+**Test category:** model-backed, manual hardware
+**Tests:** `tests/test_inkling2_reference.py`, `inkling2_npu_check`, the [block prefill and model timing procedures](plans/inkling2-mini-production-bar.md)
+
+The Phlegm NPU route prefills layer-major blocks through the fixed loop, grouped IQ4_NL and Q8_0
+expert GEMMs and causal relative-position attention. A split-scale dense Q8 stream covers the supported
+block projections. Each dispatch uses a validated stream and buffer layout from the family manifest.
+The exported `inkling2-routed-v*` ABI and the native reader advance together. Version 11 adds optional
+vision streams while preserving the existing text bundle layout.
+
+**Acceptance criteria:** A contiguous prompt and a prompt split across block boundaries preserve the committed
+visit state and match the reference within the measured route tolerances. Report host stages and device timings
+separately during prefill and single-token decode. Verify long prefixes, the sliding boundary and incomplete tails.
+
+### OPEN-ATTN-RELPOS: learned relative-position attention for the fixed loop
+**Applies to:** open-kernels (`open_kernels/designs/inkling2/`, `open_kernels/recipes/inkling2_attention.py`, `src/open_qwen36/inkling2_host.cpp`, `src/open_qwen36/inkling2_npu.cpp`)
+**Test category:** unit, manual hardware
+**Tests:** `tests/test_inkling2_reference.py`, the [relative-attention procedures](plans/inkling2-mini-production-bar.md)
+
+The causal score adds a learned 16-component relative dot product to the scaled Q/K dot product for
+distances below 1,024. Global visits multiply both query contributions by the GGUF's log-position scale.
+Sliding visits cap the visible keys at the configured 1,024-token window. The per-head sink participates
+in the normalizer with zero value contribution. Text projections apply the GGUF clipping, V normalization
+and the output gate. The text model uses learned relative scores with RoPE dimensions fixed at zero.
+
+**Acceptance criteria:** Check the learned term and sink independently, then check full and sliding model
+outputs across distance 1,023/1,024, a ring wrap, a partial packed tier and the largest supported tier.
+Retain the existing Llama high and low probability layout and the version-7 DIT mapping.
+
+The optional `attention_chunk_alignment` field is 32 for shared bundles whose IQ4 and Q8 images
+both contain the aligned attention entry point. Such bundles start sliding-window chunks on absolute
+32-key boundaries. The per-query window mask still determines which keys contribute, and a chunk
+with no visible keys leaves that row's peak, mass and numerator unchanged. The query header carries
+the mode in reserved word 7. It defaults to zero on older readers, and a bundle without the field
+keeps the original reader behavior.
+
+The optional `near_attention` field (`format: inkling2-near-v1`, `chunks: 80`) names a stream that computes
+one prefill block of up to 256 rows for all heads over 1,280 keys in one dispatch: the 1,024-key relative range
+before the block plus the block. The reader uses it for blocks of 17 to 256 rows that start on a 16-key position.
+Older full-attention keys go through the same stream in 1,280-key segments, or through the wide older-key route
+when the bundle has one. The host applies the sink and merges each segment's FP32 numerator, row maxima (log2
+units) and masses. The optional `attention_decode: keys-as-lanes-v1` field marks shared attention streams whose
+workers accept up to eight decode or verify rows with K transposed and host FP32 relative bias plus masks in the
+strip area (query header words 5 and 6). Chunk partitions and empty-chunk handling stay as above, so verify and
+decode rows follow the same arithmetic. Bundles without either field keep the earlier routes.
+
+### OPEN-SPEC-DSPARK: draft and verify an Inkling block
+**Applies to:** open-kernels (`src/open_qwen36/inkling2_dspark.cpp`, `src/open_qwen36/inkling2_host.cpp`), Phlegm reference bridge
+**Test category:** model-backed, manual hardware
+**Tests:** `src/open_qwen36/inkling2_dspark_check.cpp`, `src/open_qwen36/inkling2_verify_check.cpp`, the [Phlegm speculation procedures](plans/inkling2-mini-production-bar.md)
+
+When the compatible `dspark.gguf` sidecar is present and block verification is available, Phlegm's opt-in
+`--speculative auto` can propose up to seven candidates after the anchor. The draft consumes target feature
+taps at chronological positions 5, 23, 41 and 48. The target evaluates proposals through OPEN-SPEC-VERIFY,
+samples the output and commits only the accepted input rows to the target and draft states. The tentative
+pass can be discarded, partially committed or fully committed without leaking rejected K/V or convolution history.
+
+On bundles with aligned attention, the batched verifier uses the same per-token host dense arithmetic
+as singleton decode. The verify block keeps batched attention and grouped expert projections.
+
+**Acceptance criteria:** Compare native proposals with the published oracle, replay every accepted-prefix size,
+check exact emitted target IDs at short and long prefixes, and measure acceptance and decode throughput against
+plain Phlegm decode with matched settings. Image prefill uses the same feature taps when speculation is enabled.
+
+### OPEN-VISION-INKLING2: project Inkling media rows into the text sequence
+**Applies to:** open-kernels (`src/open_qwen36/vision/inkling2_vision.cpp`, `src/open_qwen36/vision/inkling2_vision_npu.cpp`, `open_kernels/recipes/inkling2_routed.py`), Phlegm image serving
+**Test category:** model-backed, manual hardware
+**Tests:** `inkling2_vision_check`, `inkling2_vision_npu_check`, the [vision parity and Phlegm QA procedures](plans/inkling2-mini-production-bar.md)
+
+Load the `inkling2v` projector from `mmproj.gguf`. Accept RGB images with each side from 40 through
+4,096 pixels. Pad to the 40-pixel merge grid, encode with bidirectional vision attention and append
+2304-wide merged rows at the image positions of the text prompt. Multiple image spans keep request order.
+The runtime reports the expanded row count and validates it against the same text context budget.
+
+**Acceptance criteria:** Compare the assembled tower against pinned reference embeddings over the resolution
+ladder, including a non-square image and 4,096 pixels, with correlation greater than 0.9999. Exercise
+JSON and SSE responses, image ordering, invalid image rejection, image QA and a subsequent plain-text request.
+
 ### OPEN-WIDTH-PAD: the padded width a recipe may derive, and what it does not settle
 **Applies to:** openflowlm-next (`open_kernels/recipes/qwen36moe.py`,
 `open_kernels/recipes/pack.py`)
@@ -6662,6 +6776,9 @@ Qwen2.5-VL's does. The plain shape has no head dimension and no epsilon: `head_d
 `hidden_size / num_heads` and the epsilon is LayerNorm's 1e-6, which is what transformers
 uses for this tower.
 
+The Inkling NPU tower derives its geometry from the projector GGUF described by
+OPEN-VISION-INKLING2.
+
 A `vision_config` describing a tower this code does not implement shall be refused with
 the reason named, not run with the extra parts dropped -- dropping one gives image
 embeddings that look plausible and are wrong. Refused: a non-empty
@@ -6838,6 +6955,9 @@ row, c + col), text tokens after an image continuing from the same counter
 generated tokens inheriting it; a request without images is the unchanged
 text path. The model classes read their preprocessing constants from
 `config.json` and no longer require the closed engine for images.
+
+Phlegm's Inkling adapter inserts projector rows into its fixed-loop text path under
+OPEN-VISION-INKLING2.
 
 **Deepstack.** A tower with `deepstack_visual_indexes` produces one extra set of
 image rows per index, and those are added into the decoder's residual stream

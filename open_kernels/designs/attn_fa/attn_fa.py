@@ -18,7 +18,11 @@ cache's rows and Q as the host wrote it, and write O as token rows.
 Buffers (the engine's argument order):
   Q   bf16, per head [record 64x64 | Q hi: 8 cores x Q^T [64 dims][32 tokens] | Q lo: the same];
       the record's first int32 is p0, the block's first position (token t's causal bound is p0 + t)
+      With AF_BIDIR=1 it is the last valid key, visible to every query row. The remaining key rows are padding.
   KV  the layer's KV cache, bf16 rows of kv_ld elements: K at kvh*64, V at kv_heads*64 + kvh*64
+      With AF_KSPLIT=1, each 64-row chunk contains three contiguous planes: K hi, K lo and V.
+      Each plane is [64 keys, kv_heads*64], with one key head contiguous within each row.
+      AF_VSPLIT=1 adds a fourth plane for V lo.
   O   fp32 [256 tokens, heads*64] row-major (the out-projection's input)
 
     AF_L=2048 python open_kernels/build_design.py open_kernels/designs/attn_fa/attn_fa.py <out>
@@ -98,12 +102,19 @@ def sliced(n_chunks: int) -> bool:
 
 @iron.jit(aiecc_flags=["--dynamic-objFifos", "--alloc-scheme=basic-sequential"])
 def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: CompileTime[int],
-            kv_heads: CompileTime[int], kv_ld: CompileTime[int], max_rows: CompileTime[int]):
+            kv_heads: CompileTime[int], kv_ld: CompileTime[int], max_rows: CompileTime[int],
+            bidirectional: CompileTime[bool] = False, split_keys: CompileTime[bool] = False,
+            split_values: CompileTime[bool] = False):
     why = check_shape(L, heads, kv_heads, max_rows)
     assert why is None, why
     hpg = heads // N_GROUPS
     gqa = heads // kv_heads
     qw = heads * HD
+    kv_width = kv_heads * HD
+    if split_keys and (not bidirectional or not QSPLIT or MODE != "attn" or kv_ld != (3 + split_values) * kv_width):
+        raise ValueError("AF_KSPLIT requires bidirectional split-Q attention and the matching KV planes")
+    if split_values and (not split_keys or not PSPLIT):
+        raise ValueError("AF_VSPLIT requires split keys and split probabilities")
     qh_elems = q_head_elems()
     n_chunks = L // LKP
 
@@ -116,7 +127,14 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
     o_l2_ty = np.ndarray[(N_ROWS * TQ * HD,), np.dtype[np.float32]]
     rtp_ty = np.ndarray[(RTP_LEN,), np.dtype[np.int32]]
 
-    flags = [f"-DAF_QSPLIT={QSPLIT}", f"-DAF_PSPLIT={int(PSPLIT)}", f"-DAF_TAU={TAU}", f"-DAF_ABL={ABL}", f"-DAF_SMU={SMU}", f"-DAF_EXPV={EXPV}", "-Wno-deprecated-declarations"]
+    flags = [f"-DAF_QSPLIT={QSPLIT}", f"-DAF_PSPLIT={int(PSPLIT)}", f"-DAF_TAU={TAU}", f"-DAF_ABL={ABL}",
+             f"-DAF_SMU={SMU}", f"-DAF_EXPV={EXPV}", "-Wno-deprecated-declarations"]
+    if bidirectional:
+        flags.append("-DAF_BIDIR=1")
+    if split_keys:
+        flags.append("-DAF_KSPLIT=1")
+    if split_values:
+        flags.append("-DAF_VSPLIT=1")
     _ef = ExternalFunction("af_init", source_file=KERNEL_SRC, arg_types=[o_l1_ty, st_ty], compile_flags=flags)
     obj = _ef.object_file_name
     k_meta = Kernel("af_meta", obj, [elem_ty, st_ty])
@@ -130,6 +148,10 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
     k_prep_q = Kernel("af_prep_q", obj, [elem_ty, s_ty, q_ty, q_ty, o_l1_ty])
     k_prep_kv = Kernel("af_prep_kv", obj, [elem_ty, elem_ty, s_ty, o_l1_ty])
     kernels = [k_meta, k_cap, k_init, k_qk, k_sm, k_pv, k_fin, k_ptab, k_prep_q, k_prep_kv]
+    if split_keys:
+        kernels.append(Kernel("af_qk_low", obj, [q_ty, elem_ty, s_ty, st_ty]))
+    if split_values:
+        kernels.append(Kernel("af_pv_low", obj, [s_ty, elem_ty, o_l1_ty, st_ty]))
 
     def core_tile(g, i):
         return Tile(g * GROUP_COLS + i // N_ROWS, 2 + i % N_ROWS)
@@ -162,7 +184,7 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
         tok0 = i * TQ
 
         def core_fn(a_in, b_in, o_out, kern, q_hi, q_lo, s_buf, st, my_rtp, barrier, p_lo):
-            (meta, cap, init, qk, sm, pv, fin, ptab, prep_q, prep_kv) = kern
+            (meta, cap, init, qk, sm, pv, fin, ptab, prep_q, prep_kv) = kern[:10]
             barrier.wait_for_value(1)
             n_pass = my_rtp[RTP_PASSES]
             n_ch = my_rtp[RTP_CHUNKS]
@@ -187,6 +209,10 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                     k = a_in.acquire(1)
                     qk(q_hi, q_lo, k, s_buf, st, tok0, c)
                     a_in.release(1)
+                    if split_keys:
+                        k = a_in.acquire(1)
+                        kern[10](q_hi, k, s_buf, st)
+                        a_in.release(1)
                     if PSPLIT:
                         sm(s_buf, st, o, p_lo, tok0, c)
                     else:
@@ -197,6 +223,10 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                     else:
                         pv(s_buf, v, o, st)
                     b_in.release(1)
+                    if split_values:
+                        v = b_in.acquire(1)
+                        kern[11](s_buf, v, o, st)
+                        b_in.release(1)
                 fin(o, st)
                 o_out.release(1)
             # prep dispatch: the block's table once (resident in s_buf), then a pass per query head and per kv head
@@ -250,6 +280,11 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
     TB_ty = np.ndarray[(PREP_TBL_ELEMS,), np.dtype[bfloat16]]
     qa_rows = (1 + Q_ELEMS) * LKP          # record + Q hi, in 64-wide rows
     qb_rows = Q_ELEMS * LKP
+    chunk_stride = LKP * kv_ld
+    row_stride = kv_width if split_keys else kv_ld
+    key_rows = (2 if split_keys else 1) * LKP
+    value_offset = key_rows * kv_width if split_keys else kv_width
+    value_rows = (2 if split_values else 1) * LKP
 
     def sequence(q, kv, o, tb, a_prods, b_prods, o_conses):
         for buf in rtp.values():
@@ -275,14 +310,14 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                 # while splitting a longer window into consecutive transfers.
                 for chunk0 in range(0, n_chunks, 64):
                     count = min(64, n_chunks - chunk0)
-                    a_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + kvh * HD,
-                                    sizes=[count, LKP, HD], strides=[LKP * kv_ld, kv_ld, 1], group=tg)
+                    a_prods[g].fill(kv, offset=chunk0 * chunk_stride + kvh * HD,
+                                    sizes=[count, key_rows, HD], strides=[chunk_stride, row_stride, 1], group=tg)
                 if QSPLIT:
                     b_prods[g].fill(q, offset=base + qa_rows * HD, sizes=[qb_rows, HD], strides=[HD, 1], group=tg)
                 for chunk0 in range(0, n_chunks, 64):
                     count = min(64, n_chunks - chunk0)
-                    b_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + (kv_heads + kvh) * HD,
-                                    sizes=[count, LKP, HD], strides=[LKP * kv_ld, kv_ld, 1], group=tg)
+                    b_prods[g].fill(kv, offset=chunk0 * chunk_stride + value_offset + kvh * HD,
+                                    sizes=[count, value_rows, HD], strides=[chunk_stride, row_stride, 1], group=tg)
                 for cc in range(GROUP_COLS):
                     col = g * GROUP_COLS + cc
                     row0 = cc * N_ROWS * TQ
@@ -312,10 +347,10 @@ def attn_fa(Q: In, KV: In, O: Out, TB: In, *, L: CompileTime[int], heads: Compil
                 ts = TaskGroup()
                 for g in range(N_GROUPS):
                     kvh = (g * hpg + k) // gqa
-                    a_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + kvh * HD, sizes=[count, LKP, HD],
-                                    strides=[LKP * kv_ld, kv_ld, 1], wait=True, group=ts)
-                    b_prods[g].fill(kv, offset=chunk0 * LKP * kv_ld + (kv_heads + kvh) * HD, sizes=[count, LKP, HD],
-                                    strides=[LKP * kv_ld, kv_ld, 1], wait=True, group=ts)
+                    a_prods[g].fill(kv, offset=chunk0 * chunk_stride + kvh * HD, sizes=[count, key_rows, HD],
+                                    strides=[chunk_stride, row_stride, 1], wait=True, group=ts)
+                    b_prods[g].fill(kv, offset=chunk0 * chunk_stride + value_offset + kvh * HD, sizes=[count, value_rows, HD],
+                                    strides=[chunk_stride, row_stride, 1], wait=True, group=ts)
                 pending.append(ts)
                 if len(pending) == 2:
                     pending.pop(0).finish()
@@ -429,4 +464,7 @@ SPECIALIZE = dict(
     kv_heads=int(os.environ.get("AF_KV_HEADS", 8)),
     kv_ld=int(os.environ.get("AF_KV_LD", 1024)),
     max_rows=int(os.environ.get("AF_MAX_ROWS", 4096)),
+    bidirectional=os.environ.get("AF_BIDIR") == "1",
+    split_keys=os.environ.get("AF_KSPLIT") == "1",
+    split_values=os.environ.get("AF_VSPLIT") == "1",
 )

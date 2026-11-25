@@ -1,4 +1,5 @@
 #include "open_qwen36/vision/vit.hpp"
+#include "open_qwen36/vision/vit_ops.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -423,6 +424,7 @@ void rope_tables(const VitConfig& cfg, const std::vector<int>& ph, const std::ve
 /// the work list is (segment, query block) pairs rather than query blocks - a windowed
 /// layer has many short segments and a full layer one long one, and collapsing over heads
 /// x query blocks alone starves on the first.
+template <bool adjacent_pairs = false>
 void attention(const VitConfig& cfg, const float* qkv, int n, const std::vector<float>& cs, const std::vector<float>& sn,
                const std::vector<int>& cu, float* o) {
     const int NH = cfg.heads, HD = cfg.head_dim, H = cfg.hidden, half = HD / 2;
@@ -447,12 +449,23 @@ void attention(const VitConfig& cfg, const float* qkv, int n, const std::vector<
             float* kd = k.data() + (static_cast<size_t>(h) * n + t) * HD;
             float* vd = v.data() + (static_cast<size_t>(h) * n + t) * HD;
             for (int i = 0; i < HD; ++i) {
-                const float rq = i < half ? -qs[i + half] : qs[i - half];
-                const float rk = i < half ? -ks[i + half] : ks[i - half];
+                const bool left = adjacent_pairs ? i % 2 == 0 : i < half;
+                const int partner = adjacent_pairs ? i ^ 1 : (left ? i + half : i - half);
+                const float rq = left ? -qs[partner] : qs[partner];
+                const float rk = left ? -ks[partner] : ks[partner];
                 qd[i] = qs[i] * c[i] + rq * s[i];
                 kd[i] = ks[i] * c[i] + rk * s[i];
             }
-            std::memcpy(vd, vs, static_cast<size_t>(HD) * sizeof(float));
+            if constexpr (adjacent_pairs) {
+                // Match the FP16 Q/K dot and FP16 values of the Inkling GGUF reference.
+                for (int i = 0; i < HD; ++i) {
+                    qd[i] = fp16_to_f32(f32_to_fp16(qd[i]));
+                    kd[i] = fp16_to_f32(f32_to_fp16(kd[i]));
+                    vd[i] = fp16_to_f32(f32_to_fp16(vs[i]));
+                }
+            } else {
+                std::memcpy(vd, vs, static_cast<size_t>(HD) * sizeof(float));
+            }
         }
     }
     const int QB = 32;
@@ -1058,6 +1071,26 @@ std::vector<float> vit_forward_deepstack(const VitConfig& cfg, const VitWeights&
 
 std::vector<float> vit_forward(const VitConfig& cfg, const VitWeights& w, const float* pixels, int gh, int gw) {
     return vit_forward_deepstack(cfg, w, pixels, gh, gw, nullptr);
+}
+
+float ops::dot(const float* a, const float* b, int size) { return dot_f32(a, b, size); }
+
+void ops::project(const float* x, int rows, const Linear& weights, float* y, int stride) {
+    linear(x, rows, weights, y, stride);
+}
+
+void ops::normalize(const float* x, int rows, int width, const float* weight, const float* bias, float eps, float* y) {
+    layer_norm(x, rows, width, weight, bias, eps, y);
+}
+
+void ops::full_attention(const VitConfig& cfg, const float* qkv, int rows,
+                         const std::vector<float>& cos, const std::vector<float>& sin, float* y) {
+    attention<true>(cfg, qkv, rows, cos, sin, {0, rows}, y);
+}
+
+void ops::gelu(std::vector<float>& rows) {
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) rows[i] = gelu_erf(rows[i]);
 }
 
 }  // namespace open_qwen36::vision

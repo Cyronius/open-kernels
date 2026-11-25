@@ -50,6 +50,7 @@ BAND_BYTES = PER_BAND * TILE_BYTES             # 278528 at K = 2048
 
 RW = int(os.environ.get("LMHEAD_ROWS", 1))    # token rows a dispatch takes (1 | 2; gptoss/gx_rows.h's shared tile)
 assert RW in (1, 2)
+OUTPUT_BANDS = RW == 2 and bool(int(os.environ.get("LMHEAD_OUTPUT_BANDS", 0)))
 N = int(os.environ.get("LMHEAD_N", 248320))
 N_CORES = int(os.environ.get("LMHEAD_CORES", 8))
 PER_CALL = 2            # 2 x 8704 = 17408 B per element, x2 buffered -> 34 KB of L1
@@ -176,10 +177,12 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
         nb = counts[c]
         w_taps.append(TensorAccessPattern((1, bands * BAND_BYTES), off * BAND_BYTES,
                                           [1, 1, 1, nb * BAND_BYTES], [0, 0, 0, 1]))
-        y_taps.append(TensorAccessPattern((1, n), off * BAND_ROWS, [1, 1, 1, nb * BAND_ROWS], [0, 0, 0, 1])
-                      if RW == 1 else
-                      TensorAccessPattern((1, RW * n), off * BAND_ROWS, [1, nb, RW, BAND_ROWS],
-                                          [0, BAND_ROWS, n, 1]))
+        if RW == 1 or OUTPUT_BANDS:
+            y_taps.append(TensorAccessPattern((1, RW * n), off * RW * BAND_ROWS,
+                                              [1, 1, 1, nb * RW * BAND_ROWS], [0, 0, 0, 1]))
+        else:
+            y_taps.append(TensorAccessPattern((1, RW * n), off * BAND_ROWS, [1, nb, RW, BAND_ROWS],
+                                              [0, BAND_ROWS, n, 1]))
         off += nb
 
     def sequence(a_w, a_x, c_y, w_prods, x_prod, y_conss):
@@ -199,7 +202,8 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
 DESIGN = lm_head_q8
 _src = (b"".join((HERE / f).read_bytes() for f in ("lm_head_q8.h", "lm_head_q8.cc"))
         + (GEMV / "gemv_tab.h").read_bytes() + f"K={K}".encode()
-        + ((HERE.parent / "gptoss" / "gx_rows.h").read_bytes() + f"rows{RW}".encode() if RW > 1 else b""))
+        + ((HERE.parent / "gptoss" / "gx_rows.h").read_bytes() + f"rows{RW}".encode() if RW > 1 else b"")
+        + (b"output-bands" if OUTPUT_BANDS else b""))
 SPECIALIZE = {"n": N, "n_cores": N_CORES, "per_call": PER_CALL,
               "srchash": int(hashlib.sha1(_src + str(SCALES_F32).encode()
                                           + (f"wring{WRING}".encode() if WRING else b"")).hexdigest()[:8], 16)}

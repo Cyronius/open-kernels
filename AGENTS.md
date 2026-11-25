@@ -69,6 +69,13 @@ Track each top-tier model's progress (OFLM #240) in `RECOMMENDED_MODELS.md`.
 
 ## Research and optimization
 
+- Before starting or resuming a model port or planning its performance work, read the relevant project notes in
+  `specs/open-engine/notes/`. Start with [the Inkling 2 Mini port notes](specs/open-engine/notes/inkling2-mini-port.md)
+  for new GGUF layouts, recurrent or looped state, long context, and Phlegm verification.
+- Update the project notes when a measurement, failed approach, or tooling issue changes how a future port
+  should proceed. Link to the detailed evidence in the model spec or plan.
+- For Inkling block-prefill measurements, use the tracked [Phlegm profiler](benchmarks/reference/inkling2-prefill/README.md)
+  and the [`phlegm-prefill-profile` skill](skills/phlegm-prefill-profile/SKILL.md).
 - Read relevant recommendations in `~/code/xdna2-notes/recommendations/` before proposing kernel optimizations.
   Follow their finding IDs to evidence, stack versions and open questions. If that checkout is absent, record the gap.
 - Start with R-0001 (budgets), R-0003/R-0008 (contexts and dispatch), R-0004 (reference), R-0006 (measurement),

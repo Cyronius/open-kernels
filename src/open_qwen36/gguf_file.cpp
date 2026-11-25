@@ -3,6 +3,7 @@
 #include "open_qwen36/gguf_file.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -21,6 +22,8 @@
 namespace open_qwen36 {
 
 namespace {
+
+constexpr size_t nvfp4_values = 64, nvfp4_bytes = 36, nvfp4_group = 16;
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("gguf: " + what); }
 
@@ -88,12 +91,14 @@ uint64_t gguf_type_bytes(uint32_t t, uint64_t values) {
     switch (t) {
         case 0: return values * 4;                        // f32
         case 1: case 30: return values * 2;               // f16 / bf16
-        case 2: return values / 32 * 18;                  // q4_0
+        case 2: case 20: return values / 32 * 18;         // q4_0 / iq4_nl
         case 3: return values / 32 * 20;                  // q4_1
         case 8: return values / 32 * 34;                  // q8_0
         case 12: return values / 256 * 144;               // q4_k
         case 14: return values / 256 * 210;               // q6_k
+        case 23: return values / 256 * 136;               // iq4_xs
         case 39: return values / 32 * 17;                 // mxfp4 (e8m0 exponent + 16 nibble bytes; GPT-OSS's experts)
+        case 40: return values / nvfp4_values * nvfp4_bytes;
         default: return 0;                                // unsupported
     }
 }
@@ -135,6 +140,7 @@ const char* GgufFile::type_name(Type t) {
         case Type::IQ4_XS: return "IQ4_XS"; case Type::I8: return "I8"; case Type::I16: return "I16";
         case Type::I32: return "I32"; case Type::I64: return "I64"; case Type::F64: return "F64";
         case Type::IQ1_M: return "IQ1_M"; case Type::BF16: return "BF16"; case Type::MXFP4: return "MXFP4";
+        case Type::NVFP4: return "NVFP4";
     }
     return "type?";
 }
@@ -177,6 +183,7 @@ GgufFile::GgufFile(const std::string& path) : path_(path) {
             const uint32_t t = rd_u32(q);
             std::string v;
             double num = 0.0;
+            if (t == 9) arrays_[key] = static_cast<size_t>(q - map_);
             rd_value(t, q, end, v, &num);
             meta_[key] = v;
             if (t == 6 || t == 12) num_[key] = num;
@@ -190,8 +197,6 @@ GgufFile::GgufFile(const std::string& path) : path_(path) {
             const uint32_t ty = rd_u32(q);
             t.type = static_cast<Type>(ty);
             t.offset = rd_u64(q);
-            const uint64_t nb = gguf_type_bytes(ty, t.nvalues());
-            if (nb && t.offset + nb > map_size_) fail("tensor " + name + " runs past EOF in " + path);
             tensors_.emplace(name, std::move(t));
         }
         sandwich_ = tensors_.count("blk.0.post_ffw_norm.weight") != 0;
@@ -217,6 +222,15 @@ GgufFile::GgufFile(const std::string& path) : path_(path) {
                  std::to_string(align) + ")");
         data_base_ = static_cast<size_t>(q - map_);
         data_base_ += static_cast<size_t>((align - data_base_ % align) % align);
+        for (const auto& [name, tensor] : tensors_) {
+            if (tensor.type == Type::NVFP4 &&
+                (tensor.dims.empty() || !tensor.dims.front() || tensor.dims.front() % nvfp4_values))
+                fail(name + " has an incomplete NVFP4 row");
+            const uint64_t bytes = gguf_type_bytes(static_cast<uint32_t>(tensor.type), tensor.nvalues());
+            if (data_base_ > map_size_ || tensor.offset > map_size_ - data_base_ ||
+                bytes > map_size_ - data_base_ - tensor.offset)
+                fail("tensor " + name + " runs past EOF in " + path);
+        }
     } catch (...) {
 #ifdef _WIN32
         if (map_) UnmapViewOfFile(map_);
@@ -322,7 +336,7 @@ namespace {
 std::vector<float> gguf_dequant_all(const GgufFile& g, const std::string& name) {
     const GgufFile::TensorInfo& t = g.tensor(name);
     const size_t cols = static_cast<size_t>(t.dims[0]);
-    const size_t nrows = t.dims.size() >= 2 ? static_cast<size_t>(t.dims[1]) : 1;
+    const size_t nrows = static_cast<size_t>(t.nrows());
     std::vector<float> out(cols * nrows);
     for (size_t r = 0; r < nrows; ++r) g.embed_row(name, r, cols, out.data() + r * cols);
     return out;
@@ -346,6 +360,23 @@ uint64_t GgufFile::kv_u64(const std::string& key) const {
     }
 }
 
+std::vector<uint32_t> GgufFile::kv_u32_array(const std::string& key) const {
+    const auto it = arrays_.find(key);
+    if (it == arrays_.end()) fail("no array metadata key " + key + " in " + path_);
+    const uint8_t* p = map_ + it->second;
+    const uint32_t type = rd_u32(p);
+    const uint64_t length = rd_u64(p);
+    if (type != 4 && type != 5 && type != 7) fail("expected a 32-bit integer or bool array for " + key);
+    const size_t width = type == 7 ? 1 : 4;
+    if (length > static_cast<uint64_t>(map_ + map_size_ - p) / width) fail("truncated array " + key);
+    std::vector<uint32_t> result(static_cast<size_t>(length));
+    for (auto& value : result) {
+        value = type == 7 ? (rd_u8(p) != 0) : rd_u32(p);
+        if (type == 5 && value > INT32_MAX) fail("negative value in array " + key);
+    }
+    return result;
+}
+
 double GgufFile::kv_f64(const std::string& key) const {
     try {
         return std::stod(kv_str(key));
@@ -365,9 +396,11 @@ void GgufFile::embed_row(const std::string& name, size_t row, size_t dim, float*
         return;
     }
     if (cols != dim) fail(name + " has " + std::to_string(cols) + " cols, the row wants " + std::to_string(dim));
-    const uint64_t nrows = t.dims.size() >= 2 ? t.dims[1] : 1u;  // 1-D tensors are a single row
-    if (row >= nrows) fail("row " + std::to_string(row) + " past " + name);
+    if (row >= t.nrows()) fail("row " + std::to_string(row) + " past " + name);
     const uint8_t* base = map_ + data_base_ + t.offset;
+    static constexpr int8_t iq4_values[] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    };
     switch (t.type) {
         case Type::F32: {
             std::memcpy(out, base + row * dim * 4, dim * 4);
@@ -412,6 +445,75 @@ void GgufFile::embed_row(const std::string& name, size_t row, size_t dim, float*
                 for (size_t j = 0; j < 16; ++j) {
                     out[b * 32 + j] = d * (static_cast<int>(p[2 + j] & 0xF) - 8);
                     out[b * 32 + 16 + j] = d * (static_cast<int>(p[2 + j] >> 4) - 8);
+                }
+            }
+            break;
+        }
+        case Type::IQ4_NL: {
+            // ggml-common.h's nonlinear codebook. Nibbles are ordered as in Q4_0.
+            if (dim % 32 != 0) fail(name + " has an incomplete IQ4_NL row");
+            const uint8_t* p = base + row * (dim / 32) * 18;
+            for (size_t b = 0; b < dim / 32; ++b, p += 18) {
+                uint16_t u;
+                std::memcpy(&u, p, 2);
+                const float d = fp16_to_f32(u);
+                for (size_t j = 0; j < 16; ++j) {
+                    out[b * 32 + j] = d * iq4_values[p[2 + j] & 0xF];
+                    out[b * 32 + 16 + j] = d * iq4_values[p[2 + j] >> 4];
+                }
+            }
+            break;
+        }
+        case Type::IQ4_XS: {
+            // Eight nonlinear blocks share an FP16 scale. Each block has its own signed six-bit multiplier.
+            constexpr size_t block = 256, bytes = 136;
+            if (dim % block != 0) fail(name + " has an incomplete IQ4_XS row");
+            const uint8_t* p = base + row * (dim / block) * bytes;
+            for (size_t i = 0; i < dim; i += block, p += bytes) {
+                uint16_t base_scale, scales_hi;
+                std::memcpy(&base_scale, p, 2);
+                std::memcpy(&scales_hi, p + 2, 2);
+                const float d = fp16_to_f32(base_scale);
+                for (size_t group = 0; group < 8; ++group) {
+                    const int low = (p[4 + group / 2] >> (4 * (group % 2))) & 15;
+                    const int high = (scales_hi >> (2 * group)) & 3;
+                    const float scale = d * (low + 16 * high - 32);
+                    const uint8_t* qs = p + 8 + 16 * group;
+                    float* block_out = out + i + 32 * group;
+                    for (size_t j = 0; j < 16; ++j) {
+                        block_out[j] = scale * iq4_values[qs[j] & 15];
+                        block_out[j + 16] = scale * iq4_values[qs[j] >> 4];
+                    }
+                }
+            }
+            break;
+        }
+        case Type::NVFP4: {
+            // Four UE4M3 scales, followed by four groups of E2M1 nibbles.
+            // Decode the block scales here. Expert projection scales belong to the model graph.
+            static constexpr float codes[]{0, 0.5f, 1, 1.5f, 2, 3, 4, 6,
+                                           0, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+            static const auto scales = [] {
+                std::array<float, 256> result{};
+                for (unsigned code = 0; code < result.size(); ++code) {
+                    if (code == 0x7f) continue; // Match GGML's reserved-code handling.
+                    const int exp = (code >> 3) & 15, mantissa = code & 7;
+                    result[code] = exp ? std::ldexp(1.0f + mantissa / 8.0f, exp - 7)
+                                       : std::ldexp(static_cast<float>(mantissa), -9);
+                }
+                return result;
+            }();
+            const uint8_t* p = base + row * (dim / nvfp4_values) * nvfp4_bytes;
+            constexpr size_t groups = nvfp4_values / nvfp4_group, half = nvfp4_group / 2;
+            for (size_t i = 0; i < dim; i += nvfp4_values, p += nvfp4_bytes) {
+                for (size_t group = 0; group < groups; ++group) {
+                    const float scale = scales[p[group]];
+                    const uint8_t* qs = p + groups + group * half;
+                    float* dst = out + i + group * nvfp4_group;
+                    for (size_t j = 0; j < half; ++j) {
+                        dst[j] = scale * codes[qs[j] & 15];
+                        dst[j + half] = scale * codes[qs[j] >> 4];
+                    }
                 }
             }
             break;
@@ -490,7 +592,7 @@ void GgufFile::embed_row(const std::string& name, size_t row, size_t dim, float*
         }
         default:
             fail(std::string("the embedding is ") + type_name(t.type) +
-                 "; this reader dequantizes F32/F16/BF16/Q4_0/Q4_1/Q8_0/Q4_K/Q6_K rows "
+                 "; this reader dequantizes F32/F16/BF16/Q4_0/Q4_1/Q8_0/Q4_K/Q6_K/IQ4_NL/IQ4_XS/NVFP4 rows "
                  "(convert the model with q4nx-build, or quantize the embedding to a supported type)");
     }
     const float f = fold(name);

@@ -10,6 +10,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 #include "open_qwen36/bfp16.hpp"
 #include "open_qwen36/gguf_file.hpp"
 #include "open_qwen36/q4nx_file.hpp"
@@ -503,11 +507,12 @@ constexpr size_t GX_MX4_BIAS = 2304;
 constexpr uint8_t GX_MX4_NIB[16] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 15, 14, 13, 12, 11, 10, 8};
 
 void gx_mx4_tiles(const uint8_t* src, size_t rows, size_t cols, size_t rows_pad, size_t cols_pad, const float* bias,
-                  uint8_t* out) {
+                  uint8_t* out, bool iq4_nl = false) {
     if (rows > rows_pad || cols > cols_pad || rows_pad % 64 || cols_pad % 256 || cols % 32)
         fail("gx mx4 tiles: [" + std::to_string(rows) + ", " + std::to_string(cols) + "] does not pad to [" +
              std::to_string(rows_pad) + ", " + std::to_string(cols_pad) + "]");
     const size_t nkt = cols_pad / 256, nb = rows_pad / 64, bpr = cols / 32;
+    const size_t block_bytes = iq4_nl ? 18 : 17, code_offset = iq4_nl ? 2 : 1;
 #pragma omp parallel for schedule(dynamic)
     for (long long bl = 0; bl < static_cast<long long>(nb); ++bl) {
         const size_t b = static_cast<size_t>(bl);
@@ -521,18 +526,51 @@ void gx_mx4_tiles(const uint8_t* src, size_t rows, size_t cols, size_t rows_pad,
                     for (size_t kb = 0; kb < 8; ++kb) {
                         const size_t blk = kt * 8 + kb;
                         if (blk >= bpr) continue;
-                        const uint8_t* B = src + (row * bpr + blk) * 17;
+                        const uint8_t* B = src + (row * bpr + blk) * block_bytes;
                         uint8_t* g = t + (kb / 2) * 576;
-                        const uint16_t sb = bf16_rne(e8m0_half(B[0]));
+                        uint16_t h = 0;
+                        if (iq4_nl) std::memcpy(&h, B, sizeof(h));
+                        const uint16_t sb = bf16_rne(iq4_nl ? fp16_to_f32(h) : e8m0_half(B[0]));
                         std::memcpy(g + 2 * ((kb % 2) * 16 + r), &sb, 2);
                         uint8_t* nib = g + 64 + (kb % 2) * 256 + (r / 8) * 32;
                         for (size_t i = 0; i < 32; ++i) {
-                            const uint8_t n = i < 16 ? (B[1 + i] & 15) : (B[1 + i - 16] >> 4);
+                            const uint8_t packed = B[code_offset + i % 16];
+                            const uint8_t n = i < 16 ? packed & 15 : packed >> 4;
                             const size_t j = (i % 8) * 8 + r % 8;          // k = 8 oc + i % 8, oc = i / 8
-                            nib[(i / 8) * 64 + j / 2] |= static_cast<uint8_t>(GX_MX4_NIB[n] << (4 * (j % 2)));
+                            const uint8_t code = iq4_nl ? n : GX_MX4_NIB[n];
+                            nib[(i / 8) * 64 + j / 2] |= static_cast<uint8_t>(code << (4 * (j % 2)));
                         }
                     }
                     if (kt == 0 && bias) std::memcpy(t + GX_MX4_BIAS + 4 * r, bias + row, 4);
+                }
+            }
+    }
+}
+
+// Q8_0 head tiles use f32 scales and pack the rows in 128-row bands.
+void gx_head_tiles(const uint8_t* src, size_t rows, size_t cols, size_t rows_pad, size_t cols_pad, uint8_t* out) {
+    const size_t nB = rows_pad / 128, nkt = cols_pad / 256, bpr = cols / 32;
+#pragma omp parallel for schedule(dynamic)
+    for (long long Bl = 0; Bl < static_cast<long long>(nB); ++Bl) {
+        const size_t B = static_cast<size_t>(Bl);
+        for (size_t kt = 0; kt < nkt; ++kt)
+            for (size_t q = 0; q < 4; ++q) {
+                uint8_t* c = out + ((B * nkt + kt) * 4 + q) * GX_HEAD;
+                std::memset(c, 0, GX_HEAD);
+                for (size_t r = 0; r < 32; ++r) {
+                    const size_t row = 128 * B + 32 * q + r;
+                    if (row >= rows) continue;
+                    for (size_t kb = 0; kb < 8; ++kb) {
+                        const size_t blk = kt * 8 + kb;
+                        if (blk >= bpr) continue;
+                        const uint8_t* b = src + (row * bpr + blk) * 34;
+                        uint16_t h;
+                        std::memcpy(&h, b, 2);
+                        const float d = fp16_to_f32(h);
+                        std::memcpy(c + 4 * (kb * 32 + r), &d, 4);
+                        for (size_t i = 0; i < 32; ++i)
+                            c[1024 + (r / 16) * 4096 + (kb * 32 + i) * 16 + r % 16] = b[2 + i];
+                    }
                 }
             }
     }
@@ -607,6 +645,180 @@ std::vector<float> gx_bias(const WeightFile& m, const std::string& name, size_t 
     return v;
 }
 }  // namespace
+
+void pack_inkling2_expert(const uint8_t* src, bool iq4_nl, size_t rows, size_t cols, size_t cols_pad, uint8_t* dst) {
+    if (iq4_nl) gx_mx4_tiles(src, rows, cols, rows, cols_pad, nullptr, dst, true);
+    else gx_tiles(src, false, rows, cols, rows, cols_pad, nullptr, dst);
+}
+
+namespace inkling2_block {
+namespace {
+template <bool IQ4, bool SplitScale = false>
+void pack_quantized_weights(const uint8_t* src, size_t n, size_t k, uint8_t* dst) {
+    constexpr size_t block_bytes = IQ4 ? 18 : 34;
+    constexpr size_t packed_bytes = block_bytes + (SplitScale ? 2 : 0);
+    const size_t chunks_k = k / tile_k;
+    const size_t chunks_n = n / tile_n, per_column = chunks_n / array_cols;
+    for (size_t group = 0; group < chunks_n; ++group) {
+        const size_t packed_group = (group % array_cols) * per_column + group / array_cols;
+        for (size_t kb = 0; kb < chunks_k; ++kb) {
+            auto* tile = dst + (packed_group * chunks_k + kb) * tile_n * packed_bytes;
+            auto* codes = tile + tile_n * (1 + SplitScale) * sizeof(uint16_t);
+            if constexpr (IQ4) std::memset(codes, 0, tile_n * tile_k / 2);
+            for (size_t j = 0; j < tile_n; ++j) {
+                const auto* block = src + ((group * tile_n + j) * chunks_k + kb) * block_bytes;
+                uint16_t raw_scale;
+                std::memcpy(&raw_scale, block, sizeof(raw_scale));
+                const float scale = fp16_to_f32(raw_scale);
+                const uint16_t hi = bf16_rne(scale);
+                std::memcpy(tile + j * sizeof(hi), &hi, sizeof(hi));
+                if constexpr (SplitScale) {
+                    const uint16_t lo = bf16_rne(scale - bf16_to_f32(hi));
+                    std::memcpy(tile + (tile_n + j) * sizeof(lo), &lo, sizeof(lo));
+                }
+                for (size_t lane = 0; lane < tile_k; ++lane) {
+                    const size_t dest = ((j / 8) * tile_k + lane) * 8 + j % 8;
+                    if constexpr (IQ4) {
+                        const uint8_t pair = block[2 + lane % 16];
+                        const uint8_t code = lane < 16 ? pair & 15 : pair >> 4;
+                        codes[dest / 2] |= static_cast<uint8_t>(code << (4 * (dest % 2)));
+                    } else {
+                        codes[dest] = block[2 + lane];
+                    }
+                }
+            }
+        }
+    }
+}
+
+#ifdef __AVX2__
+template <bool FromFp32>
+void pack_activation_row(const float* input, size_t row, size_t tile_rows, uint16_t* tile) {
+    static_assert(tile_k == 32);
+    const auto exponent_mask = _mm256_set1_epi32(0x7f800000);
+    __m256i exponents = _mm256_setzero_si256();
+    __m256 values[tile_k / 8];
+    for (size_t lane = 0; lane < tile_k / 8; ++lane) {
+        auto bits = _mm256_castps_si256(_mm256_loadu_ps(input + lane * 8));
+        if constexpr (!FromFp32) {
+            const auto tie = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
+            bits = _mm256_add_epi32(bits, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), tie));
+            bits = _mm256_and_si256(bits, _mm256_set1_epi32(-65536));
+        }
+        exponents = _mm256_max_epu32(exponents, _mm256_and_si256(bits, exponent_mask));
+        values[lane] = _mm256_castsi256_ps(bits);
+    }
+    auto peak = _mm_max_epu32(_mm256_castsi256_si128(exponents), _mm256_extracti128_si256(exponents, 1));
+    peak = _mm_max_epu32(peak, _mm_srli_si128(peak, 8));
+    peak = _mm_max_epu32(peak, _mm_srli_si128(peak, 4));
+    const int exponent = _mm_cvtsi128_si32(peak) >> 23;
+    if (exponent == 255) fail("non-finite Inkling block activation");
+    const int shift = std::min(126, 141 - exponent);
+    std::fill_n(tile + row * 8, 8, static_cast<uint16_t>((127 - shift) << 7));
+    const auto multiplier = _mm256_castsi256_ps(_mm256_set1_epi32((127 + shift) << 23));
+    auto* output = tile + tile_rows * 8 + (row / 4) * 4 * tile_k + (row % 4) * 8;
+    for (size_t lane = 0; lane < tile_k / 8; ++lane) {
+        const auto code = _mm256_cvtps_epi32(_mm256_mul_ps(values[lane], multiplier));
+        // Rounded BF16 mantissas fit in int16. Direct FP32 requires signed saturation.
+        const auto packed = _mm_packs_epi32(_mm256_castsi256_si128(code), _mm256_extracti128_si256(code, 1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(output + lane * 32), packed);
+    }
+}
+#endif
+
+template <bool FromFp32>
+void pack_quantized_input(const float* src, size_t rows, size_t m, size_t k, size_t tm, uint8_t* dst) {
+    const size_t chunks_k = k / tile_k;
+    const size_t tile_words = tm * (tile_k + 8);
+    for (size_t rb = 0; rb < m / tm; ++rb) {
+        const size_t first = rb * tm;
+        const size_t valid = first < rows ? std::min(tm, rows - first) : 0;
+        for (size_t kb = 0; kb < chunks_k; ++kb) {
+            auto* tile = reinterpret_cast<uint16_t*>(dst) + (rb * chunks_k + kb) * tile_words;
+            if (valid < tm) {
+                std::fill_n(tile + valid * 8, (tm - valid) * 8, uint16_t{128});  // 2^-126 in BF16
+                std::fill_n(tile + tm * 8, tm * tile_k, uint16_t{0});
+            }
+            for (size_t r = 0; r < valid; ++r) {
+                const auto* input = src + (first + r) * k + kb * tile_k;
+#ifdef __AVX2__
+                pack_activation_row<FromFp32>(input, r, tm, tile);
+#else
+                std::array<float, tile_k> values;
+                int exponent = 0;
+                for (size_t lane = 0; lane < tile_k; ++lane) {
+                    float value = input[lane];
+                    if constexpr (!FromFp32) value = bf16_to_f32(bf16_rne(value));
+                    values[lane] = value;
+                    uint32_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    exponent = std::max(exponent, static_cast<int>((bits >> 23) & 255));
+                }
+                if (exponent == 255) fail("non-finite Inkling block activation");
+                const int shift = std::min(126, 141 - exponent);
+                std::fill_n(tile + r * 8, 8, static_cast<uint16_t>((127 - shift) << 7));
+                const float multiplier = std::ldexp(1.0f, shift);
+                for (size_t lane = 0; lane < tile_k; ++lane) {
+                    const size_t index = (r / 4) * (4 * tile_k) + (lane / 8) * 32 + (r % 4) * 8 + lane % 8;
+                    long code = std::lrint(values[lane] * multiplier);
+                    if constexpr (FromFp32) code = std::clamp(code, -32768l, 32767l);
+                    tile[tm * 8 + index] = static_cast<uint16_t>(code);
+                }
+#endif
+            }
+        }
+    }
+}
+}  // namespace
+
+void pack_weights(const uint8_t* src, bool iq4, size_t n, size_t k, uint8_t* dst, bool split_scale) {
+    if (n % (tile_n * array_cols) || k % tile_k || (iq4 && split_scale)) fail("invalid Inkling weight tile shape");
+    if (iq4) pack_quantized_weights<true>(src, n, k, dst);
+    else if (split_scale) pack_quantized_weights<false, true>(src, n, k, dst);
+    else pack_quantized_weights<false>(src, n, k, dst);
+}
+
+void pack_input(const float* src, size_t rows, size_t m, size_t k, uint8_t* dst, bool from_fp32) {
+    const size_t tm = m == decode_tile_m ? decode_tile_m : tile_m;
+    if (rows > m || m % tm || k % tile_k) fail("invalid Inkling activation tile shape");
+    if (from_fp32) pack_quantized_input<true>(src, rows, m, k, tm, dst);
+    else pack_quantized_input<false>(src, rows, m, k, tm, dst);
+}
+
+void unpack_output(const float* src, size_t rows, size_t m, size_t n, float* dst) {
+    const size_t groups = n / tile_n, per_column = groups / array_cols;
+    for (size_t row = 0; row < rows; ++row)
+        for (size_t group = 0; group < groups; ++group) {
+            const size_t packed_group = (group % array_cols) * per_column + group / array_cols;
+            std::copy_n(src + (packed_group * m + row) * tile_n, tile_n, dst + row * n + group * tile_n);
+        }
+}
+
+void unpack_grouped_output(const float* src, const size_t* counts, size_t slots, size_t slot_rows,
+                           size_t core_rows, size_t n, float* dst) {
+    const size_t m = std::max(slot_rows, decode_tile_m);
+    const size_t groups = n / tile_n, per_column = groups / array_cols, per_core = groups / core_rows;
+    for (size_t slot = 0; slot < slots; ++slot) {
+        for (size_t group = 0; group < groups; ++group) {
+            const size_t stripe = (group % array_cols) * per_column + group / array_cols;
+            const size_t dma_group = (stripe % per_core) * core_rows + stripe / per_core;
+            const auto* tile = src + (slot * groups + dma_group) * m * tile_n;
+            for (size_t row = 0; row < counts[slot]; ++row) {
+                const auto* sub_tile = tile + (row / decode_tile_m) * decode_tile_m * tile_n +
+                                       (row % decode_tile_m) * 8;
+                auto* out = dst + (slot * slot_rows + row) * n + group * tile_n;
+                for (size_t lane = 0; lane < tile_n; lane += 8)
+                    std::copy_n(sub_tile + lane * decode_tile_m, 8, out + lane);
+            }
+        }
+    }
+}
+}  // namespace inkling2_block
+
+void pack_q8_head_tiles(const uint8_t* src, size_t rows, size_t cols, size_t rows_pad, uint8_t* dst) {
+    if (rows > rows_pad || rows_pad % 128 || cols % 256) fail("invalid Q8 head tile shape");
+    gx_head_tiles(src, rows, cols, rows_pad, cols, dst);
+}
 
 uint64_t op_bytes(const PackOp& op, size_t chunk_bytes) {
     if (op.op == "bfp16_gemm") return op.n_total * op.ksplit * op.in_dim / 8 * BFP16_BLOCK_BYTES;
@@ -1425,34 +1637,9 @@ void apply(const PackOp& op, const WeightFile& m, int layer, uint8_t* dst, size_
         if (rows > op.rows || cols > op.in_dim || op.rows % 128 || op.in_dim % 256 || cols % 32)
             fail("gx_lmhead " + name + ": [" + std::to_string(rows) + ", " + std::to_string(cols) +
                  "] does not pad to [" + std::to_string(op.rows) + ", " + std::to_string(op.in_dim) + "]");
-        const size_t nB = op.rows / 128, nkt = op.in_dim / 256, bpr = cols / 32;
-        bounds(op, nB * nkt * 4 * GX_HEAD, dst_bytes);
+        bounds(op, (op.rows / 128) * (op.in_dim / 256) * 4 * GX_HEAD, dst_bytes);
         const uint8_t* src = raw(m, name, rows * cols / 32 * 34);
-        uint8_t* out = dst + op.dst;
-#pragma omp parallel for schedule(dynamic)
-        for (long long Bl = 0; Bl < static_cast<long long>(nB); ++Bl) {
-            const size_t B = static_cast<size_t>(Bl);
-            for (size_t kt = 0; kt < nkt; ++kt)
-                for (size_t q = 0; q < 4; ++q) {
-                    uint8_t* c = out + ((B * nkt + kt) * 4 + q) * GX_HEAD;
-                    std::memset(c, 0, GX_HEAD);
-                    for (size_t r = 0; r < 32; ++r) {
-                        const size_t row = 128 * B + 32 * q + r;
-                        if (row >= rows) continue;
-                        for (size_t kb = 0; kb < 8; ++kb) {
-                            const size_t blk = kt * 8 + kb;
-                            if (blk >= bpr) continue;
-                            const uint8_t* b = src + (row * bpr + blk) * 34;
-                            uint16_t h;
-                            std::memcpy(&h, b, 2);
-                            const float d = fp16_to_f32(h);
-                            std::memcpy(c + 4 * (kb * 32 + r), &d, 4);
-                            for (size_t i = 0; i < 32; ++i)
-                                c[1024 + (r / 16) * 4096 + (kb * 32 + i) * 16 + r % 16] = b[2 + i];
-                        }
-                    }
-                }
-        }
+        gx_head_tiles(src, rows, cols, op.rows, op.in_dim, dst + op.dst);
     } else {
         fail("unknown pack op " + op.op);
     }

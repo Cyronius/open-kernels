@@ -54,6 +54,35 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(vit_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+# Compare the Inkling 2 Mini host route with independent GGUF references (no XRT).
+add_executable(inkling2_host_check inkling2_host_check.cpp inkling2_host.cpp gguf_file.cpp)
+target_include_directories(inkling2_host_check PRIVATE ${_inc})
+
+add_executable(inkling2_verify_check inkling2_verify_check.cpp inkling2_host.cpp gguf_file.cpp)
+target_include_directories(inkling2_verify_check PRIVATE ${_inc})
+
+add_executable(inkling2_dspark_check inkling2_dspark_check.cpp inkling2_dspark.cpp gguf_file.cpp)
+target_include_directories(inkling2_dspark_check PRIVATE ${_inc})
+
+add_executable(inkling2_npu_check inkling2_host_check.cpp inkling2_host.cpp inkling2_npu.cpp
+               gguf_file.cpp pools.cpp manifest.cpp q4nx_file.cpp)
+target_compile_definitions(inkling2_npu_check PRIVATE INKLING2_NPU_CHECK)
+target_include_directories(inkling2_npu_check PRIVATE "${XRT_INCLUDE_DIR}" ${_inc})
+target_link_directories(inkling2_npu_check PRIVATE "${XRT_LIB_DIR}")
+target_link_libraries(inkling2_npu_check PRIVATE xrt_coreutil)
+
+add_executable(inkling2_vision_check vision/inkling2_vision_check.cpp vision/inkling2_vision.cpp
+               vision/vit.cpp gguf_file.cpp q4nx_file.cpp)
+target_include_directories(inkling2_vision_check PRIVATE ${_inc})
+target_link_libraries(inkling2_vision_check PRIVATE OpenMP::OpenMP_CXX)
+
+add_executable(inkling2_vision_npu_check vision/inkling2_vision_check.cpp vision/inkling2_vision.cpp
+               vision/inkling2_vision_npu.cpp vision/vit.cpp gguf_file.cpp q4nx_file.cpp)
+target_compile_definitions(inkling2_vision_npu_check PRIVATE INKLING2_VISION_NPU_CHECK)
+target_include_directories(inkling2_vision_npu_check PRIVATE "${XRT_INCLUDE_DIR}" ${_inc})
+target_link_directories(inkling2_vision_npu_check PRIVATE "${XRT_LIB_DIR}")
+target_link_libraries(inkling2_vision_npu_check PRIVATE OpenMP::OpenMP_CXX xrt_coreutil)
+
 # block_host_test (no XRT): the block prefill's host stages against replica_block.py's fixture
 add_executable(block_host_test block_host_test.cpp block_host.cpp)
 target_include_directories(block_host_test PRIVATE ${_inc})
@@ -69,7 +98,9 @@ target_include_directories(spec_lookup_test PRIVATE ${_inc})
 
 # block_host.cpp uses AVX2/FMA intrinsics in both targets. The parent app and
 # Windows build.cmd already enable them; the standalone CMake build must too.
-foreach(t open_qwen36_cli block_host_test attn_window_test)
+# The Inkling model checks use the same CPU projections as the external runtime.
+foreach(t open_qwen36_cli block_host_test attn_window_test inkling2_host_check inkling2_verify_check
+          inkling2_dspark_check inkling2_npu_check)
     target_link_libraries(${t} PRIVATE OpenMP::OpenMP_CXX)
     if(MSVC)
         target_compile_options(${t} PRIVATE /arch:AVX2)
@@ -79,7 +110,8 @@ foreach(t open_qwen36_cli block_host_test attn_window_test)
 endforeach()
 
 foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test
-          kvslice_patch_test spec_lookup_test)
+          kvslice_patch_test spec_lookup_test inkling2_host_check inkling2_verify_check inkling2_dspark_check
+          inkling2_npu_check inkling2_vision_check inkling2_vision_npu_check)
     if(MSVC)
         target_compile_options(${t} PRIVATE /EHsc /Zc:__cplusplus /bigobj)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)

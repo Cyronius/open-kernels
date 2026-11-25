@@ -5,10 +5,11 @@
 ///        permutation plus an exact fp16 -> f32 widening of the scales;
 ///        open_kernels/gguf_pool.py holds the same law in NumPy).
 ///
-/// Also covers GgufFile::embed_row (Q8_0) and pack_norm's f32 -> bf16.
+/// Also covers GgufFile::embed_row and pack_norm's f32 -> bf16.
 ///
 ///     cmake -S . -B build && cmake --build build && ctest --test-dir build
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -174,7 +175,7 @@ std::string write_gguf_q6k(const fs::path& dir, const BlocksQ6K& b) {
 }
 
 std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb, const std::vector<float>& norm,
-                       uint32_t heads = 0) {
+                       uint32_t heads = 0, const std::vector<uint64_t>& mm_dims = {512, 64}) {
     std::vector<uint8_t> f;
     f.insert(f.end(), {'G', 'G', 'U', 'F'});
     put_u32(f, 3);                                   // v3: no alignment field, fixed 32
@@ -195,7 +196,7 @@ std::string write_gguf(const fs::path& dir, const Blocks& mm, const Blocks& emb,
         put_u32(f, type);
         put_u64(f, 0);
     };
-    put_tensor("blk.0.attn_q.weight", {512, 64}, mm.type);
+    put_tensor("blk.0.attn_q.weight", mm_dims, mm.type);
     put_tensor("token_embd.weight", {256, 32}, 8);           // Q8_0
     put_tensor("blk.0.attn_norm.weight", {512}, 0);          // F32
     // data section: 32-aligned right after the header; the tensor offsets are
@@ -600,6 +601,30 @@ int main() {
         std::printf("ok    embed_row Q8_0 (bit-exact)\n");
     }
 
+    // The direct Q8 head reads only the usable vocabulary and pads the final band.
+    {
+        constexpr size_t rows = 129, rows_pad = 256, cols = 256, chunk = 9216;
+        const Blocks input = make_blocks(rows, cols, "Q8_0", rng);
+        std::vector<uint8_t> tiles(rows_pad / 32 * chunk, 0xa5);
+        pools::pack_q8_head_tiles(input.bytes.data(), rows, cols, rows_pad, tiles.data());
+        for (size_t row = 0; row < rows_pad; ++row) {
+            const size_t lane = row % 32;
+            const uint8_t* tile = tiles.data() + row / 32 * chunk;
+            for (size_t k = 0; k < cols; ++k) {
+                float scale = 0;
+                std::memcpy(&scale, tile + sizeof(float) * (32 * (k / 32) + lane), sizeof(scale));
+                int8_t code = 0;
+                std::memcpy(&code, tile + 1024 + 4096 * (lane / 16) + 16 * k + lane % 16, 1);
+                const float expected = row < rows ? input.values[row * cols + k] : 0;
+                if (scale * code != expected || (row >= rows && (scale != 0 || code != 0))) {
+                    std::printf("FAIL Q8 head row %zu column %zu\n", row, k);
+                    return 1;
+                }
+            }
+        }
+        std::printf("ok    Q8 head exact GGUF scales and final band padding\n");
+    }
+
     // ---- embed_row (Q6_K, the qh-advance regression: every super-block half)
     {
         BlocksQ6K q6 = make_blocks_q6k(4, 512, rng);      // 4 rows x 2 super-blocks
@@ -618,6 +643,101 @@ int main() {
         }
         std::printf("%s embed_row Q6_K (both super-block halves bit-exact)\n", bad6 ? "FAIL" : "ok");
         if (bad6) return 1;
+    }
+
+    // ---- IQ4_NL: every code, both nibble halves, two blocks per row and two experts.
+    {
+        constexpr int codes[] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                  1,   13,  25,  38,  53,  69,  89, 113};
+        Blocks iq4{{}, {}, 4, 64, 18, static_cast<unsigned>(GgufFile::Type::IQ4_NL)};
+        for (unsigned b = 0; b < 8; ++b) {
+            const float scale = b < 4 ? 0.5f : -2.0f;
+            const uint16_t half = f32_to_f16(scale);
+            iq4.bytes.push_back(static_cast<uint8_t>(half));
+            iq4.bytes.push_back(static_cast<uint8_t>(half >> 8));
+            for (unsigned j = 0; j < 16; ++j)
+                iq4.bytes.push_back(static_cast<uint8_t>(((j + b) % 16) | ((15 - j) << 4)));
+            for (unsigned j = 0; j < 16; ++j) iq4.values.push_back(scale * codes[(j + b) % 16]);
+            for (unsigned j = 0; j < 16; ++j) iq4.values.push_back(scale * codes[15 - j]);
+        }
+        GgufFile weights(write_gguf(dir, iq4, emb, norm, 0, {64, 2, 2}));
+        const std::string name = "blk.0.attn_q.weight";
+        size_t size = 0;
+        const uint8_t* raw = weights.raw(name, &size);
+        if (size != iq4.bytes.size() || std::memcmp(raw, iq4.bytes.data(), size) != 0 ||
+            weights.f32(name) != iq4.values) {
+            std::printf("FAIL IQ4_NL raw bytes or dequantized expert rows\n");
+            return 1;
+        }
+        std::printf("ok    IQ4_NL raw bytes and dequantized expert rows (bit-exact)\n");
+    }
+
+    // ---- NVFP4: four independent block scales, all codes, two rows per expert.
+    {
+        constexpr float codes[]{0, 0.5f, 1, 1.5f, 2, 3, 4, 6, 0, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+        constexpr uint8_t scales[]{0x00, 0x01, 0x38, 0x3f, 0x30, 0x40, 0x7e, 0x7f};
+        constexpr float decoded[]{0, 1.0f / 512, 1, 1.875f, 0.5f, 2, 448, 0};
+        Blocks nv{{}, {}, 4, 128, 36, static_cast<unsigned>(GgufFile::Type::NVFP4)};
+        for (size_t b = 0; b < 8; ++b) {
+            for (size_t group = 0; group < 4; ++group) nv.bytes.push_back(scales[(b + group) % 8]);
+            for (size_t group = 0; group < 4; ++group) {
+                for (size_t j = 0; j < 8; ++j)
+                    nv.bytes.push_back(static_cast<uint8_t>(((j + b) % 8) | ((15 - j) << 4)));
+                const float scale = decoded[(b + group) % 8];
+                for (size_t j = 0; j < 8; ++j) nv.values.push_back(scale * codes[(j + b) % 8]);
+                for (size_t j = 0; j < 8; ++j) nv.values.push_back(scale * codes[15 - j]);
+            }
+        }
+        {
+            GgufFile weights(write_gguf(dir, nv, emb, norm, 0, {128, 2, 2}));
+            const std::string name = "blk.0.attn_q.weight";
+            size_t size = 0;
+            const auto* raw = weights.raw(name, &size);
+            if (size != nv.bytes.size() || std::memcmp(raw, nv.bytes.data(), size) ||
+                weights.f32(name) != nv.values) {
+                std::printf("FAIL NVFP4 raw bytes or dequantized expert rows\n");
+                return 1;
+            }
+        }
+        bool rejected = false;
+        try {
+            GgufFile bad(write_gguf(dir, nv, emb, norm, 0, {127, 2, 2}));
+        } catch (const std::runtime_error& ex) {
+            rejected = std::string(ex.what()).find("incomplete NVFP4 row") != std::string::npos;
+        }
+        if (!rejected) return 1;
+        std::printf("ok    NVFP4 exact dequantization and row alignment\n");
+    }
+
+    // ---- Signed head counts and bool sliding-window flags are stored as arrays.
+    {
+        std::vector<uint8_t> header{'G', 'G', 'U', 'F'};
+        put_u32(header, 3);
+        put_u64(header, 0);
+        put_u64(header, 2);
+        put_str(header, "inkling2_loop.attention.head_count");
+        put_u32(header, 9);  // array
+        put_u32(header, 5);  // int32
+        put_u64(header, 2);
+        put_u32(header, 24);
+        put_u32(header, 24);
+        put_str(header, "inkling2_loop.attention.sliding_window_pattern");
+        put_u32(header, 9);
+        put_u32(header, 7);  // bool
+        put_u64(header, 2);
+        header.insert(header.end(), {1, 0});
+        const auto path = dir / "inkling2-meta.gguf";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(header.data()), header.size());
+        }
+        GgufFile metadata(path.string());
+        if (metadata.kv_u32_array("inkling2_loop.attention.head_count") != std::vector<uint32_t>{24, 24} ||
+            metadata.kv_u32_array("inkling2_loop.attention.sliding_window_pattern") != std::vector<uint32_t>{1, 0}) {
+            std::printf("FAIL GGUF array metadata\n");
+            return 1;
+        }
+        std::printf("ok    GGUF signed head counts and bool window flags\n");
     }
 
     // ---- OPEN-GGUF-GRANITE-FOLD: the folds granite-4.2-3b's metadata asks for, and their refusals
@@ -692,6 +812,33 @@ int main() {
         std::printf("%s fold: pool scales x0.125 and embed_row x0.5 bit-exact, codes unchanged, 0.3 refused (%zu differ)\n",
                     badf || !refused ? "FAIL" : "ok   ", badf);
         if (badf || !refused) return 1;
+    }
+
+    // The dense Inkling path preserves signed GGUF scales and clamps the
+    // nearest FP32 value below +2 instead of wrapping its int16 code.
+    {
+        namespace block = pools::inkling2_block;
+        constexpr size_t n = block::tile_n * block::array_cols, k = block::tile_k, m = block::tile_m;
+        constexpr uint16_t scales[]{0x0001, 0x0401, 0x3555, 0xb555, 0x7bff};
+        std::vector<uint8_t> source(block::weight_bytes(false, n, k));
+        std::vector<uint8_t> packed(block::weight_bytes(false, n, k, true));
+        for (size_t row = 0; row < std::size(scales); ++row)
+            std::memcpy(source.data() + row * 34, &scales[row], 2);
+        block::pack_weights(source.data(), false, n, k, packed.data(), true);
+        for (size_t row = 0; row < std::size(scales); ++row) {
+            uint16_t hi, lo;
+            std::memcpy(&hi, packed.data() + row * 2, 2);
+            std::memcpy(&lo, packed.data() + (block::tile_n + row) * 2, 2);
+            if (bf16_to_f32(hi) + bf16_to_f32(lo) != fp16_to_f32(scales[row])) return 1;
+        }
+        std::vector<float> x(k);
+        x[0] = std::nextafter(2.0f, 0.0f);
+        x[1] = -x[0];
+        std::vector<uint16_t> a(block::input_bytes(m, k) / 2, 0xffff);
+        block::pack_input(x.data(), 1, m, k, reinterpret_cast<uint8_t*>(a.data()), true);
+        if (bf16_to_f32(a[0]) != std::ldexp(1.0f, -14) || a[8] != 128 ||
+            a[m * 8] != 32767 || a[m * 8 + 1] != 32768 || a[m * 8 + 8] != 0) return 1;
+        std::printf("ok    Inkling Q8 split scales and direct FP32 activation packing\n");
     }
 
     std::printf("GGUF-PACK OK\n");

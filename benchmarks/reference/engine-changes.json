@@ -114,6 +114,396 @@
         "src/open_qwen36/pools_test.cpp": "bc8c6531341606c23986d0c3c7b6f32f5f5562a81582844603a782d57983ecca",
         "src/open_qwen36/block_host_test.cpp": "e30a49e204b121ceb940ebd7b85065d9b5f637011df32137d8af74993694a0b9"
       }
+    },
+    {
+      "id": "gptoss-granite-engine-merge",
+      "origin": "open-kernels: f36f54fa92e6a0535e05cf4312262a986a43db49 merges the GPT-OSS and Granite engine changes, carried into main by d3a75d7faf4c2526421f5ebb59093f45e179d6d4",
+      "files": {
+        "src/open_qwen36/core.cpp": "35eea613e9c62e657a35637977127614df540059935d1403763a85bac59a84f8",
+        "src/open_qwen36/core.hpp": "9296fe9fbb603e8210d8a454daeb2b85b8df01c588e16ffd21caba08cf881a82",
+        "src/open_qwen36/engine.cpp": "3cb4b0e68de2b0ac4c43535444306c54b92f4dadad472ae8a77d4293f91af2c8",
+        "src/open_qwen36/manifest.cpp": "e14495f05fe49736bda28b4e9f774086625316e0f10f9a57123026f05abc5ed7",
+        "src/open_qwen36/manifest.hpp": "0ad0538e83ced8885406b672640e53849ee8c6699d18fe4ffdee0ddb278866d6"
+      }
+    },
+    {
+      "id": "inkling2-iq4-nl-reader",
+      "origin": "open-kernels: host IQ4_NL blocks and flattened expert rows for Inkling 2 Mini GGUF bring-up",
+      "files": {
+        "src/open_qwen36/gguf_file.cpp": "111767764e9145a5039f997bb2880f07e8bdc8ead1e6b1a3953831c14b14834f",
+        "src/open_qwen36/gguf_file.hpp": "2143e1cabf3e3047358f521aaf2e366927dbaee292cf3f7db677b177a60cf20a",
+        "src/open_qwen36/gguf_pack_test.cpp": "891de7d3c90a7bf3e881bf14469a1fa40677a20e493079105cb3afdcce914b33"
+      }
+    },
+    {
+      "id": "inkling2-native-host",
+      "origin": "open-kernels: fixed-loop Inkling 2 Mini GGUF host execution, per-visit sequence state and no-XRT parity driver",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "786ebe05bf76ca53a35917e8a35ee21ae9857e5c7248abe25e0737b35f65379d",
+        "src/open_qwen36/gguf_file.cpp": "cc2f2896fc5176644f180f66418c9a66c5d1836c65962e6e05ea9911b72fa085",
+        "src/open_qwen36/gguf_file.hpp": "481619660ff2cdf637c93adac8f4e9f0181d20330449fb6d839b8d1df58af4db",
+        "src/open_qwen36/gguf_pack_test.cpp": "7c9defcd7510d3bfcd6f4ee02cdd58e152f399695474ba3193d0ca9a0abda9e1",
+        "src/open_qwen36/inkling2_host.cpp": "b6b39fcb2fe0cf46ea0a358e433eee0e321a53915b2db8b2a509ee0a5c74bd9a",
+        "src/open_qwen36/inkling2_host.hpp": "1b713a29073180e39b8acf9abe2465f76e062de35e0ff539aa6394539b745f1a",
+        "src/open_qwen36/inkling2_host_check.cpp": "0987d7e86e6494fd4eb9f56467d5c3e317991d4f375882bc257e23ecfaa9a0bf"
+      }
+    },
+    {
+      "id": "inkling2-routed-npu-experts",
+      "origin": "open-kernels: single-token Inkling 2 Mini decode with resident IQ4_NL and Q8_0 expert pools and one XRT context",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "2ed07b93eccb0a6ec44257a1836b4c66815fbc09e8d16ff9664269984a79c04e",
+        "src/open_qwen36/inkling2_host.cpp": "768cc59dcada88c9828415fbdf92ac29a91671a39cccffe88ffc6fa01e77a1ef",
+        "src/open_qwen36/inkling2_host.hpp": "8933083a8c8e9f1d484db4150684806ff09cbded09a8e954cd177cbf5f3c9f9a",
+        "src/open_qwen36/inkling2_host_check.cpp": "52062cdec1d91c84d9f3f9086d902d11fc2feb8de839faa8840a12b72ef5a5ac",
+        "src/open_qwen36/inkling2_npu.cpp": "c8973a78e7b5a6f632f4646d8abe2afc8f7aab6ab475459d2d0455957e46cbdf",
+        "src/open_qwen36/inkling2_npu.hpp": "dd5d245c84d9b617af7beb33df81da04556f786b42b7a7beb9db9641fa7721cb",
+        "src/open_qwen36/pools.cpp": "c9540399efb215e2697078dbc9feb9f346cab5c6928b47d70e8f8659c4399db0",
+        "src/open_qwen36/pools.hpp": "e65dce9b23cf00947fbe3b2141cae6982f4496997b41230e17554aeeb564d07d"
+      }
+    },
+    {
+      "id": "inkling2-npu-q8-head",
+      "origin": "open-kernels: version-2 Inkling 2 bundle with a resident Q8 head, GGUF artifact declarations, and an explicit dispatch timeout for phlegm",
+      "files": {
+        "src/open_qwen36/gguf_pack_test.cpp": "cfa51acf603658777cc89abe1e61996ebb75e7dfa471de5d359049bcc3331344",
+        "src/open_qwen36/inkling2_host.cpp": "c69b87d30a9edfd7e34fd2e231c972afa7c0af9953b15b22ce21de9651fd7bd2",
+        "src/open_qwen36/inkling2_host.hpp": "71e4629cf8ac7f8f6ff1fc31539bb203926976448f3fbced1395965cfe2dc30b",
+        "src/open_qwen36/inkling2_npu.cpp": "58cbdb83941fe8b6bb3add92be509bb9d1954292fac55967b5dabe33dda9718b",
+        "src/open_qwen36/inkling2_npu.hpp": "c143b998df35f3076ecd969952aea54323808ee2179c2f500b5105d60aa9fc14",
+        "src/open_qwen36/pools.cpp": "5a112afa0baf458026164aea9021c136f8df29520a58f54f5a1a4c54a83a9321",
+        "src/open_qwen36/pools.hpp": "17bbc7f2ef9dbd8ce2cf0026dc677006495f7ba0e4c2e3565368ad738859b59e"
+      }
+    },
+    {
+      "id": "inkling2-expert-block",
+      "origin": "open-kernels: version-3 Inkling 2 bundle with compact IQ4_NL/Q8_0 expert GEMMs for block prefill and retained grouped GEMV decode",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "c7e1183c8bbf6ef8050ad3b4e10e4251f64451d8dc46090188e57bb7fdff3056",
+        "src/open_qwen36/inkling2_host.hpp": "32f6f4b869df831f5b7f3fe7999b71ca0800d74e440b52f600acf01db78b0f3d",
+        "src/open_qwen36/inkling2_npu.cpp": "a38eae2e6526a0b628e54e9081c7fc1c961f814a91e16e636f5815501eee5876",
+        "src/open_qwen36/pools.cpp": "23b85c7ac3298fcf4ab2c93849edac9defd6287360b62652db21075a2184dfcf",
+        "src/open_qwen36/pools.hpp": "ce50caf4b2eda70241e1d72dec08af517932048e52cca0136962cdebc6d8dd80"
+      }
+    },
+    {
+      "id": "inkling2-shared-expert-pool",
+      "origin": "open-kernels: version-4 Inkling 2 bundle with one compact IQ4_NL/Q8_0 weight pool used by grouped decode and block prefill",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "5b2db0af2364981209bc186f674004411459dcae5d2bc9e67aa4d9c5c4175ca5",
+        "src/open_qwen36/pools.cpp": "7b61070a1c045a54e3e4bf98aff2be77e4d1002059c98af3da6c9126f856cb42",
+        "src/open_qwen36/pools.hpp": "e4261f4d54554a81200384d81f55b8fd920dacdc13d06477ee56872aeba7f8db"
+      }
+    },
+    {
+      "id": "inkling2-relative-attention",
+      "origin": "open-kernels: optional version-5 Inkling 2 bundle with streamed relative-position NPU attention and host KV staging",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "ffc461df214ca54d526e16f8b10800e3f97b48ff4152f72e2eb546ec04b8ddd3",
+        "src/open_qwen36/inkling2_host.cpp": "bc049e1b670f567aa8805c93deee9c84fc2b32ea2fdd9f2d03a418363b5aa117",
+        "src/open_qwen36/inkling2_npu.cpp": "60e2f9bdb7183b0a8e705ab047a3d0ae3ac7b407eb04b2bc0fd71a62f33c7fc4"
+      }
+    },
+    {
+      "id": "inkling2-shared-decode-context",
+      "origin": "open-kernels: optional version-6 Inkling 2 bundle sharing attention and grouped expert decode contexts by quant format",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "4ce4b7b5cf8753ed5ff03badc00b7f0295a9f1546f9620fc5a5aa3999023152b",
+        "src/open_qwen36/inkling2_host.cpp": "33a8ce3481b39d997ec358eb29ada7efe13d74704ca4f2e38320e9e2e06a3ff1",
+        "src/open_qwen36/inkling2_npu.cpp": "91dabb1f6a918c06f5a21496f5892f9e63fe6fa584ab311e1aa5fd6db31b19ef"
+      }
+    },
+    {
+      "id": "inkling2-grouped-block-prefill",
+      "origin": "open-kernels: version-7 Inkling 2 bundle batching eight expert slices per launch during prefill",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "e19b5ea474b2bbff1ef2c07f8019cef2e1c088bbc72aad3ae33918232985780a",
+        "src/open_qwen36/inkling2_host.hpp": "c17a7252606e5ced451d2811c83272865addbb11d9b090cba11516626f73fcdb",
+        "src/open_qwen36/inkling2_npu.cpp": "502a5c9819f17be254ee5b5390d071c517dfd5fe048a134b7187a0c62414cefa",
+        "src/open_qwen36/pools.cpp": "cd5af0ef3955ffccb23390c76cbf294cd63fbd1db3e83082e82d7db1500d4aaa",
+        "src/open_qwen36/pools.hpp": "87d66ead47a6514e8de8d010e1939cd6e85e374b19c868a98ad89b74d1abe613"
+      }
+    },
+    {
+      "id": "inkling2-dense-block-prefill",
+      "origin": "open-kernels: version-8 Inkling 2 bundle with split-scale Q8 dense attention projections for block prefill",
+      "files": {
+        "src/open_qwen36/gguf_pack_test.cpp": "181a2b38484bb6ed315cfb8c3e71ea81f59a6cc73a4860225faab6de4a894af4",
+        "src/open_qwen36/inkling2_host.cpp": "1294a68fe6f6ad6444ea9fdaa74a54fcaf17fe6399eabb721a693c88c0b16c05",
+        "src/open_qwen36/inkling2_host.hpp": "237958d7c4483373a93451a8f334f47de511ab99b2e0a13031f885a5bdbbacb6",
+        "src/open_qwen36/inkling2_npu.cpp": "88a45450ed35bb8db3c7e5d6f1228bc1a70d6ecedaf5725d6670ada870c409a8",
+        "src/open_qwen36/pools.cpp": "3da46dde30a4c5dececaf887486ac65f307530128a9c8332d019d1e7e5339b44",
+        "src/open_qwen36/pools.hpp": "788c7494e4c4afab14f5a1e80e8fbe896de79b45e4e9d19c5860ff3662ea1fa0"
+      }
+    },
+    {
+      "id": "inkling2-reuse-full-attention-key-prefix",
+      "origin": "open-kernels: reuse uploads of complete full-attention K/V tiers outside the block's relative-position extent",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "dab54504cc636652bb1aee6dd49bcbe5711f10f21f8eb20b65d6de9a7bf0a102"
+      }
+    },
+    {
+      "id": "inkling2-native-vision-host",
+      "origin": "open-kernels: BF16 mmproj vision tower and direct mixed image rows through the Inkling 2 Mini text sequence",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "b6b3b10888db653129a9763acc67eee8f7693e05ae8a00aa2a2de9865f48aeff",
+        "src/open_qwen36/inkling2_host.cpp": "8c16e5c840d5412f30a7ac40722ded02e69890f78eac6c6e17f4fef3f0ac88a6",
+        "src/open_qwen36/inkling2_host.hpp": "0b27e6b2f7a38b85592a2bd2c42a3ff7631d59b81fc33c29bd5910e9569a3801",
+        "src/open_qwen36/vision/inkling2_vision.cpp": "0b433d9981c8f76e2d6e5280b1fc035b500545ea1cea758046618167e241bbd2",
+        "src/open_qwen36/vision/inkling2_vision.hpp": "cd9fc538d6601807fe74ea27c71797ec58d6a25994490031ebe62d1d9c88a6eb",
+        "src/open_qwen36/vision/inkling2_vision_check.cpp": "19ecf81c41252af568ea5eb862b300b1ad497ebc174c851aeb260bb2cadd4ed1",
+        "src/open_qwen36/vision/vit.cpp": "a1b51d2155616031c3fb88ac39d0bd38de6cdd6b68fda780a9c79c9fb3b43f39",
+        "src/open_qwen36/vision/vit_ops.hpp": "32cbc1bdd47c8af1d16ef3d42016da533f946e7a1109e6ad6257bb7c7d92ac41"
+      }
+    },
+    {
+      "id": "inkling2-npu-vision",
+      "origin": "open-kernels: resident BF16 projection and bidirectional attention contexts for the version-9 Inkling 2 Mini vision tower",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "e9ae077a930bb8be7181589482825d9a3dc766878aa61d797a913e058405e2e8",
+        "src/open_qwen36/inkling2_npu.cpp": "747952a8f1f4e67775029e996199bfadb97d39372efb62237bea6a7773b6348f",
+        "src/open_qwen36/vision/inkling2_vision.cpp": "07234d8e891b5b95a6f18154665fd53084d67184d67ce1085e4587c742bdcb94",
+        "src/open_qwen36/vision/inkling2_vision.hpp": "36a1f6535a8092943f817f7bddf24fad240756bf1b0b1004353ff37d1c8ae90a",
+        "src/open_qwen36/vision/inkling2_vision_check.cpp": "74218fddf2b418fd813e2154a73b8e83e668437a0a49e3163891b91ea5d766cc",
+        "src/open_qwen36/vision/inkling2_vision_npu.cpp": "ada982fd3eaa26834a48c13a28fe3856c88c8243a7f9a5909e35ca39152fd5a0",
+        "src/open_qwen36/vision/inkling2_vision_npu.hpp": "0f6654b27350be42924580c91e528658813d81968b5edf792995d4b7d66d63df"
+      }
+    },
+    {
+      "id": "inkling2-verify-prefix",
+      "origin": "open-kernels: transactional block verification and partial prefix commit for Inkling 2 speculation",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "74f6663f6ad90004a85d7ee19aab97b29d61fe34a7c921da8814a29cd3d90963",
+        "src/open_qwen36/inkling2_host.cpp": "c2829a94dfa0c61f0723bcb61250c0939e2493dacfd3b0ccaef2fc579fa5133c",
+        "src/open_qwen36/inkling2_host.hpp": "cb90c4c0b44a1b68b790afa27deb653f368bb83680d17c47ebec8b497dc0b4a5",
+        "src/open_qwen36/inkling2_verify_check.cpp": "0821053166fd671d5851c6f3d2f6d7a54f5cdb2235aa57ce33446ed4829d882c"
+      }
+    },
+    {
+      "id": "inkling2-dspark-target-features",
+      "origin": "open-kernels: export chronological Inkling 2 DSpark features from prefill, image and tentative verify rows",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "da8b814d8b798edc1da9014c10524cea21c1b4d4280a6a6b5809f41042c67aaa",
+        "src/open_qwen36/inkling2_host.hpp": "eac59a53bb646069e74fb15ddeb605457d28e196c0fa2cb15aaf6c5e43ecebd7",
+        "src/open_qwen36/inkling2_verify_check.cpp": "19506dc58ff41abca3e5b03e2f4edb02332fbaa480b1b65ed18960a8c6fb9907"
+      }
+    },
+    {
+      "id": "inkling2-vision-split-keys-and-values",
+      "origin": "open-kernels: optional v10 split-key and v11 split-key-and-value bidirectional vision streams",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "9e9abf1a0b34eaf634f9500c1196bbb91b7031eafb77300776f91ede40153b0d",
+        "src/open_qwen36/vision/inkling2_vision_npu.cpp": "82143fb92e38bbfa10a4ca3580d05b4f129d9081f4dc942cac7262a2b8c375d2"
+      }
+    },
+    {
+      "id": "inkling2-dspark-cpu",
+      "origin": "open-kernels: native Inkling 2 DSpark draft graph and oracle proposal check",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "37210de764f6998d47237767ce05bb6adf2e13b5c16c58a0a9a03e74d9b2a13a",
+        "src/open_qwen36/gguf_file.cpp": "af1dc47b036c658c7aaf1363aec1495b8149e4d8d8e72c34f96176dd0eeda1ef",
+        "src/open_qwen36/inkling2_cpu.hpp": "ebecb39ed5dcff8dbfe9eeb90c5daa2655a5e03418e812b3145dc7065e96b6c2",
+        "src/open_qwen36/inkling2_dspark.cpp": "e52387493d14c91b94043908a47e8a7391f75acc6c19684b46a26185eb92f235",
+        "src/open_qwen36/inkling2_dspark.hpp": "7439a59ac4a68adb5a3ddb9e9158bc769247a2d866cef8294a10b7a79b10a1ff",
+        "src/open_qwen36/inkling2_dspark_check.cpp": "f8801f92d97b518ae7191044a45c36fe9047ba0175ff4e75461e14fcc2102c05",
+        "src/open_qwen36/inkling2_host.cpp": "4e7cd9555e746026835466b0da9770261dee677257a91a977ddbed99e8b7de49",
+        "src/open_qwen36/inkling2_host.hpp": "fed3bc548bca209c2e73081c03f3fd33dbabc605da3347dea01d3c1c46c6f28d"
+      }
+    },
+    {
+      "id": "inkling2-dspark-q8-avx2",
+      "origin": "open-kernels: project the shared DSpark Q8_0 head directly from GGUF with AVX2",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "1f970f706c2f41c226b168bec29feb0a1ad178e92abbfa9a5a452fc665002361",
+        "src/open_qwen36/inkling2_dspark.cpp": "d87a91bd36aef83fabdc54bd64b4716f7f5880350cdf6ea2c796393b96ac8978"
+      }
+    },
+    {
+      "id": "inkling2-host-projections",
+      "origin": "open-kernels: fuse exact singleton Q8_0 projection and parallelize narrow F32 block projections",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "a916bd50db9fecf63937bea868692fa4c209a57d88daea46cf34a91073babd2b",
+        "src/open_qwen36/inkling2_cpu.hpp": "dc1086de1e57490fea65256aaaf3d66e6f470baa6c74b8efeffed239325b9d0d"
+      }
+    },
+    {
+      "id": "inkling2-verify-matrix",
+      "origin": "open-kernels: check each eight-token verify prefix and staged DSpark cache at the sliding window",
+      "files": {
+        "src/open_qwen36/inkling2_dspark_check.cpp": "af43a98f396d4f9bb76cc85d5a36bf87f15444b1ce05c1ab8fd88774b3cdc4e3",
+        "src/open_qwen36/inkling2_verify_check.cpp": "1720da955b442372c3d51ddaa40a731ea2500045cc57cc3eda1bb3e05204af2b"
+      }
+    },
+    {
+      "id": "inkling2-packed-query-reuse",
+      "origin": "open-kernels: retain each Inkling full-attention query payload across key tiers",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "af5a30790514368dbfe00b177865b577561e8fa7a7f3d53617000994e394f4a5"
+      }
+    },
+    {
+      "id": "inkling2-q8-small-block-projections",
+      "origin": "open-kernels: share packed Q8_0 decoding across small Inkling projection blocks",
+      "files": {
+        "src/open_qwen36/inkling2_cpu.hpp": "85806cfdfbd0467e9e923ed090febdd20a55eb236c3ece795d16a9919564509e"
+      }
+    },
+    {
+      "id": "inkling2-merge-attention-frames",
+      "origin": "open-kernels: merge relative-attention output directly from its framed result",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "d23bb5e5daf73b2bb77bb960b949caa63084e75fb940e3e5b3de1e2772027001"
+      }
+    },
+    {
+      "id": "inkling2-dspark-vector-attention",
+      "origin": "open-kernels: vectorize DSpark context attention and cap Q8 head logits in the projection loop",
+      "files": {
+        "src/open_qwen36/inkling2_dspark.cpp": "41491b53bac6f7698ac5a0f8936197627cf2b87f808ce37b6301709ce7e30c7c"
+      }
+    },
+    {
+      "id": "inkling2-singleton-attention-projections",
+      "origin": "open-kernels: schedule the six singleton Q8 attention input projections in one host parallel loop",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "174d6551db7397b440179f30cde15dcf9faf6c3ce841e7b70def00ed1135297f"
+      }
+    },
+    {
+      "id": "inkling2-dspark-release-long-cache",
+      "origin": "open-kernels: cap retained DSpark cache capacity after sequence reset",
+      "files": {
+        "src/open_qwen36/inkling2_dspark.cpp": "6bb37ae78d4804f2d6d2b78ca86fbd485c5186bb193c9d36155a5de71a10e56a"
+      }
+    },
+    {
+      "id": "inkling2-contiguous-convolution-taps",
+      "origin": "open-kernels: pack Inkling 2 host convolution weights by lag and reuse dynamic taps within each head",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "e05f39f030d8170f85b9a4139651ee9fb9e3950e5207bcd91c2f06c38b79cecb"
+      }
+    },
+    {
+      "id": "inkling2-incremental-long-kv-commit",
+      "origin": "open-kernels: reserve full-attention KV addresses lazily on Win64 and commit used pages without relocating old rows",
+      "files": {
+        "src/open_qwen36/inkling2_host.cpp": "3b9a6392e13ffea825e19112a4c9f0343919e6be30dbc5c7bfc5acc3e345ed06"
+      }
+    },
+    {
+      "id": "inkling2-f32-row-tiling",
+      "origin": "open-kernels: share F32 weight loads across four Inkling projection rows while retaining each dot accumulation order",
+      "files": {
+        "src/open_qwen36/inkling2_cpu.hpp": "1a7f9dc317fbf15e807ac88e28d3f71f02a80f9f1785c58634568bca084a13fd"
+      }
+    },
+    {
+      "id": "inkling2-q8-eight-row-tiling",
+      "origin": "open-kernels: unpack Q8_0 weights once for an eight-row Inkling projection while retaining each dot accumulation order",
+      "files": {
+        "src/open_qwen36/inkling2_cpu.hpp": "a8a6eaece3efeb865a820b6bfb82e123bacab9218a8d0c38db1ffb542de80e9a"
+      }
+    },
+    {
+      "id": "inkling2-vector-activation-pack",
+      "origin": "open-kernels: pack Inkling block activations eight lanes at a time while preserving the packed wire bytes",
+      "files": {
+        "src/open_qwen36/pools.cpp": "fa9a8a341350e42adb88d57b0c05b561e0c96a935fab5a171f1e1811bdeb91f8"
+      }
+    },
+    {
+      "id": "inkling2-nvfp4-host",
+      "origin": "open-kernels: decode NVFP4 rows and apply the physical expert scales in the Inkling host projection",
+      "files": {
+        "src/open_qwen36/gguf_file.cpp": "8916e9d2d2303ca81aa1b9a00d454a7765acb729a8af5275d2d0ceb850b8d2a1",
+        "src/open_qwen36/gguf_file.hpp": "31354cfc438700cf3c95bb2eaba33d58862275c6c4e7237f1defb3923fadcebc",
+        "src/open_qwen36/gguf_pack_test.cpp": "a69e570f1aa7ba26f4d992b5d5dc6ce13e70224bbb6824638e0ea64cdda1cb05",
+        "src/open_qwen36/inkling2_cpu.hpp": "d0681e3f4b2ecb9bb8233d9b3f7436b0cac6942c77ce21e2c3a2d4fecfa260d0",
+        "src/open_qwen36/inkling2_host.cpp": "1100345441749fd319c4097b4289b0f65638a7a1b55f34c8f76d1b16291c0401"
+      }
+    },
+    {
+      "id": "inkling2-stream-cached-kv",
+      "origin": "open-kernels: stream complete cached Inkling K/V ranges into aligned v11 XRT buffers while preserving the packed wire bytes",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "b149bd8d852bda6daa2bf241e0a193dc9907074a84bd7e44781948836578bb33"
+      }
+    },
+    {
+      "id": "inkling2-overlapped-prefill",
+      "origin": "open-kernels: overlap Windows Inkling expert and dense prefill dispatches with host work and parallelize independent host rows",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "1ea543e3065df55ada4489e8055691e65207a4bd354cb16cd3b3af2e797cae46",
+        "src/open_qwen36/inkling2_host.cpp": "a66384103e44d0a4cf05fb1b8239d5dd4335ccb9a36e40c938acc296385b419b",
+        "src/open_qwen36/inkling2_npu.cpp": "5366dd5a280acd50764eba2ce60d3a5ba154e917bdfae9750cc3ecba8db9100d"
+      }
+    },
+    {
+      "id": "inkling2-aligned-verification-attention",
+      "origin": "open-kernels: align Inkling window chunks and dense verify arithmetic with singleton decode on capable shared images",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "ec22a0ebb0ba6202385752668c0a8008dd153e2921258e15c590bd27a2c105e6",
+        "src/open_qwen36/inkling2_host.cpp": "acb86b54addf155620907d421da76950a375fb668249b7f37769b6fd6cbb03e9",
+        "src/open_qwen36/inkling2_npu.cpp": "c81c8db41c98d5d7fcbe327d57246255abd363de41c1ca25775ae7c5e876a011"
+      }
+    },
+    {
+      "id": "inkling2-wide-old-attention",
+      "origin": "open-kernels: select manifest-backed wide older-key attention and preserve packed keys by recurrent visit and sequence",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "9b5c42ed0170a3c23ba23ced0ec8baeecf0b4f67204ef9436758d3649f3d209f",
+        "src/open_qwen36/inkling2_host.cpp": "c4880a7f4dba18852a899b1a6ee3abcc31707100717fe7f24c39c0dd8d1f7331",
+        "src/open_qwen36/inkling2_npu.cpp": "597cc6416fb8474a989dacc915f5e19c12d10422151522dea3a79439ee6cc608",
+        "src/open_qwen36/inkling2_wide_attention.hpp": "e687e8a7b2bc273797fa8ed1c5f8d0fb48cc95ddac934bb324ab7fb38546d093"
+      }
+    },
+    {
+      "id": "inkling2-paired-verification-head",
+      "origin": "open-kernels: optionally reuse each Q8 head weight tile across two consecutive verification rows",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "ff4fdbb1fdd30689100ebefb0405d182964a041b48a059891e71048ea795d8fe",
+        "src/open_qwen36/inkling2_host.cpp": "f82a04b3932902a4feefe973f9924eccde95b753c22220cb208b8298d7c23e43",
+        "src/open_qwen36/inkling2_npu.cpp": "7d3dd3aef979909780cd615b44e765cf1de339968ba13e3f796008eec96a0739"
+      }
+    },
+    {
+      "id": "inkling2-shared-singleton-decode",
+      "origin": "open-kernels: route singleton attention projections through the shared image and match verify arithmetic",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "2885725bca4eb74e2320031472ba8ea1c92346f5cb05f91b76204b55e9728142",
+        "src/open_qwen36/inkling2_host.cpp": "0a578085047d75ae16e6352ce33c515f6939fbddfeb12eab178aea98bb5b88b9",
+        "src/open_qwen36/inkling2_npu.cpp": "ea00f99309452c7529bda9906787be12fd162e09e811fa68ef66d9911a48bff9",
+        "src/open_qwen36/inkling2_singleton_io.hpp": "0cdfe2802b1719a9fd61b985e84e86270f5a314ae80d1610fc8c875285183176"
+      }
+    },
+    {
+      "id": "inkling2-lossless-wide-key-cache",
+      "origin": "open-kernels: recover unchanged BF16 keys from the wide-attention wire and retire duplicate Windows pages",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "0db9ce49262b62190d31cbabeea8bdd32d1e171e2bb3edddb34fc4d49d989984",
+        "src/open_qwen36/inkling2_host.cpp": "1358aa6700d55bc2efec579776de8b21a385519c174c4d36f33c70753edab57e",
+        "src/open_qwen36/inkling2_npu.cpp": "a60129d457aa6e81dfe8dea193f5cac33ac4b52ef8c976dff286868bb2945818",
+        "src/open_qwen36/inkling2_wide_attention.hpp": "93e83e122c9c00835188641fd14500d6fea314d2408bd0d08e75c09f02abe171"
+      }
+    },
+    {
+      "id": "inkling2-near-attention-decode-rows",
+      "origin": "open-kernels: one-dispatch near-range block attention, keys-as-lanes decode and verify rows, threaded host SiTU, reduction, convolution and gate, cache-friendly small F32 projections",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "7ec4802588ed2a1220b3e0bc7963afb5bd7cbe31c4cdbd5771eb8fa15fbbeed3",
+        "src/open_qwen36/inkling2_host.cpp": "b9edefb841ab963d4c772a9dbc26b425804a7af3270f208d93b00e00fe146aba",
+        "src/open_qwen36/inkling2_cpu.hpp": "ae56c0028aff951caad656a78da19b7fa365f0b56a6fd2acca9a5c0241662535"
+      }
+    },
+    {
+      "id": "inkling2-shared-prefill-q8-pool",
+      "origin": "open-kernels: grouped Q8 prefill reads the split-scale experts that singleton decode packs (manifest key shared_prefill_q8). Recorded late from 2026-11-24: near attention follows the retired wide older-key range, eight-lane FMA dots for small F32 projections in a prefill batch",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "33a0d523002faa47b765eaa093f86175858aa07268e00fb9cdfd43ea70b36f9d",
+        "src/open_qwen36/inkling2_cpu.hpp": "77ed5b0b0af0978104e87365b895ed673a77bf1070ef26ebab690dfc11fccf61",
+        "src/open_qwen36/inkling2_wide_attention.hpp": "2560f760e6e1ea0fbd055c716c3eeb12d1a858ab97474cff1dedada4faf5417d"
+      }
     }
   ]
 }

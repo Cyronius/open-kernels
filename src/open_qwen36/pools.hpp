@@ -119,6 +119,25 @@ void q4_0_to_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst);
 /// exactly 4096 codes, so the codes are a verbatim slice and only the scales are gathered;
 /// `recipes/pack.py q8_half_tiles` is the same permutation in NumPy.
 void q8_half_tile(const uint8_t* chunk, unsigned half, uint8_t* dst);
+/// One Inkling 2 expert plane in band order. Shapes pad only along K.
+/// IQ4_NL uses the compact 2,560-byte tile with its original lookup indices;
+/// Q8_0 uses the 5,120-byte tile. Both round GGUF's block scales to BF16.
+void pack_inkling2_expert(const uint8_t* src, bool iq4_nl, size_t rows, size_t cols, size_t cols_pad, uint8_t* dst);
+namespace inkling2_block {
+inline constexpr size_t tile_m = 16, tile_n = 96, tile_k = 32, array_cols = 8;
+inline constexpr size_t decode_tile_m = 4;
+inline size_t weight_bytes(bool iq4, size_t n, size_t k, bool split_scale = false) {
+    return n * (k / tile_k) * ((iq4 ? 18 : 34) + (split_scale ? 2 : 0));
+}
+inline size_t input_bytes(size_t m, size_t k) { return m * (k / tile_k) * (tile_k + 8) * sizeof(int16_t); }
+void pack_weights(const uint8_t* src, bool iq4, size_t n, size_t k, uint8_t* dst, bool split_scale = false);
+void pack_input(const float* src, size_t rows, size_t m, size_t k, uint8_t* dst, bool from_fp32 = false);
+void unpack_output(const float* src, size_t rows, size_t m, size_t n, float* dst);
+void unpack_grouped_output(const float* src, const size_t* counts, size_t slots, size_t slot_rows,
+                           size_t core_rows, size_t n, float* dst);
+}  // namespace inkling2_block
+/// Q8_0 rows to 9,216-byte f32-scale logits tiles, with zero padding up to rows_pad.
+void pack_q8_head_tiles(const uint8_t* src, size_t rows, size_t cols, size_t rows_pad, uint8_t* dst);
 /// [rows, cols] of `elem`-byte values -> [cols, dst_rows], the columns past `rows` zeroed.
 /// dst_rows == rows is the plain transpose; a wider one pads a 16-head DeltaNet's alpha /
 /// beta out to dn_glue's 32-lane accumulator.

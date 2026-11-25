@@ -19,6 +19,17 @@ cargo build -p phlegm-core -p phlegm-cli --offline
 cargo build -p phlegm-core -p phlegm-cli --features npu --offline
 ```
 
+The in-tree import at `8f4060367f9a7b52ded9edab7c3752d8a185fdb2` also preserves the S3 engine
+tree. Its 76 source files match the S3 hashes in `engine-provenance.json`, and its license
+matches the original import. Use this reference when the original local OFLM snapshot is
+unavailable. Run the check from a source checkout with canonical Git line endings and build
+outputs outside the engine directories.
+
+```sh
+python3 benchmarks/reference/check_import.py \
+  --upstream . --commit 8f4060367f9a7b52ded9edab7c3752d8a185fdb2
+```
+
 Wrap builds/tests in Dibs on the shared development machine. Linux `npu`
 builds the shim and invokes `benchmarks/reference/build.py` for the bridge;
 its existing flag list is the single definition. Only `block_host.cpp` gets
