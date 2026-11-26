@@ -114,45 +114,6 @@ __attribute__((noinline)) inline void gemv_q8_half_tile(const uint8_t *__restric
   else
     acc.from_vector(aie::load_v<kQ8Rows>(y));
 
-#if GEMV_Q8_ROWS2_PROBE
-  // PROBE (verify-pass timing, output wrong): two token rows in A rows 0 and 1, the epilogue per row
-  aie::accum<accfloat, kQ8Rows> acc1 = acc;
-#pragma clang loop unroll(disable)
-  for (unsigned kb = 0; kb < kQ8KBlocks; ++kb) {
-    const uint8_t *__restrict src = c0 + kb * kQ8KInBlock * kQ8Rows;
-    aie::mmul<4, 8, 8, int16_t, int8_t> Clo, Chi;
-#pragma clang loop unroll(full)
-    for (unsigned oc = 0; oc < 4; ++oc) {
-      const aie::vector<int16_t, 8> x8 = aie::load_v<8>(xi + kb * kQ8KInBlock + oc * 8);
-      const aie::vector<int16_t, 16> x16 = aie::concat(x8, aie::load_v<8>(xi + kb * kQ8KInBlock + ((oc + 1) & 3) * 8));
-      const aie::vector<int16_t, 32> A = aie::concat(x16, aie::zeros<int16_t, 16>());
-      const aie::vector<int8_t, 64> q0 = aie::load_v<64>((const int8_t *)src + oc * 128);
-      const aie::vector<int8_t, 64> q1 = aie::load_v<64>((const int8_t *)src + oc * 128 + 64);
-      auto [lo, hi] = aie::interleave_unzip(q0, q1, 8);
-      if (oc == 0) {
-        Clo.mul(A, lo);
-        Chi.mul(A, hi);
-      } else {
-        Clo.mac(A, lo);
-        Chi.mac(A, hi);
-      }
-    }
-    const aie::vector<int32_t, 32> clv = Clo.template to_vector<int32_t>(), chv = Chi.template to_vector<int32_t>();
-    const aie::vector<bfloat16, kQ8Rows> sv = aie::load_v<kQ8Rows>(s + kb * kQ8Rows);
-#pragma clang loop unroll(full)
-    for (unsigned t = 0; t < 2; ++t) {
-      const aie::vector<int32_t, kQ8Rows> vi = aie::concat(clv.template extract<8>(t), chv.template extract<8>(t));
-      aie::accum<accfloat, kQ8Rows> part;
-      part.from_vector(aie::to_float<float>(vi, sh[kb]));
-      const aie::vector<bfloat16, kQ8Rows> hi = part.template to_vector<bfloat16>();
-      const aie::vector<bfloat16, kQ8Rows> lo = aie::sub(part, hi).template to_vector<bfloat16>();
-      aie::accum<accfloat, kQ8Rows> &a = t ? acc1 : acc;
-      a = aie::mac(a, hi, sv);
-      a = aie::mac(a, lo, sv);
-    }
-  }
-  acc = aie::add(acc, acc1.template to_vector<float>());
-#else
 #pragma clang loop unroll(disable)
   for (unsigned kb = 0; kb < kQ8KBlocks; ++kb) {
     const uint8_t *__restrict src = c0 + kb * kQ8KInBlock * kQ8Rows;
@@ -183,7 +144,6 @@ __attribute__((noinline)) inline void gemv_q8_half_tile(const uint8_t *__restric
     acc = aie::mac(acc, hi, sv);
     acc = aie::mac(acc, lo, sv);
   }
-#endif
 
   aie::store_v(y, acc.template to_vector<float>());
   event1();
@@ -205,9 +165,6 @@ static inline void gemv_q8_pool_group_rt(const uint8_t *__restrict chunks,
     const unsigned part = c % rs;                   // which 16-row slice of the band
     const unsigned kt = c / rs;
     gemv_q8_half_tile(chunks + i * kQ8TileBytes, tab, K, kt, kt == 0, y + part * kQ8Rows);
-#if GEMV_Q8_TWICE_PROBE
-    gemv_q8_half_tile(chunks + i * kQ8TileBytes, tab, K, kt, false, y + part * kQ8Rows);   // PROBE: a second row's call
-#endif
   }
 }
 

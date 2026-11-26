@@ -741,7 +741,6 @@ def common(spec: ModelSpec, ffn: str = "moe") -> Common:
         return _common_dense(spec)
     n = LIMITS["n_cols"]
     hid, ff, ne = spec.hidden, spec.moe_intermediate, spec.experts_per_tok
-    ne = int(os.environ.get("QWEN36MOE_PROBE_NE", ne))   # PROBE (verify-pass timing): more routed slots a stream
     pq = pool_quant(spec)                           # the pool's scale layout (q4_1 or q4_1_f32)
     chunk = chunk_bytes(pq)                         # ... and so its chunk size
     stripe = q4_bytes(128, hid, pq)                 # 128 rows x HID: one up (or gate) stripe, RS=4
@@ -1309,7 +1308,7 @@ GEMM_T = 256          # gemm_q4_prefill.py's GQP_T: a multiple of tile_n * 8 col
 # bought 4 % of the expert stage and nothing of the prefill, in exchange for doubling
 # mb_x / mb_h / mb_y and spending the core's last 4 KB of L1. Raise it once the core rate is
 # up (the plan's B(3)); the design and the driver are ready for it.
-MB_NT = int(os.environ.get("QWEN36MOE_PROBE_MB_NT", 8))   # PROBE (whole-prompt MoE A/B): tokens a visit
+MB_NT = 8   # tokens a visit (16 measured no faster: the kernel is core-bound at 8; production-bar plan, step 2)
 ATTN_LMAX = 4096      # the widest attention GEMM stream (rows of window); a longer window is chunked on the host
 # The q4_1 GEMM reads the band law; an all-q8 MoE route runs every GEMM on bf16 instead (bf16_route), and
 # a q8 projection elsewhere runs as its exact q4_1 split (gemm_weight): every q8 code is 16 hi + lo, so two q4_1 halves sum

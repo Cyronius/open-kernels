@@ -112,10 +112,6 @@ if F32:
 # compiled the null body is an ODR violation the linker resolves either way.
 if os.environ.get("LX_NULL_GEMV") == "1":
     OS = OS + ["-DGEMV_NULL"]
-if os.environ.get("X_Q8_ROWS2_PROBE") == "1":   # PROBE: verify-pass timing, output wrong
-    OS = OS + ["-DGEMV_Q8_ROWS2_PROBE=1"]
-if os.environ.get("X_Q8_TWICE_PROBE") == "1":   # PROBE: verify-pass timing, output wrong
-    OS = OS + ["-DGEMV_Q8_TWICE_PROBE=1"]
 # timing-only (output garbage): LX_STAMP=1 builds the dense main core with an event log of
 # its timer (gen_kernels.py STAMP); the down GEMV's second piece carries it out.
 STAMP = os.environ.get("LX_STAMP") == "1"
@@ -288,9 +284,8 @@ def kernels(inc, t):
     # GEMVs (runtime group / band law): projections into a y element; MoE up/gate and down into ms
     if NEED_Q4_GY:
         k["gy"] = ef("gemv_q4_gy", [e, tab, y, i32, i32, i32])      # (t, tab, ye, group, per_band, rs)
-    rows2 = ["-DGEMV_ROWS2_PROBE=1"] if os.environ.get("X_ROWS2_PROBE") == "1" else []   # PROBE: verify-pass timing
-    k["gup"] = ef("gemv_q4_gup", [e, tab, ms, i32, i32], GUP_OS + rows2)    # (t, tab, ms, group, band)  u | g
-    k["gdown"] = ef("gemv_q4_gdown", [e, tab, ms, i32, i32], OS + rows2 if rows2 else None)   # (t, tab, ms, j, slot)
+    k["gup"] = ef("gemv_q4_gup", [e, tab, ms, i32, i32], GUP_OS)    # (t, tab, ms, group, band)  u | g
+    k["gdown"] = ef("gemv_q4_gdown", [e, tab, ms, i32, i32])   # (t, tab, ms, j, slot)
     # activation tables: x (one element, K = HID) and the two-element og (K = KWIDE)
     k["prep2048"] = ExternalFunction(f"gemv_q4_prep_k{HID}", source_file=str(_gemv_prep_entry(HID)),
                                      arg_types=[x, tab], include_dirs=inc, compile_flags=OS)
