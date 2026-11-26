@@ -40,9 +40,13 @@ def one_context() -> bool:
 
 def merged_image(spec: ModelSpec) -> bool:
     """Whether this spec's layer kernels are the merged image. It needs both layer types, and
-    no q8 projection role: ux.py's main-core program has room for ONE GEMV entry (the main
-    cores sit at 16256 of 16384 bytes), so a q8 model of the family keeps lx/ax."""
-    return one_context() and spec.has_linear and spec.has_full and not spec.q8_roles
+    ONE projection GEMV entry on the main core: ux.py's main-core program has room for one (the
+    main cores sit at 16256 of 16384 bytes). No q8 role, or every projection role at q8
+    (OPEN-DECODE-ONE-CONTEXT-Q8: the q8 entry serves both stages; `OPEN_LAYER_MERGED_Q8=0` keeps lx/ax);
+    a mix keeps lx/ax."""
+    q8 = set(spec.q8_roles) if spec.q8_roles else set()
+    one_entry = not q8 or ({"attn", "linear", "linear_out"} <= q8 and os.environ.get("OPEN_LAYER_MERGED_Q8", "1") != "0")
+    return one_context() and spec.has_linear and spec.has_full and one_entry
 
 
 # OPEN-DECODE-STREAM-UX: the kernel geometries the merged image's stream changes below were
@@ -50,6 +54,9 @@ def merged_image(spec: ModelSpec) -> bool:
 # reference Qwen3.6-35B-A3B spec and every GGUF of it (KAT Coder, Ornith, Nex, Clover) share it.
 STREAM_MEASURED_KERNELS: tuple[str, ...] = (
     "sha256:2a3631c0cf5f0265bd639a08350990a24d86f92e9fda2f6c7cd748c3acbe61ad",
+    # Unsloth's Qwen3.6-35B-A3B UD-Q4_K_S at q8 projections on the merged q8 image (OPEN-DECODE-ONE-CONTEXT-Q8):
+    # 79.0 -> 73.5 ms a step with all four knobs, logits byte-identical (2026-11-26)
+    "sha256:9a635603a58ef7634a48b0645aefd7d38ab23bb3aa0a7827e497746f6dbd3404",
 )
 WRING_DEPTH = 16
 
@@ -98,6 +105,10 @@ def probe_env() -> dict[str, str]:
     e = dict(_attn_probe_env())
     if one_context():
         e["OPEN_LAYER_ONE_CTX"] = "1"
+    if os.environ.get("OPEN_LAYER_MERGED_Q8"):
+        e["OPEN_LAYER_MERGED_Q8"] = os.environ["OPEN_LAYER_MERGED_Q8"]
+    if os.environ.get("OPEN_VERIFY_ONE_CTX"):
+        e["OPEN_VERIFY_ONE_CTX"] = os.environ["OPEN_VERIFY_ONE_CTX"]
     for k in _LAYER_PROBE_VARS:
         if os.environ.get(k):
             e[k] = os.environ[k]
@@ -1698,11 +1709,17 @@ def shared_steps(spec: ModelSpec, kernel: str, a_xm: int, a_res: int) -> list[di
 VERIFY_ROWS = 2
 
 
+def merged_verify(spec: ModelSpec) -> bool:
+    """The verify pass on one image too (designs/layer_x/vux.py, OPEN-VERIFY-ONE-CONTEXT) when decode is merged;
+    `OPEN_VERIFY_ONE_CTX=0` keeps vlx / vax on two contexts."""
+    return bool(verify_rows(spec)) and merged_image(spec) and os.environ.get("OPEN_VERIFY_ONE_CTX", "1") != "0"
+
+
 def verify_rows(spec: ModelSpec) -> int:
     """Rows of the MoE verify pass (designs/layer_x/vlx.py, vax.py): the q8-projection MoE spec with both layer
     types, two contexts and the shared expert on the host; 0 for every other spec, whose export does not change."""
     q8 = set(spec.q8_roles) if spec.q8_roles else set()
-    ok = (spec.num_experts and spec.has_linear and spec.has_full and not merged_image(spec) and shared_host(spec)
+    ok = (spec.num_experts and spec.has_linear and spec.has_full and shared_host(spec)
           and {"attn", "linear", "linear_out"} <= q8 and os.environ.get("OFLM_EXPORT_VERIFY", "1") != "0")
     return VERIFY_ROWS if ok else 0
 
@@ -1777,21 +1794,23 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
         out["verify_tail"] = ([{"op": "run", "kernel": "ln", "args": [f"vxres@{r}", "zero", "normw", "xresf", f"vhn@{r}"]}
                                for r in range(nr)]
                               + [{"op": "run", "kernel": "lmv", "args": ["lmpool", "vhn", "vlogits"]}])
-        out["contexts"]["vlx"] = "vlx0/final.xclbin"
-        out["contexts"]["vax"] = "vax0/final.xclbin"
-        out["kernels"]["vlx0"] = {"context": "vlx", "insts": "vlx0/insts.bin", "build": "vlx0"}
-        out["kernels"]["vlx1"] = {"context": "vlx", "insts": "vlx1/insts.bin", "patch": "moeroute2", "rows": nr,
+        vmerged = merged_verify(spec)
+        vl_ctx, va_ctx = ("vlayer", "vlayer") if vmerged else ("vlx", "vax")
+        out["contexts"][vl_ctx] = "vlx0/final.xclbin"
+        out["contexts"].setdefault(va_ctx, "vax0/final.xclbin")
+        out["kernels"]["vlx0"] = {"context": vl_ctx, "insts": "vlx0/insts.bin", "build": "vlx0"}
+        out["kernels"]["vlx1"] = {"context": vl_ctx, "insts": "vlx1/insts.bin", "patch": "moeroute2", "rows": nr,
                                   "build": "vlx1"}
-        vax0 = {"context": "vax", "insts": "vax0/insts.bin", "patch": "attnpos", "build": "vax0"}
+        vax0 = {"context": va_ctx, "insts": "vax0/insts.bin", "patch": "attnpos", "build": "vax0"}
         if out["kernels"]["ax0"].get("rb"):
             vax0["rb"] = out["kernels"]["ax0"]["rb"]
         out["kernels"]["vax0"] = vax0
-        out["kernels"]["vax1"] = {"context": "vax", "insts": "vax1/insts.bin", "patch": "moeroute2", "rows": nr,
+        out["kernels"]["vax1"] = {"context": va_ctx, "insts": "vax1/insts.bin", "patch": "moeroute2", "rows": nr,
                                   "build": "vax1"}
         for lt, k0, k1, ab, rout, xm, res, st in (
                 (LINEAR, "vlx0", "vlx1", L.A_BYTES, L.A_ROUT, L.A_XM, L.A_RES, "state"),
                 (FULL, "vax0", "vax1", L.AA_BYTES, L.AA_ROUT, L.AA_XM, L.AA_RES, "state")):
-            args = ["pool", "vxres", "consts", st, "vact"] + (["ptab"] if lt == FULL else [])
+            args = ["pool", "vxres", "consts", st, "vact"] + (["ptab"] if lt == FULL or vmerged else [])
             shared = [s for r in range(nr) for s in shared_steps(spec, k1, r * ab + xm, r * ab + res)]
             out["layer_types"][lt]["verify"] = {
                 "rows": nr, "act": nr * ab, "state_slots": nr + 1 if lt == LINEAR else 0,
@@ -2030,10 +2049,15 @@ def builds(spec: ModelSpec, max_ctx: int = 4096) -> dict[str, dict]:
         b["lmv"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_rows2",
                     "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),
                             "LMHEAD_CORES": str(LIMITS["n_cols"]), "LMHEAD_ROWS": str(verify_rows(spec))}}
-        for d in ("vlx", "vax"):
-            for part in (0, 1):
-                b[f"{d}{part}"] = {"design": f"layer_x/{d}.py", "build_dir": f"layer_x/build_{d}{part}{sfx}",
-                                   "env": {f"{d.upper()}_PART": str(part)}}
+        if merged_verify(spec):
+            for name, part in (("vlx0", 0), ("vlx1", 1), ("vax0", 2), ("vax1", 3)):
+                b[name] = {"design": "layer_x/vux.py", "build_dir": f"layer_x/build_vux{part}{sfx}",
+                           "env": {"VUX_PART": str(part)}}
+        else:
+            for d in ("vlx", "vax"):
+                for part in (0, 1):
+                    b[f"{d}{part}"] = {"design": f"layer_x/{d}.py", "build_dir": f"layer_x/build_{d}{part}{sfx}",
+                                       "env": {f"{d.upper()}_PART": str(part)}}
     b["ln"] = {"design": "ln/ln.py", "build_dir": "ln/build", "env": {}}
     b["lm_head_q8"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_full",
                        "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),

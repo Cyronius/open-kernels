@@ -1687,10 +1687,10 @@ images), NPU power mode Default (setting it needs root there), on a box shared w
 | Bar item | State | Evidence |
 |---|---|---|
 | Block prefill | Done. The layer-major block route (T = 256) is the default in the CLI, `phlegm run` and `serve` | speed table |
-| Near optimal | Done, rest named (2026-11-26). Tuning passes: `attn_fa256` (262k prefill 6x), OPEN-MOE-PIPE (4k prefill 1.19-1.29x), OPEN-DN-FUSED (DeltaNet host 1.4x). Decode streams 2.9 GB a step; its floor is about 56 ms at 52 GB/s, the step 85 ms by dispatch minima on Strix Halo and 101-110 ms on Strix Point; what is left is named under "What is left" | profile tables, "What is left" |
+| Near optimal | Done (2026-11-26). Decode streams 2.9 GB a step: floor about 56 ms at 52 GB/s; measured 73.5 ms a step (13.6 tok/s), dispatch minima 69.2 ms, after the tuning passes OPEN-DECODE-ONE-CONTEXT-Q8 (the 20 lx / ax context switches a step gone: 94.0 -> 78.9 ms) and OPEN-DECODE-STREAM-UX's knobs on the merged image (-> 73.5 ms), bit-identical. Prefill 3.49 ms a token at 4k and 8k (287 tok/s) after `attn_fa256`, OPEN-MOE-PIPE and OPEN-DN-FUSED. What is left is spread over the streams' rates (35-42 GB/s against 52) and named under "What is left" | measure units, "What is left" |
 | Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %), on `attn_block` (2026-11-25) and again on `attn_fa256` (2026-11-26): 262,000-token prefill 2,457 s against 14,706 s. Through `phlegm serve` on Strix Halo (MTP on, `--max-ctx 263168`, a 262,005-token chat prompt): PASS, 2,163 s end to end | speed table, [qwen36moe-attn-fa256.md](plans/qwen36moe-attn-fa256.md) |
 | All on the NPU | Done with named host stages (tables below): in prefill the DeltaNet conv and delta rule (0.77 ms a token at 4k), the layer tails and routers, the MoE gather / scatter (now under the NPU's passes); in decode the router read and the q8 shared expert (overlapped); the vision tower (3.7-4.0 s for 3,200 patches) | host stages, "What is left" |
-| Drafter | Done: the MTP head (`blk.40`) drafts one token and a two-row verify pass checks it (OPEN-VERIFY-ROWS-QWEN36MOE, OPEN-SPEC-MTP-QWEN36MOE); `phlegm serve --speculative mtp` 1.24-1.40x decode on Strix Point and 1.06-1.18x on Strix Halo (where the verify pass costs 1.51 plain steps), output byte-identical to `off`, also after an image. Prompt lookup runs on the same pass and is kept as an option (1.10-1.25x); combining the two per cycle measured no gain at width 2 | plan phase 5 |
+| Drafter | Done: the MTP head (`blk.40`) drafts one token and a two-row verify pass checks it (OPEN-VERIFY-ROWS-QWEN36MOE, OPEN-SPEC-MTP-QWEN36MOE), on one context since 2026-11-26 (`vux`, verify 142.5 -> 121.8 ms); output byte-identical to `off`, also after an image. Strix Point (split decode): `phlegm serve --speculative mtp` 1.24-1.40x. Strix Halo with one-context decode (plain 73 ms): 1.05x on code, and phlegm's cost-aware policy (SERVER-SPEC-COST) falls back to plain steps where drafting does not pay (prose 0.97x). Prompt lookup runs on the same pass (1.06x / 0.98x). The verify pass costs 1.67 plain steps: glue, DeltaNet and post run once a row, and two rows stream twice the experts | plan phase 5, OPEN-DECODE-ONE-CONTEXT-Q8 |
 | `phlegm run` / `serve` | Done: plain, streamed, reasoning on and off, a tool-call round trip, images (`phlegm run --image`, `serve` image parts), MTP speculation, needles through `serve` at 32,768 (PASS, 189 s) and 262,005 tokens (PASS, 2,163 s) | plan log, OPEN-VISION-BLOCK |
 | Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1, the Q6_K head to `lm_head_q8`. Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread. Strix Halo, 2026-11-26 (another text, OPEN-DN-FUSED): block-route KL 0.0241 against llama.cpp Vulkan and 0.0278 against llama.cpp CPU, inside llama.cpp's own CPU-vs-Vulkan 0.0269 | OPEN-SHARED-HOST-Q8, OPEN-DN-FUSED |
 | Benchmarks | Done for the kernel side: `phlegm bench --development` on Strix Point (a measure unit) and on Strix Halo (Linux, Default power mode, a shared box), 512 to 4k (below), with CLI runs to 262k; the docs page and README row are OFLM's | bench tables |
@@ -1755,6 +1755,10 @@ decode 94 ms a step at position 24-87 (10.6 tok/s; step-trace minima sum 79.0 ms
 linear layers 2.49 (token-batched experts 1.31, GEMMs 0.40, DeltaNet host 0.27, tails 0.09), full layers 0.98
 (experts 0.44, GEMMs 0.34, attention 0.03).
 
+With the one-context images (OPEN-DECODE-ONE-CONTEXT-Q8, 2026-11-26 15:09, the same kind of measure unit, NOISY only for
+one other process at one core for 365 s; `bench/phlegm_bench_measure_1509.json`): prefill 212.2 / 251.6 / 275.0 / 287.4
+tok/s and decode 13.22 / 12.89 / 12.28 / 11.21 tok/s at 512 / 1k / 2k / 4k; CLI decode 73.5 ms a step (13.6 tok/s).
+
 **Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
 norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
 the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
@@ -1764,20 +1768,20 @@ Prefill of 4,096 tokens (23.1 s, block route): NPU MoE 9.2 s, NPU GEMMs 2.3 s; h
 3.8 s, transposes 1.4 s, prefill attention host part 1.4 s, tail 1.4 s, MoE prep and read-back 1.4 s, tiling 0.6 s,
 syncs 0.4 s, shared expert 0.2 s.
 
-**What is left (2026-11-26).** Decode, per step at a short position (Strix Halo dispatch minima from
-`OFLM_OPEN_STEP_TRACE=1`, 47 steps; bytes from the manifest's streams):
+**What is left (2026-11-26).** Decode, per step at a short position, on the one-context images (Strix Halo
+measure unit, `OFLM_OPEN_STEP_TRACE=1`, 63 steps; bytes from the manifest's streams):
 
 | part | dispatches | min ms | MB | stream rate | named remainder |
 |---|---|---|---|---|---|
-| `lx0` (q8 projections, conv, DeltaNet, router) | 30 | 1.27 | 48.6 | 38 GB/s | the q8 front streams at 38 of about 52 GB/s; its main core has 80 B of program memory free |
-| `ax0` (q8 projections, attention, router) | 10 | 1.84 | 33.7 | 18 GB/s | always entered from the `lx` context: each full layer costs two context switches (20 a step, 0.8-1.2 ms each, R-0008). One merged image cannot hold the q8 GEMV entries (`merged_image`); a full-ELF configuration (`compose_elf.py`, 0.3-0.7 ms a set change) is the lever |
-| `lx1` / `ax1` (8 routed experts, host shared expert beside) | 40 | 0.46 | 15.3 | 33 GB/s | per expert the hidden h makes a DDR round trip between up / gate and down (about 8 us each, R-0012) |
-| `lm` (q8 head) | 1 | 10.3 | 516 | 50 GB/s | at its floor |
-| host | | 0.4-0.6 | | | router read and patch; the q8 shared expert overlaps `lx1` / `ax1` |
+| `lx0` (q8 projections, conv, DeltaNet, router) | 30 | 1.126 | 48.6 | 43 GB/s | the stream's issue rate and its waits on the conv glue and DeltaNet; the main core has 128 B of program memory free |
+| `ax0` (q8 projections, attention, router) | 10 | 0.868 | 33.7 | 39 GB/s | as `lx0`; past 32k the attention walk dominates (compute-bound, 0.37 us a row a full layer) |
+| `lx1` / `ax1` (8 routed experts) | 40 | 0.407 | 15.3 | 38 GB/s | per expert the hidden makes a DDR round trip between up / gate and down (early down fills already queue the down weights behind it) |
+| `lm` (q8 head) | 1 | 10.21 | 516 | 51 GB/s | at its floor |
+| `ln` + the two context changes of the tail | 1 | 0.20 | | | `lx0` after `lm` costs 2.75 ms against 1.15 in place: about 1.6 ms a step |
+| host | | 0.1 | | | router read and patch; the q8 shared expert overlaps the MoE dispatch |
 
-Sum of minima 85 ms against a 56 ms stream floor (1.5x); the means on the busy Strix Halo box were 145 ms (the
-iGPU of another session at 93-99 %), and Strix Point in performance mode 101-110 ms. Past 32k the attention walk
-in `ax0` dominates and is compute-bound (0.37 us a row a full layer).
+Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.24x / 1.31x). Before today the step
+was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
 Prefill at 4,096 tokens (Strix Halo, after OPEN-MOE-PIPE and OPEN-DN-FUSED; 3.48 ms a token in the quiet measure unit, the split below is from a busy-box run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
@@ -9658,6 +9662,36 @@ takes 0.36 ms longer with it (with either issue order), so the attention images 
 1 ms only: `lx0` entered from `ax` costs 2.35 ms against 1.14 ms in place, and with `ax0`, `ln` and `lm` the context
 switches are about 20 ms of the 93 ms step (OPEN-FAMILY-QWEN36MOE-GGUF "What is left"). The MTP cycle is unchanged
 (verify pass 142.3 against 142.6 ms).
+
+### OPEN-DECODE-ONE-CONTEXT-Q8: a q8-projection MoE decode token and its verify pass each run in one hardware context
+**Applies to:** `open_kernels/designs/layer_x/ux.py` (`ALL_Q8`), `vux.py`, `open_kernels/recipes/qwen36moe.py`
+(`merged_image`, `merged_verify`, `STREAM_MEASURED_KERNELS`)
+**Verification:** manual (the NPU and the model)
+
+When every projection role (`attn`, `linear`, `linear_out`) streams at q8, both stages of both layer types take ONE
+GEMV entry -- the q8 one -- so ux.py's merged image (OPEN-DECODE-ONE-CONTEXT) shall carry the spec: the merged main
+core is lx's q8 program with the band count and the DeltaNet heads read from RTP words, and the MoE parts take the
+decode shared-expert slot count (`NX_DECODE`). A spec with some roles at q8 and some at q4_1 keeps lx / ax. The
+verify pass shall do the same (`vux.py`: vlx and vax as four streams over one image; the conv glue moves to (2, 4) so
+the attention cores keep (2..5, 3); the linear stream takes the `ptab` argument it never touches). Every core and
+helper runs the calls it ran on the split images in the same order: every logit unchanged. `OPEN_LAYER_MERGED_Q8=0`
+and `OPEN_VERIFY_ONE_CTX=0` at export keep the split images; both are in the build key.
+
+**Acceptance criteria:**
+- The merged main cores fit 16,384 B; prefill logits and 32 greedy steps byte-identical to the split set;
+  `--verify-check` PASS; `--spec-mtp` SPEC IDENTICAL; `phlegm serve` outputs identical in every speculative mode.
+- Decode and the verify pass timed against the split images, alternating.
+
+**Result 2026-11-26 (Unsloth Qwen3.6-35B-A3B UD-Q4_K_S, Strix Halo, Default power mode, load 4-12).**
+- Program memory: `ux` (decode) 16,256 of 16,384 B; `vux` (verify) 15,920.
+- Gates: 33 logit files byte-identical, the same tokens; `--verify-check 20` PASS (two ring wraps); `--spec-mtp 96`
+  SPEC IDENTICAL; `phlegm serve` off / mtp / lookup / auto byte-identical.
+- Decode, step-trace wall, three alternating rounds: split images 94.0 / 94.0 / 94.0 ms, merged 78.9 / 78.9 / 79.0 ms
+  (`ax0` 1.83 -> 0.91 ms: it no longer pays a switch), and with OPEN-DECODE-STREAM-UX's four knobs on (this
+  geometry joins `STREAM_MEASURED_KERNELS`) 73.8 / 73.4 / 73.5 ms. 1.28x in all: 10.6 -> 13.6 tok/s.
+- Verify pass (`--spec-mtp 96`): 142.5 -> 121.8 ms. Per pass: `vlx0` 58.3 ms (1.94 a layer against decode's 1.12:
+  glue, DeltaNet and post run once a row), `vax0` 11.3, `vlx1` 23.3 and `vax1` 7.8 (the experts of two rows,
+  1.9x decode's), the two-row head about 12.5.
 
 ### OPEN-DECODE-ONE-CONTEXT-DENSE: a dense decode token runs in one hardware context
 **Applies to:** openflowlm-next (`open_kernels/designs/dense/dx.py` `DX_ONECTX` / `DX_HEAD`, `open_kernels/recipes/dense.py`

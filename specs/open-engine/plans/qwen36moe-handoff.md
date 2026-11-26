@@ -28,12 +28,15 @@ stage named, near optimal with the remainders named. New today:
   1.4x, KL at the backends' spread).
 - Linux: shmem device buffers where XRT 2.21 refuses userptr ones; the helpers use phlegm's npu-dev XRT 2.27.
 - The timing probes are gone (kernels byte-identical after a re-export).
+- One-context decode and verify images for the q8 spec (`ux`, `vux`): decode 94 -> 73.5 ms a step; phlegm drafts only
+  while it pays (SERVER-SPEC-COST).
 
 ## Open, in the order to take them
 
-1. **Decode** (1.5x its 56 ms stream floor): the lx / ax context switches (20 a step, 0.8-1.2 ms each; a full-ELF
-   configuration as `compose_elf.py` does for the diffusion sets is the lever), the routed experts' hidden round trip,
-   the q8 front at 38 GB/s.
+1. **Decode** (73.5 ms a step, 1.31x its 56 ms stream floor, on one context since OPEN-DECODE-ONE-CONTEXT-Q8): the
+   streams run at 38-43 GB/s against 52; the routed experts' hidden round trip; the tail's two context changes
+   (`ln`, `lm`, about 1.6 ms). The verify pass costs 1.67 plain steps (two-row glue / DeltaNet / post serialized,
+   twice the experts), which keeps MTP near break-even on Strix Halo.
 2. **Prefill**: the token-batched expert kernel (core-bound at 8 tokens a visit: native `mmul<4,8,8>`, one unpacked
    weight for both sub-tiles); the DeltaNet conv and delta rule on the NPU (a chunked kernel); `attn_fa256` at 2.3x
    its transfer floor (hardware bf16 exp2 with an accuracy gate, fewer PV calls, Q to bfp16 once a pass).

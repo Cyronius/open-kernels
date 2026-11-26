@@ -657,3 +657,9 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   process at one core for 407 s): `phlegm bench --development` 212 / 251 / 276 / 287 tok/s prefill and 10.4 / 10.2 /
   9.8 / 9.1 tok/s decode at 512 / 1k / 2k / 4k; CLI 4k and 8k prefill 3.48 / 3.47 ms a token; decode 94 ms a step.
   The busy-box numbers earlier in the day were 1.6-1.9x slower: the box's load, not the engine.
+- 2026-11-26 15:00, OPEN-DECODE-ONE-CONTEXT-Q8: with every projection role at q8 the merged decode image needs one
+  GEMV entry, the q8 one: `ux` builds for this spec at 16,256 of 16,384 B and removes the 20 lx / ax context
+  switches a step (94.0 -> 78.9 ms), with OPEN-DECODE-STREAM-UX's knobs 73.5 ms; `vux` merges the verify pass
+  (142.5 -> 121.8 ms). All gates bit-identical. Speculation is then near break-even on this box (plain 73 ms against a
+  1.67-step verify pass): phlegm drafts only while it pays (SERVER-SPEC-COST). Measure unit: decode 13.2 / 12.9 /
+  12.3 / 11.2 tok/s at 512 / 1k / 2k / 4k, prefill unchanged (212-287 tok/s).
