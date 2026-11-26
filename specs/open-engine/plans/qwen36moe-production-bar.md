@@ -643,3 +643,7 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   on, the chat template around it: 262,005 prompt tokens): answer 58213, PASS, 2,163 s wall (prefill and 5 tokens),
   Default power mode, shared box. Against the CLI's 2,457 s on Strix Point (performance mode, before OPEN-MOE-PIPE /
   OPEN-DN-FUSED). This closes handoff item 4 (262k through `phlegm serve`).
+- 2026-11-26 13:12, `phlegm serve` features on Strix Halo (`serve_features.sh`, MTP on): thinking off "391" with empty
+  reasoning; thinking on "391" with 1,042 characters of reasoning, `stop`; streamed "Red, Orange, Yellow" in 7
+  chunks; `get_weather` `{"city":"Paris"}` with `finish_reason` tool_calls, and after the tool message "The weather in
+  Paris right now is light rain with a temperature of 14°C." (292 of 325 prompt tokens reused). FEATURES PASS.
