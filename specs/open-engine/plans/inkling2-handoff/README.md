@@ -79,8 +79,11 @@ These are the last clean numbers. Do not carry them to another machine or stack.
    (estimated 0.1 s per 256-row block).
 5. K/V: a per-visit cache of packed K^T/V saves the copy, but doubles K/V memory and keeps the sync. To remove the
    sync, move the bias out of the K/V buffer (kernel layout change).
-6. `benchmarks/reference/check_import.py --upstream <OFLM checkout>`: not run. The first machine had no OFLM checkout
-   with the base commit `38ae3d2`.
+6. `benchmarks/reference/check_import.py`: passed on 2026-11-26 (55 engine files byte-identical to the base, 42 match
+   recorded changes). `38ae3d2` was a local OFLM trunk snapshot and is on no public remote; Phlegm commit `5445db3`
+   records its engine source bytes exactly, so the check ran against a repository built from
+   `git archive 5445db3 src/open_qwen36 src/include/nlohmann LICENSE_OPEN_RUNTIME.md` with `--commit` set to it.
+   The ledger holds Windows (CRLF) hashes; the check now accepts LF or CRLF worktrees.
 7. Production-bar items that need the user: the 1M-context run, a Phlegm release tag and `phlegm bench` on it,
    features on the release build, a shipped drafter. Decode is still below the 6 to 7 tok/s target.
 

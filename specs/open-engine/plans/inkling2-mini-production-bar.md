@@ -5445,6 +5445,11 @@ DSpark wins 3-8% on code and JSON and loses 4-17% elsewhere. Each extra verify r
 draft pays only above about 60% acceptance. Prompt lookup drafted rarely (37-141 drafts over 131-286 cycles) and was
 slower on every prompt. Both stay opt-in; the registry entry ships `speculative: off`.
 
+**Import check (Linux).** `check_import.py` passed: 55 engine files byte-identical to the OFLM base and 42 matching the
+recorded changes. The base `38ae3d2` is a local trunk snapshot on no public remote; Phlegm commit `5445db3` states
+that its engine source bytes are exactly `38ae3d2`'s, so the check ran against a repository built from that commit's
+`src/open_qwen36`, `src/include/nlohmann` and `LICENSE_OPEN_RUNTIME.md`.
+
 ### Phlegm acceptance on Linux (2026-11-26)
 
 Phlegm: `~/code/phlegm-inkling2`, branch `feat/inkling2-phlegm` (handoff patch, the contraction fix, an
