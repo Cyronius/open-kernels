@@ -120,7 +120,7 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         K["prep4096b"](oe[1], tab)
         X.role_gemv_bands(win, yout, B, K, "attn", O_PC, O_K)
         xin.release(2)
-        X.moe_body(win, xin, yout, B, K)
+        X.moe_body(win, xin, yout, B, K, nx=X.NX_DECODE)
 
     workers = ([XL.ln_worker(of_lni, of_lno, tl, L, entry_fp32=D.XN_F32)] + XL.main_workers(main_body, of_w, of_x, of_y, t, K)
                + XL.attn_workers(of_ain, of_aout, of_og, a, afns))
@@ -207,7 +207,7 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
                              ain_p, aout_c, og_cs)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                           AA_BYTES, CA_BYTES, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW)
+                           AA_BYTES, CA_BYTES, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW, nx=X.NX_DECODE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),

@@ -1567,8 +1567,8 @@ RNE, which is the value the f32-scale kernels use on the core. Q8_0 / Q5_0 / Q6_
 requantized: to q4_1 for projections, to `lm_head_q8` for the head. The ops undo the
 converter's per-head `[q | gate]` interleave and its tiled linear-attention value heads
 (OPEN-CONVERT-QWEN35-VHEADS's rule). They also transpose alpha, beta, the router and conv1d.
-No q4nx file is written and no weight is held in f32 on the device. A spec with a q8 or t2
-role, or a rotated one, gets no view.
+No q4nx file is written and no weight is held in f32 on the device. A spec with a t2 role, or a
+rotated one, gets no view; q8 roles follow OPEN-GGUF-Q8-ROLES-QWEN36MOE and OPEN-SHARED-HOST-Q8.
 
 **Acceptance criteria:**
 - The view's op order, `dst`, `nch` and `in_dim` equal the q4_1 plan's. The block route's
@@ -1672,6 +1672,199 @@ The 491-token prompt, against llama.cpp CPU on the same file:
 - Since the 2026-11-08 moe_batch rounding-mode fix (OPEN-MOE-BATCH, which has the re-gate of all eight
   folders) Nex Q4pure's block route departs from llama.cpp CPU at short token 22, a near tie (CPU -1.03 /
   -1.14, the NPU -1.049 / -1.051), and matches llama.cpp Vulkan for all 64.
+
+#### Production bar (AGENTS.md, OFLM #240): qwen3.6-moe:35b-a3b
+
+Audited 2026-11-24 on the in-tree engine (`src/open_qwen36`, the phlegm runtime). Source: Unsloth's
+`unsloth/Qwen3.6-35B-A3B-MTP-GGUF` `UD-Q4_K_S` (revision `5bc3e238`), run directly as `model.gguf`. Kernel set
+`kernels-q8s` (Q8_0 projections at q8, OPEN-GGUF-Q8-ROLES-QWEN36MOE; shared expert on the host, OPEN-SHARED-HOST-Q8).
+Machine: HX PRO 370 (Strix Point), NPU performance mode, Windows 11, NPU driver 32.0.20102.3930, mlir-aie 1.4.2.
+Development runs, not a release benchmark. Plan: [qwen36moe-production-bar.md](plans/qwen36moe-production-bar.md).
+
+| Bar item | State | Evidence |
+|---|---|---|
+| Block prefill | Done. The layer-major block route (T = 256) is the default in the CLI, `phlegm run` and `serve` | speed table |
+| Near optimal | Open. Profiled, with the remainders named below; no tuning pass yet | profile tables |
+| Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %, 2026-11-25). Prefill of 262,000 tokens takes 4.1 h (named under near optimal) | speed table |
+| All on the NPU | Done with named host stages (tables below) | host stages |
+| Drafter | Open. No two-row verify pass exists for this family; the MTP head (`blk.40`) needs one. Prompt lookup needs the same pass | plan phase 5 |
+| `phlegm run` / `serve` | Done: plain, streamed, reasoning on and off, a tool-call round trip | plan log |
+| Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1, the Q6_K head to `lm_head_q8`. Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread | OPEN-SHARED-HOST-Q8 |
+| Benchmarks | Done for the kernel side: `phlegm bench --development` in a measure unit, 512 to 4k (below), with CLI runs to 131k; the docs page and README row are OFLM's | bench table |
+| Features | Reasoning and tool calling pass. Open: vision (not started; it needs phlegm's chat image input, which another session has in progress) and MTP (drafter row) | this table |
+
+Reliability: about one routed MoE dispatch in 30,000 to 300,000 is lost by the driver or firmware (OPEN-ROUTE-ALT).
+The engine runs the layer again on a new hardware context (OPEN-ROUTE-REDO); 8 real losses in one gate run were
+recovered with bit-identical logits.
+
+**Speed (development; CLI unless marked).**
+
+| context | prefill | decode step |
+|---|---|---|
+| 1 | | 107-109 ms (9.2-9.3 tok/s) |
+| 4,096 | 23.1-24.2 s (169-177 tok/s) | 123.6 ms (8.1 tok/s) |
+| 8,192 | 44.8-49.4 s (166-183 tok/s) | 138-145 ms (6.9-7.2 tok/s) |
+| 32,768 | 286 s (115 tok/s) | about 240 ms (4.2 tok/s) |
+| 131,072 | 2,328 s (56 tok/s; NPU GEMMs and block attention 910 s, host 1,066 s) | 607-645 ms (1.55 tok/s) |
+| 262,000 | 14,706 s (17.8 tok/s; NPU GEMMs and block attention 9,943 s, host 3,974 s) | 1,120-1,189 ms (0.84 tok/s) |
+
+`phlegm bench --development` (128 output tokens, 2026-11-24 20:45, one `dibs run --measure` unit: CLEAN before,
+NOISY after because another session's `llama-bench.exe` started at the end; `bench/phlegm_bench_measure.json`):
+
+| input tokens | prefill tok/s | decode tok/s | first token ms |
+|---|---|---|---|
+| 512 | 156.3 | 9.10 | 3,276 |
+| 1,024 | 179.6 | 8.91 | 5,703 |
+| 2,048 | 188.1 | 8.58 | 10,886 |
+| 4,096 | 188.5 | 8.08 | 21,734 |
+
+An earlier run beside another session's builds (19:31) read 90-129 tok/s prefill and 6.3-7.2 tok/s decode; it is
+not used.
+
+**Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
+norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
+the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
+about +30 % decode bytes for the KL). Past 32k the attention walk dominates and is compute-bound.
+
+Prefill of 4,096 tokens (23.1 s, block route): NPU MoE 9.2 s, NPU GEMMs 2.3 s; host DeltaNet conv and delta rule
+3.8 s, transposes 1.4 s, prefill attention host part 1.4 s, tail 1.4 s, MoE prep and read-back 1.4 s, tiling 0.6 s,
+syncs 0.4 s, shared expert 0.2 s.
+
+**Host stages, decode:** router read and stream patch 0.2-0.3 ms a token; the q8 shared expert about 10 ms a token
+of host time, hidden behind the routed MoE dispatch (107.0 ms with the overlap against 112.7 ms without);
+embedding 0.05 ms; the layer copies for OPEN-ROUTE-REDO about 1 ms.
+
+### OPEN-GGUF-Q8-ROLES-QWEN36MOE: a GGUF's Q8_0 projections stream at q8
+**Applies to:** `open_kernels/recipes/qwen36moe.py` (`quant_for_gguf`, `gguf_view`), `src/open_qwen36/pools.cpp`
+(`q35_q8`, `q35_bf16`, `q35_mat` `split`), `manifest.cpp`
+**Verification:** test (`specs/open-engine/tests/test_qwen36moe_gguf.py`, `gguf_pack_test`) + manual (the KL gate below)
+
+For a GGUF-only model directory, the attention, DeltaNet and DeltaNet-out roles whose tensors are not
+Q4_0 / Q4_1 / Q4_K shall stream at q8: the pool op is `q35_q8` (q8_perm half-tiles of the GGUF's codes),
+the block route's GEMM weights are `q35_bf16` from the same codes, and the `lean` variant's are the
+exact hi / lo q4_1 split (`q35_mat` `split`). Q4_K routed experts keep their codes (`q35_stripes` /
+`q35_down`).
+
+**Acceptance criteria:**
+- Every `q8_perm` op of the base manifest becomes `q35_q8` with its `nch` and `in_dim`; every packed
+  route weight, the variants' included, is translated to `q35_*` ops at the same `dst`.
+- `gguf_pack_test`: a `q35_q8` half-tile holds the GGUF block's codes and its scale widened to f32.
+
+### OPEN-SHARED-HOST-Q8: a q8 shared expert runs on the host in decode
+**Applies to:** `open_kernels/recipes/qwen36moe.py` (`shared_host`, `shared_steps`, `gemm_route`),
+`open_kernels/designs/layer_x/` (`xcommon.NX_DECODE`, `lx.py`, `ax.py`), `src/open_qwen36/core.cpp`
+(`Core::shared_q8`), `block_host.cpp` (`shared_expert_q8`), `manifest.cpp`
+**Verification:** test (`test_qwen36moe_gguf.py::test_q8_shared_expert_runs_on_the_host_in_decode`,
+`block_host_test` `shared_expert_q8`) + manual (the KL gate below)
+
+The decode cores have no program memory for a q8 GEMV beside the routed experts' (lx's main core had
+80 B free), so requantizing a Q8_0 shared expert to q4_1 was the only decode route, and it cost the
+whole KL gap to llama.cpp on Unsloth's Qwen3.6-35B-A3B. When the spec's `shared` role is q8 (a GGUF whose
+shared expert is Q8_0):
+- the decode streams `lx1` / `ax1` carry the routed slots only (`nx = NE`, as `mx` does) and close on
+  the residual plus the routed sum;
+- the layer program runs a host step `shared_q8` after `moeroute2`: it reads `xm` (bf16) and the
+  residual (f32) from `act`, adds sigmoid(xm . gate_inp) x down(silu(gate xm) x up xm) computed from the
+  GGUF's Q8_0 codes (scales widened exactly; f32 arithmetic). On the pipelined decode path it runs while the
+  MoE dispatch runs and is added to the dispatch's output residual (`xres`) before the next layer starts
+  (`OFLM_OPEN_SHARED_OVERLAP=0`: added to the input residual before the dispatch, as the serial path does);
+- the block route's shared GEMMs read the q8 codes (`q35_bf16`, and the exact split in `lean`);
+- the pool keeps its q4_1 shared slots, so the layout and the `moeroute2` table do not move.
+A q4_1 shared role is unchanged.
+
+**Acceptance criteria:**
+- The program is `run, moeroute2, shared_q8, run`; the step's `a_xm` / `a_res` are the MoE stream's; its
+  tensor names are the GGUF's `blk.{l}.ffn_{up,gate,down}_shexp.weight` and `ffn_gate_inp_shexp.weight`.
+- The pool ops equal those of the same spec with a q4_1 shared role.
+- `shared_expert_q8` equals an fp64 forward of the same codes within 1e-5 of the output's magnitude.
+
+**Verification (manual), 2026-11-24:** `kernels-q8s`, the 8-chunk teacher-forced gate against llama.cpp
+Vulkan on the same file (2040 positions). Block route: KL mean 0.0235, median 0.0082, same top 92.9% (0.0401 /
+0.0173 / 91.0% with the shared expert at q4_1). Sequential decode route (every position through `lx` / `ax` and
+the host step): KL mean 0.0210, median 0.0079, same top 93.3%; with the overlap, 0.0230 / 0.0084 / 93.0%.
+Decode step at position 1 (`--bench-step 5`, submit-ahead, median): 107.0 ms overlapped, 112.7 ms with the step
+before the dispatch, 104.8 ms for `kernels-q8` (shared expert at q4_1 on the NPU). Host cost of the step before the
+overlap: 10.1 ms a token (40 layers, OpenMP wake-ups included; OFLM_OPEN_PROFILE `shared_ms`). Control, llama.cpp CPU against Vulkan: 0.0190 /
+0.0078 / 94.3%.
+
+### OPEN-ROUTE-ALT: the routed-expert stream is patched into alternate copies
+**Applies to:** `src/open_qwen36/core.cpp` (`Core::load_kernel`, `Core::route`)
+**Verification:** manual (NPU)
+
+A `moeroute2` kernel keeps two instruction BOs. `Core::route` patches the expert addresses into the copy the
+previous dispatch of that kernel did not read, syncs it, and runs it. `OFLM_OPEN_ROUTE_ONE=1` keeps one copy
+(the old behavior) for A/B runs.
+
+Why: with one copy, Qwen3.6-35B-A3B's `lx1` / `ax1` decode dispatches were lost about once in 20,000 (ERT state 8
+after about 7 s; `pci` Event ID 3 with `TxnOp=ffffffff` and zero fault fields, the F-0108 signature). `lx0` / `ax0`,
+which run as often and are not rewritten between their dispatches, never failed. OFLM's own 35B set met the same
+`lx1` timeouts on 2026-10-07 (`plans/archive/q8-gemm.md` there). The root cause in the driver or firmware is not
+known; the measured fact is that rewriting a just-completed command's instruction BO loses commands.
+
+**Verification (manual), 2026-11-24:** the sequential 8-chunk gate (512 positions a run, 40 MoE dispatches a
+position) on `kernels-q8s` and `kernels-q8`:
+
+| instruction BO | runs that hung |
+|---|---|
+| one copy, submit-ahead (three rounds) | 3 (`kernels-q8s`), 6 (`kernels-q8`), 5 (`kernels-q8s`) of 8 |
+| one copy, hw-context priority 0x180 (`OFLM_OPEN_CTX_PRIORITY`) | 7 of 8 |
+| one copy, serial dispatches (`OFLM_OPEN_SUBMIT_AHEAD=0`) | 5 of 8 |
+| two copies | 0 of 8 (about 164,000 MoE dispatches) |
+| two copies, shared expert overlapped (OPEN-SHARED-HOST-Q8) | 1 of 8 |
+| one copy, shared expert overlapped | 1 of 8 |
+
+So the two copies cut the rate (about 20x by these counts) but do not remove the cause; the overlap, which waits
+for `lx1` / `ax1` before the next layer's first dispatch starts, cuts it about as much. The residual is about one
+lost dispatch in 300,000 (one in about 7,500 decode tokens; 16 runs, a small sample). A second submission of the
+lost command on the same hardware context also ends in ERT state 8 (measured once), so the context is dead after a
+loss. OPEN-ROUTE-REDO recovers from it on a new context.
+
+Caveat (2026-11-24): `xrt-smi` samples later showed other agents' NPU processes (`run_kernel.exe`, `bench.exe`) running
+during these rounds although this work held the dibs npu lock, two of them seconds before two hangs. The rows above
+were not taken on a free NPU, so they do not separate this change from a contender (F-0185). The rounds are to be
+repeated with foreign NPU contexts logged (`.plans/qwen36moe/npuq.sh`).
+
+### OPEN-ROUTE-REDO: a lost routed dispatch runs its layer again on a new hardware context
+**Applies to:** `src/open_qwen36/core.cpp` (`Core::wait_run`, `Core::redo_layer`, `Core::rebuild_context`,
+`Core::snapshot_state`, `Core::snapshot_xres`, `Core::step_impl`)
+**Verification:** manual (NPU)
+
+In the decode step, before a layer's first dispatch, the engine copies `xres` and, for a linear-attention layer,
+the layer's recurrent state to the host. When that layer's routed dispatch (`lx1` / `ax1`) ends in ERT state 8 and
+nothing is queued behind it, the engine:
+1. keeps the lost command's run and the old hardware context alive (it never frees them);
+2. makes a new hardware context for that image, new kernel objects, and new instruction BOs with the current
+   stream contents;
+3. writes the copies back to `xres` and the state, and runs the whole layer again (first dispatch, router,
+   routed dispatch). In the overlapped path the shared expert is not run again; its output is still valid.
+
+A second loss in the same layer, or a loss with a dispatch queued behind it, or a loss outside the decode step
+(block prefill), still fails the request. `OFLM_OPEN_NO_RECOVER=1` turns the copies and the redo off.
+`OFLM_OPEN_FORCE_RECOVER=N` treats the first routed dispatch from dispatch N on as lost, to test the redo.
+
+Why each part (measured 2026-11-24, `.plans/qwen36moe/force_ab.sh`):
+- A resubmission on the old context also ends in ERT state 8 (OPEN-ROUTE-ALT).
+- `lx1` alone on a new context completed as a no-op with the old instruction BO (the next router read timed out),
+  and hung with a new BO. Whole layers from `lx0` on a new context give the same tokens as a plain run. So `lx1`
+  needs the tile state that `lx0` leaves, and only a layer redo can recover.
+- A new context made after the old one was freed hung on its first dispatch; with the old one kept, it ran.
+- An exception thrown after a rebuild crashed in `xrt::bo::~bo` inside `xrt_core.dll` (access violation at
+  offset 0x504c3), so a loss is reported by a flag, not by an exception.
+
+**Verification (manual), 2026-11-24:** greedy tokens of a 32-token prompt, 24 new tokens, `kernels-q8s`, against
+the plain run of the same route: forced losses at `lx1` layers 0, 4, 29, 38 and `ax1` layers 3, 39 (submit-ahead)
+and `lx1` layers 0 and 29 (serial) all gave the same tokens. Decode cost of the copies: 106 ms a token
+against 105 ms with `OFLM_OPEN_NO_RECOVER=1` (one run each). A real loss costs about 12 s (the 7 s timeout, the 5 s
+second wait) plus the rebuild.
+
+Real losses, 2026-11-24 (the sequential 8-chunk gate with one routed-stream copy, `OFLM_OPEN_ROUTE_ONE=1`, to
+provoke them; `kl/q8s_redo`): chunk 2 lost 8 routed dispatches (`lx1` layers 4, 10, 12, 36 and 36 again, `ax1`
+layers 19, 23, 39; positions 309 to 363; no foreign NPU context) and the redo recovered every one, including the
+layer lost twice. All 4,096 logit vectors of the 8 chunks are bit-identical to those of the clean overlapped run
+(`kl/q8s_seq_ov`); KL 0.0230, median 0.0084, same top 93.0%. The 8 losses came in one burst within about 4,500
+dispatches, against about one in 100,000 before; whether the first loss or the kept dead contexts caused the
+rest is not known. Chunks 2 to 7 also ran 3 to 5 times slower (330 to 560 ms a position, no losses after chunk 2)
+while another session ran builds; a plain run at 19:29 measured 110 ms a token, so the slowdown did not persist.
 
 ### OPEN-FAMILY-CLOVER: Clover-35B-A3B-Preview's causal path on the qwen35moe GGUF route
 **Applies to:** OPEN-FAMILY-QWEN36MOE-GGUF's view and kernels, unchanged; the model directory's

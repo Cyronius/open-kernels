@@ -21,7 +21,7 @@ Update this file in the same commit as the evidence. Each model's full audit is 
 | Gemma 4 E2B / E4B | done for E4B text (#238); E2B not rerun | open (unprofiled; prefill fell 85 to 62 tok/s) | open (32k once, not repeated) | open (towers refused) | open (Unsloth MTP, prompt lookup) | open (Google QAT Q4_0; Unsloth reason to record) | [planned](specs/open-engine/plans/gemma4e-production-bar.md); vision, video, audio not open |
 | BERT embeddings (bge x3, minilm, nomic, gte) | ? | ? | ? | ? | n/a | ? | not started |
 | whisper-v3:turbo | ? | ? | ? | open (decoder on host) | ? | ? | not started |
-| qwen3.6-moe:35b-a3b | ? | ? | open (32k test) | ? | open (DFlash planned) | ? | not started |
+| qwen3.6-moe:35b-a3b | done (layer-major block route) | open (profiled; decode 107 ms at 1, prefill 169-177 tok/s at 4k) | done (needle at 262,000) | done (host stages named) | open (MTP needs a two-row verify pass) | done (Unsloth UD-Q4_K_S, q8 projections kept) | open: drafter, vision ([audit](specs/open-engine/spec.md), OPEN-FAMILY-QWEN36MOE-GGUF) |
 | gpt-oss:20b | done (`attn_fa_gx` to 131k) | done, rest named (decode 82-84 ms short; 409 ms a step at 131k, compute-bound over a 170 ms stream floor) | done (needle at 130,500) | done (host stages named) | done (measured rejection: prompt lookup, DFlash) | done (ggml-org MXFP4 GGUF) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GPTOSS); bench is a development run |
 | qwen3.5:4b (or :9b) | ? | open (prefill numbers) | open | ? | open | open | not started |
 | Ternary Bonsai 2 27B | ? | ? | open (8k of 262k) | ? | done (DFlash 2 + lookup) | open (reads PQ2_0 via q4nx-build) | not started; work not on main |
@@ -84,14 +84,28 @@ Audit: `spec.md` OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b" (2026-11-21).
   for a publishable bench report.
 - OFLM side: registry entry (MXFP4 GGUF, gptoss, 131,072); `oflm add` / `serve` / `bench`; benchmark page; README row.
 
+### qwen3.6-moe:35b-a3b
+
+Audit: `spec.md` OPEN-FAMILY-QWEN36MOE-GGUF, "Production bar: qwen3.6-moe:35b-a3b" (2026-11-24). Plan:
+[qwen36moe-production-bar.md](specs/open-engine/plans/qwen36moe-production-bar.md).
+
+- Done: Unsloth's UD-Q4_K_S GGUF runs directly (Q4_K experts exact, Q8_0 projections at q8, the q8 shared expert on
+  the host in decode), KL 0.0230 against the 0.019 backend spread; layer-major block prefill; needles at 4k, 8k and
+  32k, 131k and 262,000; `phlegm run` / `serve` with reasoning and a tool call; host stages named; lost
+  routed dispatches recovered on a new hardware context (OPEN-ROUTE-REDO).
+- Speed (`phlegm bench --development`, measure unit, 2026-11-24): prefill 156 / 180 / 188 / 188 tok/s and decode
+  9.1 / 8.9 / 8.6 / 8.1 tok/s at 512 / 1k / 2k / 4k. CLI: 8k prefill 166-183 tok/s, decode 140 ms; 32k 115 tok/s,
+  about 240 ms; 131k 56 tok/s, 607-645 ms; 262k 17.8 tok/s, 1.12-1.19 s.
+- Open: the drafter (MTP head needs a two-row verify pass; prompt lookup needs the same pass); vision; a tuning pass on the q8 projection stream.
+- OFLM side: registry entry (Unsloth MTP GGUF, `UD-Q4_K_S`, qwen35moe, 262,144); `oflm add` / `serve` / `bench`;
+  benchmark page; README row.
+
 ### Others
 
 Not audited. Local evidence to start from:
 
 - BERT embeddings, whisper-v3:turbo: no spec here; FLM rows in
   [flm-kernel-matrix.md](specs/open-engine/flm-kernel-matrix.md).
-- qwen3.6-moe:35b-a3b: OPEN-FAMILY-QWEN36MOE-GGUF;
-  [dflash-drafters.md](specs/open-engine/plans/dflash-drafters.md).
 - qwen3.5:4b / 9b: OPEN-FAMILY-QWEN35;
   [qwen35-remaining-sizes.md](specs/open-engine/plans/qwen35-remaining-sizes.md).
 - Ternary Bonsai 2 27B: OPEN-QUANT-T2, OPEN-CONVERT-PRISM-TERNARY;

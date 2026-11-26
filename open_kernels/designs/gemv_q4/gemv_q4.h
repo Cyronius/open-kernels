@@ -199,6 +199,62 @@ __attribute__((noinline)) inline void gemv_q4_tile(const uint8_t *__restrict til
       aie::concat(aie::broadcast<int16_t, 16>((int16_t)0x3F80),
                   aie::broadcast<int16_t, 16>((int16_t)0x3D80)).template cast_to<bfloat16>();
 
+#if GEMV_ROWS2_PROBE
+  // PROBE (verify-pass timing, output wrong): two token rows in A rows 0 and 1, the epilogue per row
+  aie::accum<accfloat, kRows> acc1 = acc;
+#pragma clang loop unroll(disable)
+  for (unsigned kb = 0; kb < kKBlocks; ++kb) {
+    aie::vector<int32_t, 8> ve[2][2], vo[2][2];
+#pragma clang loop unroll(full)
+    for (unsigned rb = 0; rb < 2; ++rb) {
+      const uint8_t *__restrict src = (rb == 0 ? nib0 : nib1) + kb * 256;
+      aie::mmul<4, 8, 8, int16_t, uint8_t> Ce, Co;
+#pragma clang loop unroll(full)
+      for (unsigned oc = 0; oc < 4; ++oc) {
+        const aie::vector<int16_t, 8> x8 = aie::load_v<8>(xi + kb * kKInBlock + oc * 8);
+        const aie::vector<int16_t, 16> x16 = aie::concat(x8, aie::load_v<8>(xi + kb * kKInBlock + ((oc + 1) & 3) * 8));
+        const aie::vector<int16_t, 32> A = aie::concat(x16, aie::zeros<int16_t, 16>());
+        const aie::vector<uint8_t, 64> q = aie::load_v<64>(src + oc * 64);
+        const aie::vector<uint8_t, 64> e = aie::bit_and((uint8_t)0x0F, q);
+        const aie::vector<uint8_t, 64> o = aie::bit_and((uint8_t)0xF0, q);
+        if (oc == 0) {
+          Ce.mul(A, e);
+          Co.mul(A, o);
+        } else {
+          Ce.mac(A, e);
+          Co.mac(A, o);
+        }
+      }
+      const aie::vector<int32_t, 32> cev = Ce.template to_vector<int32_t>(), cov = Co.template to_vector<int32_t>();
+      ve[0][rb] = cev.template extract<8>(0);
+      vo[0][rb] = cov.template extract<8>(0);
+      ve[1][rb] = cev.template extract<8>(1);
+      vo[1][rb] = cov.template extract<8>(1);
+    }
+    const aie::vector<bfloat16, kRows> d32 = load_scale(dp + kb * kRows);
+    const aie::vector<bfloat16, kRows> m32 = load_scale(mp + kb * kRows);
+    auto [de, dod] = aie::interleave_unzip(d32, d32, 1);
+    auto [me, mo] = aie::interleave_unzip(m32, m32, 1);
+    const aie::vector<bfloat16, kRows> dperm = aie::concat(de.template extract<16>(0), dod.template extract<16>(0));
+    const aie::vector<bfloat16, kRows> mperm = aie::concat(me.template extract<16>(0), mo.template extract<16>(0));
+    const aie::vector<bfloat16, kRows> ds = aie::mul(dperm, dsc).template to_vector<bfloat16>();
+#pragma clang loop unroll(full)
+    for (unsigned t = 0; t < 2; ++t) {
+      const aie::vector<int32_t, kRows> vi = aie::concat(ve[t][0], ve[t][1], vo[t][0], vo[t][1]);
+      aie::accum<accfloat, kRows> part;
+      part.from_vector(aie::to_float<float>(vi, sh[kb + t]));
+      const aie::vector<bfloat16, kRows> hi = part.template to_vector<bfloat16>();
+      const aie::vector<bfloat16, kRows> lo = aie::sub(part, hi).template to_vector<bfloat16>();
+      aie::accum<accfloat, kRows> &a = t ? acc1 : acc;
+      a = aie::mac(a, hi, ds);
+      a = aie::mac(a, lo, ds);
+      a = aie::mac(a, mperm, xsh[kb + t]);
+      a = aie::mac(a, mperm, xsl[kb + t]);
+    }
+  }
+  acc = aie::add(acc, acc1.template to_vector<float>());
+#else
+
 #pragma clang loop unroll(disable)
   for (unsigned kb = 0; kb < kKBlocks; ++kb) {
     aie::vector<int32_t, 8> ve[2], vo[2];
@@ -249,6 +305,7 @@ __attribute__((noinline)) inline void gemv_q4_tile(const uint8_t *__restrict til
     acc = aie::mac(acc, mperm, xsh[kb]);
     acc = aie::mac(acc, mperm, xsl[kb]);
   }
+#endif
 
   const aie::vector<float, kRows> yv = acc.template to_vector<float>();
   if (last) {

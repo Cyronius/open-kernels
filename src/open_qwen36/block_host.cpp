@@ -1030,5 +1030,56 @@ size_t block_prefill_tokens(size_t pos, size_t n, size_t gt, size_t max_ctx, boo
     return n;
 }
 
+Q8Rows q8_rows(const float* w, size_t rows, size_t cols) {
+    if (cols % 32) throw std::runtime_error("q8_rows: cols must be a multiple of 32");
+    Q8Rows m{rows, cols, std::vector<int8_t>(rows * cols), std::vector<float>(rows * cols / 32)};
+    for (size_t b = 0; b < rows * cols / 32; ++b) {
+        float amax = 0.f;
+        for (size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(w[b * 32 + i]));
+        const float d = amax / 127.f, inv = d > 0.f ? 1.f / d : 0.f;
+        m.d[b] = d;
+        for (size_t i = 0; i < 32; ++i) m.q[b * 32 + i] = static_cast<int8_t>(std::lround(w[b * 32 + i] * inv));
+    }
+    return m;
+}
+
+void q8_gemv(const Q8Rows& m, const float* x, float* y) {
+    const long long R = static_cast<long long>(m.rows);
+    const size_t nb = m.cols / 32;
+#pragma omp parallel for schedule(static)
+    for (long long r = 0; r < R; ++r) {
+        const int8_t* q = m.q.data() + static_cast<size_t>(r) * m.cols;
+        const float* d = m.d.data() + static_cast<size_t>(r) * nb;
+        __m256 acc = _mm256_setzero_ps();
+        for (size_t b = 0; b < nb; ++b) {
+            __m256 s = _mm256_setzero_ps();
+            for (size_t k = 0; k < 32; k += 8) {
+                const __m256 w = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + b * 32 + k))));
+                s = _mm256_fmadd_ps(w, _mm256_loadu_ps(x + b * 32 + k), s);
+            }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d[b]), s, acc);
+        }
+        __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        h = _mm_hadd_ps(h, h);
+        h = _mm_hadd_ps(h, h);
+        y[r] = _mm_cvtss_f32(h);
+    }
+}
+
+void shared_expert_q8(const Q8Rows& ug, const Q8Rows& down, const float* gw, const float* xm, float* res) {
+    const size_t hid = ug.cols, ff = ug.rows / 2;
+    if (ug.rows % 2 || down.rows != hid || down.cols != ff)
+        throw std::runtime_error("shared_expert_q8: [u | g] is [2ff, hid] and down [hid, ff]");
+    std::vector<float> u(2 * ff), h(ff), y(hid);
+    q8_gemv(ug, xm, u.data());
+    for (size_t j = 0; j < ff; ++j) h[j] = u[ff + j] / (1.f + std::exp(-u[ff + j])) * u[j];
+    q8_gemv(down, h.data(), y.data());
+    double dot = 0;
+    for (size_t i = 0; i < hid; ++i) dot += static_cast<double>(xm[i]) * gw[i];
+    const float gate = 1.f / (1.f + std::exp(-static_cast<float>(dot)));
+    for (size_t i = 0; i < hid; ++i) res[i] += gate * y[i];
+}
+
 }  // namespace host
 }  // namespace open_qwen36

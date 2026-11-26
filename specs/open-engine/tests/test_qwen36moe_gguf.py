@@ -30,7 +30,7 @@ def test_view_is_the_q4_1_manifest_with_gguf_pack_ops():
             # same order and offsets: the block route's weights name these ops by index
             assert [o["dst"] for o in ops] == [o["dst"] for o in bops]
             assert all("model.layer" not in o.get("tensor", "") + o.get("up", "") for o in ops)
-            expert_ops = {"expert_stripes": "expert_stripes_gguf", "expert_down": "expert_down_gguf"}
+            expert_ops = {"expert_stripes": "q35_stripes", "expert_down": "q35_down"}
             for o, b in zip(ops, bops):
                 if b["op"] in expert_ops:
                     assert o["op"] == expert_ops[b["op"]]
@@ -87,8 +87,56 @@ def test_untile_inverts_llama_cpp_v_head_reorder():
 
 def test_no_view_for_formats_the_q35_ops_do_not_write():
     s = default_spec()
-    assert Q.gguf_view(replace(s, quant={**s.quant_map, "attn": "q8"}), manifest(s)) is None
+    assert Q.gguf_view(replace(s, quant={**s.quant_map, "experts": "q8"}), manifest(s)) is None
     assert Q.gguf_view(replace(s, quant="q4_1_f32"), manifest(s)) is None
+
+
+# Traces: OPEN-GGUF-Q8-ROLES-QWEN36MOE
+def test_q8_roles_view_streams_q8_and_routes_bf16():
+    s = replace(default_spec(), quant={"attn": "q8", "linear": "q8", "linear_out": "q8"})
+    m = manifest(s)
+    g = m["gguf"]
+    for name, lt in g["layer_types"].items():
+        base = m["layer_types"][name]
+        for key in ("pool", "consts"):
+            for o, b in zip(lt["pack"][key], base["pack"][key]):
+                if b["op"] == "q8_perm":
+                    assert o["op"] == "q35_q8" and o["nch"] == b["nch"] and o["in_dim"] == b["in_dim"]
+                if b["op"] == "std_perm":
+                    assert o["op"] == "q35_mat"
+        packed = [w for key in ("weights", "shared_weights")
+                  for w in lt["gemm_block"].get(key, {}).values() if w["from"] == "pack"]
+        assert packed
+        for w, bw in zip(packed, [w for key in ("weights", "shared_weights")
+                                  for w in base["gemm_block"].get(key, {}).values() if w["from"] == "pack"]):
+            for o, b in zip(w["pack"], bw["pack"]):
+                assert b["op"] == "bf16_gemm" and o["op"] == "q35_bf16"
+                assert (o["nch"], o["in_dim"], o["dst"], o.get("via")) == (b["nch"], b["in_dim"], b["dst"], b.get("via"))
+    q = [o for o in g["layer_types"]["full_attention"]["pack"]["pool"] if o.get("tensor", "").endswith("attn_q.weight")]
+    assert [o["op"] for o in q] == ["q35_q8", "q35_q8"] and sorted(o["offset"] for o in q) == [0, s.head_dim]
+
+
+# Traces: OPEN-SHARED-HOST-Q8
+def test_q8_shared_expert_runs_on_the_host_in_decode():
+    s = replace(default_spec(), quant={"attn": "q8", "linear": "q8", "linear_out": "q8", "shared": "q8"})
+    m, base = manifest(s), manifest(replace(s, quant={"attn": "q8", "linear": "q8", "linear_out": "q8"}))
+    g = m["gguf"]
+    for name, lt in g["layer_types"].items():
+        prog = lt["program"]
+        assert [st["op"] for st in prog] == ["run", "moeroute2", "shared_q8", "run"]
+        st, mx = prog[2], lt["gemm_block"]
+        assert st["kernel"] == prog[3]["kernel"] and (st["a_xm"], st["a_res"]) == (mx["a_xm"], mx["a_res"])
+        assert (st["up"], st["gate"], st["down"], st["gate_inp"]) == (
+            "blk.{l}.ffn_up_shexp.weight", "blk.{l}.ffn_gate_shexp.weight", "blk.{l}.ffn_down_shexp.weight",
+            "blk.{l}.ffn_gate_inp_shexp.weight")
+        assert m["layer_types"][name]["program"][2]["up"] == "model.layer.{l}.mlp.share_up_exps_proj.weight"
+        # the pool layout does not move; the block route's shared GEMMs read the q8 codes
+        assert lt["pack"]["pool"] == base["gguf"]["layer_types"][name]["pack"]["pool"]
+        for w in lt["gemm_block"]["shared_weights"].values():
+            assert w["from"] == "pack" and all(o["op"] == "q35_bf16" and "via" not in o for o in w["pack"])
+        for w in lt["gemm_block_variants"]["lean"]["shared_weights"].values():
+            assert [o["split"] for o in w["pack"]][:1] == ["hi"] and all(o["op"] == "q35_mat" for o in w["pack"])
+    assert [st["op"] for st in base["gguf"]["layer_types"]["full_attention"]["program"]] == ["run", "moeroute2", "run"]
 
 
 def test_equal_head_counts_untile_nothing():

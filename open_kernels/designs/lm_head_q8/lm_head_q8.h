@@ -190,7 +190,11 @@ __attribute__((noinline)) inline void gemv_q8_tile2(const uint8_t *__restrict ti
   return;
 #endif
   aie::set_rounding(aie::rounding_mode::conv_even);
+#if LMHEAD_SCALES_F32
   const float *__restrict s = (const float *)tile;
+#else
+  const bfloat16 *__restrict s = (const bfloat16 *)tile;
+#endif
   const uint8_t *__restrict c0 = tile + kScaleBytes;
   const uint8_t *__restrict c1 = c0 + kRowBlockStride;
   const int16_t *__restrict xg = (const int16_t *)tab + kt * kTileK * 2;

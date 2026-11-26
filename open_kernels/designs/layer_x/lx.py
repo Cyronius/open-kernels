@@ -123,7 +123,7 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
         X.role_gemv_bands(win, yout, B, K, "linear_out", OUT_PC, OUT_K)
         xin.release(2)
         # part 1: the MoE block
-        X.moe_body(win, xin, yout, B, K)
+        X.moe_body(win, xin, yout, B, K, nx=X.NX_DECODE)
 
     workers = ([XL.ln_worker(of_lni, of_lno, tl, L, entry_fp32=D.XN_F32)] + XL.main_workers(main_body, of_w, of_x, of_y, t, K)
                + XL.glue_post_workers(of_side, of_gact, of_gout, of_pin, of_pout, g, GK, Tile(2, 3)))
@@ -258,7 +258,7 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
         else:
             # 8. the MoE block (moeroute2 has pointed the routed slots' fills at the router's choice)
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                           A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW)
+                           A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=X.NX_DECODE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),

@@ -1028,6 +1028,46 @@ int main() {
         if (badf || !refused) return 1;
     }
 
+    {
+        // Traces: OPEN-GGUF-Q8-ROLES-QWEN36MOE. q35_q8 keeps a Q8_0 tensor's codes in q8_perm's half-tiles:
+        // half-tile c of a 64-row band holds rows 16 (c % 4) .. +16 of k-tile c / 4, bf16 scales [kb * 16 + r]
+        // then int8 codes [k * 16 + r] (spec.md, the q8 band law).
+        const unsigned rows = 64, cols = 512, ncol = cols / 256;
+        const Blocks w = make_blocks(rows, cols, "Q8_0", rng);
+        GgufFile gq(write_gguf_tensors(dir, "q8-roles.gguf",
+                                       {{"blk.0.attn_qkv.weight", {cols, rows}, static_cast<uint32_t>(GgufFile::Type::Q8_0), w.bytes}}));
+        PackOp op;
+        op.op = "q35_q8";
+        op.tensor = "blk.{l}.attn_qkv.weight";
+        op.nch = 2 * rows / 32 * ncol;
+        op.in_dim = cols;
+        std::vector<uint8_t> pool(static_cast<size_t>(op.nch) * 5120, 0xff);
+        pools::apply(op, gq, 0, pool.data(), pool.size(), 5120);
+        auto rne = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            return static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+        };
+        size_t bad = 0;
+        for (size_t c = 0; c < op.nch; ++c) {
+            const size_t band = c / (4 * ncol), cc = c % (4 * ncol), kt = cc / 4;
+            const uint8_t* h = pool.data() + c * 5120;
+            for (unsigned r = 0; r < 16; ++r) {
+                const size_t row = 64 * band + 16 * (cc % 4) + r;
+                for (unsigned kb = 0; kb < 8; ++kb) {
+                    const uint8_t* blk = w.bytes.data() + (row * (cols / 32) + kt * 8 + kb) * 34;
+                    uint16_t d16, s;
+                    std::memcpy(&d16, blk, 2);
+                    std::memcpy(&s, h + 2 * (kb * 16 + r), 2);
+                    bad += s != rne(fp16_to_f32(d16));
+                    for (unsigned i = 0; i < 32; ++i) bad += h[256 + (kb * 32 + i) * 16 + r] != blk[2 + i];
+                }
+            }
+        }
+        std::printf("%s q35_q8: Q8_0 codes and bf16 scales in q8_perm half-tiles (%zu differ)\n", bad ? "FAIL" : "ok   ", bad);
+        if (bad) return 1;
+    }
+
     std::printf("GGUF-PACK OK\n");
     return 0;
 }
