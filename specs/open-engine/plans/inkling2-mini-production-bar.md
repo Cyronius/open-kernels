@@ -5384,6 +5384,26 @@ Decode after a 1,024-token prefix (profiled bridge, NOISY, load average ~30): 35
 experts, plus the head). Host stages: K/V pack 58 ms and sync 12 ms, controller 40 ms, route 9 ms. The host stages
 use OpenMP teams and are inflated by the shared CPUs; compare them only within a sitting.
 
+**Resident decode K/V (`c9b1736`).** Each visit and 4,096-key tile keeps its own K/V buffer: committed keys are packed
+once; a call rewrites only slots from the committed end (pending rows, then zeros) and the bias of live chunks.
+Full-attention chunks more than the relative extent before the query keep a zero bias and are not synced again, so at
+long context only the newest tile changes. ABBA at 1,024 + 48 (profiled bridge, NOISY, load ~26): K/V stage 29.6-31.2
+to 12.4-14.3 ms, decode 261.1-264.1 to 241.0-254.2 ms, prefill and decode logits bit-equal in every arm. Partial
+accept 30 of 30 (prefixes 5, 1,021 and 3,000). Splitting the narrow F32 controller and router products by output row
+changed nothing (controller 19.2-21.5 ms either way) and was dropped.
+
+**Decode is at the NPU's DMA rate.** One token reads about 3.78 GB of weights: experts 1.85 GB (44 IQ4_NL visits of
+8 x 4.48 MB, 4 Q8_0 visits of 8 x 8.46 MB), dense Q8 projections 1.44 GB (48 x 30 MB) and the Q8 head 0.49 GB. The
+179 ms of device wait is 21 GB/s. The Strix Point expert wait (52.6 ms for 1.85 GB) was 35 GB/s. The NPU here runs in
+power mode `default`; a `performance` or `turbo` run is the next measurement and needs the machine's owner (the mode
+is system-wide). The host work left a token: controller ~20 ms, K/V ~13 ms, route ~4 ms, attention merge and head
+readback a few ms.
+
+**DSpark on `phlegm run`** (`--speculative auto`, 400-token cap, code prompt, order off/auto/auto/off, NOISY): output
+byte-identical in all four runs, wall 112.6 / 176.2 / 176.2 / 112.6 s. Verify passes keep the one-row dense kernels
+to stay bit-equal to decode, so a k-row verify reads the dense weights k times; the routed experts of k tokens are
+mostly disjoint (8 of 128 each), so expert bytes also grow with k. Both make a verify cost close to k decode tokens.
+
 ## Rebuild the v11 kernel bundle
 
 From the repository root, use the IRON Python environment with Peano and the XRT packaging tools
