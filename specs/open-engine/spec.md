@@ -6332,6 +6332,14 @@ block projections. Each dispatch uses a validated stream and buffer layout from 
 The exported `inkling2-routed-v*` ABI and the native reader advance together. Version 11 adds optional
 vision streams while preserving the existing text bundle layout.
 
+The optional `singleton_decode.gate_up_order: paired-v1` field adds the `iq4-moe` and `q8-moe` singleton streams.
+One launch runs a decode row's 8 routed experts through gate/up, SiTU on the cores (caps 4 and 25 built in) and
+down, and returns the 8 down rows; the host keeps routing and the weighted sum. The SiTU output reaches the down
+leg through a DDR region of the output buffer, as the same BF16-rounded power-of-two int16 tiles the host packs.
+With the field, every gate/up pool reader packs and unpacks core r's bands as gate 3r, up 3r, gate 3r+1, and so
+on. The reader keeps two launches with host SiTU when the field is absent, the caps differ or the two expert
+tensors differ in type.
+
 **Acceptance criteria:** A contiguous prompt and a prompt split across block boundaries preserve the committed
 visit state and match the reference within the measured route tolerances. Report host stages and device timings
 separately during prefill and single-token decode. Verify long prefixes, the sliding boundary and incomplete tails.

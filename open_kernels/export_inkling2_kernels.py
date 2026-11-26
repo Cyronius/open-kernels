@@ -40,6 +40,9 @@ def kernel_builds(wide_old_attention=False, head_pair=False, singleton_decode=Fa
                 yield f"singleton-{quant}-{leg}", "inkling2/shared_decode.py", dict(
                     INKLING2_SHARED_SINGLETON=1, INKLING2_SHARED_FORMAT=quant,
                     INKLING2_SHARED_K=width, INKLING2_SHARED_CHUNKS=0)
+            yield f"singleton-{quant}-moe", "inkling2/shared_decode.py", dict(
+                INKLING2_SHARED_SINGLETON=1, INKLING2_SHARED_FORMAT=quant, INKLING2_SHARED_K=1152,
+                INKLING2_SHARED_CHUNKS=0, INKLING2_SHARED_MOE=1)
         for chunks in ATTENTION_CHUNKS:
             yield f"singleton-attention-{chunks}", "inkling2/shared_decode.py", dict(
                 INKLING2_SHARED_SINGLETON=1, INKLING2_SHARED_FORMAT="q8", INKLING2_SHARED_K=0,
@@ -102,7 +105,7 @@ def package(build_dir: Path, out: Path, wide_old_attention=False, head_pair=Fals
         if head_pair:
             command.extend(["--head-pair", build_dir / "head-pair"])
         if singleton_decode:
-            command.extend(["--singleton-decode", build_dir, "--split-prefill-q8"])
+            command.extend(["--singleton-decode", build_dir, "--split-prefill-q8", "--fused-experts"])
         subprocess.run(command, check=True)
         staged.rename(out)
 

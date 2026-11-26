@@ -28,12 +28,18 @@ SLOTS, EXPERT_WIDTH = 8, 2304
 ACT_GROUP, ACT_BYTES = 4, 320
 BANDS = EXPERT_WIDTH // TN // ROWS
 assert OUT_FRAMES == BANDS
+UP_K, DOWN_K, PAIRS = 2304, 1152, BANDS // 2
 
 
 @iron.jit(aiecc_flags=["--dynamic-objFifos", "--alloc-scheme=basic-sequential"])
 def shared_decode(w: In, x: In, y: Out, *, k: CompileTime[int], iq4: CompileTime[bool],
                   chunks: CompileTime[int], singleton: CompileTime[bool] = False,
-                  bands: CompileTime[int] = BANDS, source_hash: CompileTime[int] = 0):
+                  bands: CompileTime[int] = BANDS, moe: CompileTime[bool] = False, source_hash: CompileTime[int] = 0):
+    if moe:
+        # Gate/up, SiTU and down of one token in one launch; the down leg sets the band geometry.
+        if not singleton or chunks or bands != BANDS:
+            raise ValueError("the fused expert stream needs the singleton image")
+        k = DOWN_K
     if k == 0:
         if not 1 <= chunks <= 128 or bands != OUT_FRAMES:
             raise ValueError("invalid shared attention tier")
@@ -65,16 +71,17 @@ def shared_decode(w: In, x: In, y: Out, *, k: CompileTime[int], iq4: CompileTime
     control_size = 5 if singleton else 2
     control_ty = np.ndarray[(control_size,), np.dtype[np.int32]]
     lookup = np.tile(IQ4_NL_VALUES, 2).astype(np.int16)
-    ex_args = [aty, bty, table_ty, table_ty, cty, np.int32, np.int32]
-    symbol = "inkling_shared_q8" if singleton else "inkling_shared_expert"
+    ex_args = [aty, bty, table_ty, table_ty, cty] + ([cty] if singleton else []) + [np.int32, np.int32]
+    symbol = "inkling_shared_project" if singleton else "inkling_shared_expert"
     null = bool(os.environ.get("INKLING2_SHARED_NULL"))  # timing builds only: all DMA, no arithmetic
-    flags = [os.environ.get("INKLING2_SHARED_OPT", "-O2"), "-DBLOCK_ROWS=4", "-DINKLING2_SINGLETON" if singleton else f"-DIQ4_WEIGHTS={int(iq4)}"]
+    flags = [os.environ.get("INKLING2_SHARED_OPT", "-O2"), "-DBLOCK_ROWS=4"]
+    flags += ["-DINKLING2_SINGLETON", "-DVECMATH_COMPACT"] if singleton else [f"-DIQ4_WEIGHTS={int(iq4)}"]
     flags += ["-DEXPERT_NULL"] if null else []
     external = ExternalFunction(symbol, source_file=str(HERE / "shared_decode.cc"), arg_types=ex_args,
                                 include_dirs=include_dirs(), compile_flags=flags)
     eo = external.object_file_name
     expert = Kernel(symbol, eo, ex_args)
-    iq4_pair = Kernel("inkling_shared_iq4_pair", eo, ex_args) if singleton else expert
+    situ = Kernel("inkling_shared_situ", eo, [cty, cty, np.int32]) if singleton else None
     copy_query = Kernel("inkling_shared_query", eo, [bty, q_ty, np.int32])
     copy_kv = Kernel("inkling_shared_kv", eo, [aty, kv_ty, np.int32])
     emit = Kernel("inkling_shared_output", eo, [o_ty, cty, np.int32])
@@ -83,6 +90,7 @@ def shared_decode(w: In, x: In, y: Out, *, k: CompileTime[int], iq4: CompileTime
                                 arg_types=[q_ty, o_ty], include_dirs=include_dirs(),
                                 compile_flags=[os.environ.get("INKLING2_SHARED_OPT", "-O2"), "-DVECMATH_COMPACT",
                                                "-DINKLING2_ALIGNED_CHUNKS"]
+                                              + (["-DINKLING2_EXP32"] if singleton else [])
                                               + (["-DINKLING2_ATTENTION_NULL"] if null else []))
     ao = external.object_file_name
     init = Kernel("inkling_attn_init", ao, [q_ty, o_ty])
@@ -107,27 +115,65 @@ def shared_decode(w: In, x: In, y: Out, *, k: CompileTime[int], iq4: CompileTime
             a.release(1)
         c.release(1)
 
+    def singleton_band(a, b, result, scratch, held, count, records, flags, project, lut0, lut1):
+        # `held` is the band's first B record, already acquired. Core-side B has depth 1, so every
+        # acquire returns this same buffer.
+        activations = a.acquire(1)
+        project(activations, held, lut0, lut1, result, scratch, 0, flags + 1)
+        b.release(1)
+        for i in range_(1, records):
+            b.acquire(1)
+            project(activations, held, lut0, lut1, result, scratch, i, flags)
+            b.release(1)
+        a.release(1)
+        for _ in range_(count - 1):
+            activations = a.acquire(1)
+            for i in range_(records):
+                b.acquire(1)
+                project(activations, held, lut0, lut1, result, scratch, i, flags)
+                b.release(1)
+            a.release(1)
+
     def make_worker(is_query_head):
-        def work(a, b, c, mode, lut0, lut1, query, kv, result, scores, probs, kernels):
-            expert_fn, pair_fn, copy_q, copy_k, init_fn, step_fn, emit_fn, zero_fn = kernels
+        def work(a, b, c, mode, lut0, lut1, query, kv, result, scores, probs, *rest):
+            gate, halves, kernels = rest if singleton else (None, None, rest[0])
+            expert_fn, situ_fn, copy_q, copy_k, init_fn, step_fn, emit_fn, zero_fn = kernels
             first = b.acquire(1)
             # The first B record always arrives after the RTP writes. This orders
             # the mode read on every launch without a core reset or barrier lock.
             if singleton:
-                iq4_on, q8_on, kind, count, band_count = mode[0], mode[1], mode[2], mode[3], mode[4]
-                for _ in range_(iq4_on):
-                    expert_band(a, b, c, first, count, lut0, lut1, pair_fn, 2)
+                kind, count, band_count, flags, fused = mode[0], mode[1], mode[2], mode[3], mode[4]
+                records = 4 - flags  # 4 Q8_0 records or 2 IQ4_NL records per activation frame
+                for _ in range_(fused):
+                    for _ in range_(PAIRS):
+                        frame = c.acquire(1)
+                        # The gate band goes to the scratch (flag 4), its up band to the frame.
+                        for half in range_(2):
+                            for _ in range_(half):
+                                b.acquire(1)
+                            singleton_band(a, b, frame, gate, first, UP_K // TK // ACT_GROUP, records,
+                                           flags + halves[half], expert_fn, lut0, lut1)
+                        for t in range_(3):
+                            situ_fn(gate, frame, t)
+                        c.release(1)
+                        # After the last pair this waits for the down leg, which needs the frame drained first.
+                        b.acquire(1)
+                for _ in range_(1 - kind):
+                    frame = c.acquire(1)
+                    singleton_band(a, b, frame, gate, first, count, records, flags, expert_fn, lut0, lut1)
+                    c.release(1)
                     for _ in range_(band_count - 1):
-                        weights = b.acquire(1)
-                        expert_band(a, b, c, weights, count, lut0, lut1, pair_fn, 2)
+                        b.acquire(1)
+                        frame = c.acquire(1)
+                        singleton_band(a, b, frame, gate, first, count, records, flags, expert_fn, lut0, lut1)
+                        c.release(1)
             else:
                 kind, count = mode[0], mode[1]
-                q8_on, band_count = 1 - kind, BANDS
-            for _ in range_(q8_on):
-                expert_band(a, b, c, first, count, lut0, lut1, expert_fn, 1)
-                for _ in range_(band_count - 1):
-                    weights = b.acquire(1)
-                    expert_band(a, b, c, weights, count, lut0, lut1, expert_fn, 1)
+                for _ in range_(1 - kind):
+                    expert_band(a, b, c, first, count, lut0, lut1, expert_fn, 1)
+                    for _ in range_(BANDS - 1):
+                        weights = b.acquire(1)
+                        expert_band(a, b, c, weights, count, lut0, lut1, expert_fn, 1)
             for _ in range_(kind):
                 if is_query_head:
                     copy_q(first, query, 0)
@@ -172,28 +218,38 @@ def shared_decode(w: In, x: In, y: Out, *, k: CompileTime[int], iq4: CompileTime
             mode = Buffer(control_ty, initial_value=np.zeros(control_size, np.int32), use_write_rtp=True)
             controls.append(mode)
             scratch = [Buffer(ty if has_head else byte_type(64)) for ty in (q_ty, kv_ty, o_ty, scores_ty, probs_ty)]
+            if singleton:
+                scratch += [Buffer(cty), Buffer(np.ndarray[(16,), np.dtype[np.int32]],
+                                                 initial_value=np.array([4] + [0] * 15, np.int32))]
             workers.append(Worker(make_worker(has_head), tile=Tile(col, 2 + row), stack_size=0x2000, fn_args=[
                 a_core.cons(), b_core[row].cons(), c_core[row].prod(), mode,
                 Buffer(table_ty, initial_value=lookup, address=0xBFC0),
                 Buffer(table_ty, initial_value=lookup, address=0xFFC0), *scratch,
-                (expert, iq4_pair, copy_query, copy_kv, init, step, emit, emit_zero),
+                (expert, situ, copy_query, copy_kv, init, step, emit, emit_zero),
             ]))
         ap.append(a.prod(tile=shim))
         bp.append(b.prod(tile=shim))
         cp.append(c.cons(tile=shim))
 
-    def sequence(first, second, out, a_prods, b_prods, c_conss):
+    def set_modes():
         for mode in controls:
             count = tiles // ACT_GROUP if k else chunks
             if singleton:
-                mode[0] = int(bool(k) and iq4)
-                mode[1] = int(bool(k) and not iq4)
-                mode[2] = int(not k)
-                mode[3] = count
-                mode[4] = bands
+                mode[0] = int(not k)
+                mode[1] = count
+                mode[2] = bands
+                mode[3] = 2 * int(iq4)
+                mode[4] = int(moe)
             else:
                 mode[0] = int(not k)
                 mode[1] = count
+
+    def weight_tap(total, col, per_slot, slot_stripe):
+        return TensorAccessPattern((SLOTS, total // SLOTS), col * per_slot, [1, slot_stripe // b_frame, ROWS, b_frame],
+                                   [0, b_frame, slot_stripe, 1])
+
+    def sequence(first, second, out, a_prods, b_prods, c_conss):
+        set_modes()
         group = TaskGroup()
         for col in range(SLOTS):
             c_conss[col].drain(out, tap=TensorAccessPattern(
@@ -208,13 +264,46 @@ def shared_decode(w: In, x: In, y: Out, *, k: CompileTime[int], iq4: CompileTime
                 a_tap = TensorAccessPattern((SLOTS, a_bytes), col * a_bytes, [1, blocks // inner, inner, 256],
                                             [0, inner * 256, 256, 1])
             a_prods[col].fill(second, tap=a_tap, group=group)
-            b_prods[col].fill(first, tap=TensorAccessPattern(
-                (SLOTS, b_bytes), col * b_bytes, [1, stripe // b_frame, ROWS, b_frame],
-                [0, b_frame, stripe, 1]), group=group)
+            b_prods[col].fill(first, tap=weight_tap(SLOTS * b_bytes, col, b_bytes, stripe), group=group)
         group.finish()
 
-    runtime = Runtime(sequence, [byte_type(SLOTS * b_bytes), byte_type(SLOTS * a_bytes), float_type(SLOTS * c_elems),
-                                 ap, bp, cp])
+    # Fused stream buffers: gate/up pool, one packed token, down pool, then [y of all slots | SiTU wire].
+    up_tiles = UP_K // TK
+    up_stripe = BANDS * (up_tiles // 2 if iq4 else up_tiles) * b_frame
+    x_bytes = up_tiles * ACT_BYTES
+    wire_elems = ROWS * PAIRS * FRAME_VALUES
+    out_elems = SLOTS * (c_elems + wire_elems)
+
+    def fused_sequence(up_weights, token, down_weights, out, a_prods, b_prods, c_conss):
+        set_modes()
+        group = TaskGroup()
+        for col in range(SLOTS):
+            # Core r's band pair j holds K32 tiles 3(3r + j) to 3(3r + j) + 2: frame slot 3r + j.
+            c_conss[col].drain(out, tap=TensorAccessPattern(
+                (out_elems,), SLOTS * c_elems + col * wire_elems, [1, PAIRS, ROWS, FRAME_VALUES],
+                [0, FRAME_VALUES, PAIRS * FRAME_VALUES, 1]), wait=True, group=group)
+            a_prods[col].fill(token, tap=TensorAccessPattern((x_bytes,), 0, [BANDS, 1, up_tiles, ACT_BYTES],
+                                                             [0, 0, ACT_BYTES, 1]), group=group)
+            b_prods[col].fill(up_weights, tap=weight_tap(SLOTS * ROWS * up_stripe, col, ROWS * up_stripe, up_stripe),
+                              group=group)
+        group.finish()
+        # The down leg reads the wire back through DDR only after its drain has finished.
+        group = TaskGroup()
+        for col in range(SLOTS):
+            c_conss[col].drain(out, tap=TensorAccessPattern(
+                (out_elems,), col * c_elems, [1, 1, c_elems // 256, 256], [0, 0, 256, 1]), wait=True, group=group)
+            a_prods[col].fill(out, tap=TensorAccessPattern(
+                (out_elems,), SLOTS * c_elems + col * wire_elems, [BANDS, 1, ROWS * PAIRS, 3 * ACT_BYTES // 4],
+                [0, 0, FRAME_VALUES, 1]), group=group)
+            b_prods[col].fill(down_weights, tap=weight_tap(SLOTS * b_bytes, col, b_bytes, stripe), group=group)
+        group.finish()
+
+    if moe:
+        runtime = Runtime(fused_sequence, [byte_type(SLOTS * ROWS * up_stripe), byte_type(x_bytes),
+                                           byte_type(SLOTS * b_bytes), float_type(out_elems), ap, bp, cp])
+    else:
+        runtime = Runtime(sequence, [byte_type(SLOTS * b_bytes), byte_type(SLOTS * a_bytes),
+                                     float_type(SLOTS * c_elems), ap, bp, cp])
     return Program(iron.get_current_device(), runtime, workers=workers).resolve_program()
 
 
@@ -225,6 +314,7 @@ SPECIALIZE = {
     "chunks": int(os.environ.get("INKLING2_SHARED_CHUNKS", "0")),
     "singleton": bool(int(os.environ.get("INKLING2_SHARED_SINGLETON", "0"))),
     "bands": int(os.environ.get("INKLING2_SHARED_BANDS", str(BANDS))),
+    "moe": bool(int(os.environ.get("INKLING2_SHARED_MOE", "0"))),
     "source_hash": int(hashlib.sha256(IQ4_NL_VALUES.tobytes() + os.environ.get("INKLING2_SHARED_NULL", "").encode()
                                       + b"".join(p.read_bytes() for p in (
         HERE / "shared_decode.cc", HERE / "block_expert.cc", HERE / "iq4_lut.h", HERE / "relative_attention.cc",

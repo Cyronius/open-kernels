@@ -654,13 +654,14 @@ void pack_inkling2_expert(const uint8_t* src, bool iq4_nl, size_t rows, size_t c
 namespace inkling2_block {
 namespace {
 template <bool IQ4, bool SplitScale = false>
-void pack_quantized_weights(const uint8_t* src, size_t n, size_t k, uint8_t* dst) {
+void pack_quantized_weights(const uint8_t* src, size_t n, size_t k, uint8_t* dst, bool paired) {
     constexpr size_t block_bytes = IQ4 ? 18 : 34;
     constexpr size_t packed_bytes = block_bytes + (SplitScale ? 2 : 0);
     const size_t chunks_k = k / tile_k;
     const size_t chunks_n = n / tile_n, per_column = chunks_n / array_cols;
     for (size_t group = 0; group < chunks_n; ++group) {
-        const size_t packed_group = (group % array_cols) * per_column + group / array_cols;
+        const size_t packed_group = paired ? paired_band(group, chunks_n, worker_rows)
+                                           : (group % array_cols) * per_column + group / array_cols;
         for (size_t kb = 0; kb < chunks_k; ++kb) {
             auto* tile = dst + (packed_group * chunks_k + kb) * tile_n * packed_bytes;
             auto* codes = tile + tile_n * (1 + SplitScale) * sizeof(uint16_t);
@@ -771,11 +772,19 @@ void pack_quantized_input(const float* src, size_t rows, size_t m, size_t k, siz
 }
 }  // namespace
 
-void pack_weights(const uint8_t* src, bool iq4, size_t n, size_t k, uint8_t* dst, bool split_scale) {
+size_t paired_band(size_t group, size_t groups, size_t core_rows) {
+    const size_t half = groups / 2, pairs = half / core_rows;
+    if (groups % (2 * core_rows) || half % core_rows || group >= groups) fail("invalid paired gate/up band");
+    const bool up = group >= half;
+    const size_t feature = group - (up ? half : 0);
+    return (feature / pairs) * 2 * pairs + (feature % pairs) * 2 + up;
+}
+
+void pack_weights(const uint8_t* src, bool iq4, size_t n, size_t k, uint8_t* dst, bool split_scale, bool paired) {
     if (n % (tile_n * array_cols) || k % tile_k || (iq4 && split_scale)) fail("invalid Inkling weight tile shape");
-    if (iq4) pack_quantized_weights<true>(src, n, k, dst);
-    else if (split_scale) pack_quantized_weights<false, true>(src, n, k, dst);
-    else pack_quantized_weights<false>(src, n, k, dst);
+    if (iq4) pack_quantized_weights<true>(src, n, k, dst, paired);
+    else if (split_scale) pack_quantized_weights<false, true>(src, n, k, dst, paired);
+    else pack_quantized_weights<false>(src, n, k, dst, paired);
 }
 
 void pack_input(const float* src, size_t rows, size_t m, size_t k, uint8_t* dst, bool from_fp32) {
@@ -795,12 +804,13 @@ void unpack_output(const float* src, size_t rows, size_t m, size_t n, float* dst
 }
 
 void unpack_grouped_output(const float* src, const size_t* counts, size_t slots, size_t slot_rows,
-                           size_t core_rows, size_t n, float* dst) {
+                           size_t core_rows, size_t n, float* dst, bool paired) {
     const size_t m = std::max(slot_rows, decode_tile_m);
     const size_t groups = n / tile_n, per_column = groups / array_cols, per_core = groups / core_rows;
     for (size_t slot = 0; slot < slots; ++slot) {
         for (size_t group = 0; group < groups; ++group) {
-            const size_t stripe = (group % array_cols) * per_column + group / array_cols;
+            const size_t stripe = paired ? paired_band(group, groups, core_rows)
+                                         : (group % array_cols) * per_column + group / array_cols;
             const size_t dma_group = (stripe % per_core) * core_rows + stripe / per_core;
             const auto* tile = src + (slot * groups + dma_group) * m * tile_n;
             for (size_t row = 0; row < counts[slot]; ++row) {

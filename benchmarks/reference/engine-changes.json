@@ -504,6 +504,17 @@
         "src/open_qwen36/inkling2_cpu.hpp": "77ed5b0b0af0978104e87365b895ed673a77bf1070ef26ebab690dfc11fccf61",
         "src/open_qwen36/inkling2_wide_attention.hpp": "2560f760e6e1ea0fbd055c716c3eeb12d1a858ab97474cff1dedada4faf5417d"
       }
+    },
+    {
+      "id": "inkling2-fused-singleton-experts",
+      "origin": "open-kernels: one singleton launch per decode visit runs gate/up, SiTU on the cores and down (manifest singleton_decode.gate_up_order paired-v1, streams iq4-moe and q8-moe); gate/up pools use the paired band order",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "993e90bc07427d997b715d1e6d9b790c12cec1351d8dad5bfa91f56d323ff6be",
+        "src/open_qwen36/inkling2_host.cpp": "2e9e0f2c08c696f66979a3ff9ca3ccefc0edc6d66ad5427fe5645393ff310bdf",
+        "src/open_qwen36/inkling2_host.hpp": "6ee3094acfd841bfc211ee9e28235c499d33626d8d75a564dc8012052aab7765",
+        "src/open_qwen36/pools.cpp": "44f0ebf75769034466fde17294b9e87b3d5bd0c014480918786a175a2294802c",
+        "src/open_qwen36/pools.hpp": "a9e6bdf323d7cc4d2a2fff42cbb5def37cdc5b04c982a07232834e721c22be87"
+      }
     }
   ]
 }
