@@ -633,3 +633,9 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   - 4k profile after both (ms a token, `dn_new2`): linear layers 4.18 (MoE waited 1.60, DeltaNet host 0.77,
     tail 0.30, GEMM 0.22, MoE gather + scatter 0.53 now under the NPU's passes), full layers 1.42 (MoE waited 0.53,
     GEMM 0.27, attention 0.11); whole 5.62.
+- 2026-11-26, the KL control on the regenerated text: llama.cpp Vulkan base (`build-vk` with Khronos headers 1.4.363 and
+  SPIRV-Headers vulkan-sdk-1.4.335.0 from a local prefix; the box has no vulkan-headers package): PPL 6.2388. llama.cpp
+  CPU against it: mean 0.0269, median 0.0077, same top 92.9 %. NPU (`fa2`, after OPEN-DN-FUSED) against it: 0.0241,
+  0.0066, 93.4 %. `kl/base_vk_c512.kld` now points at the Vulkan base, as on Strix Point.
+- 2026-11-26, phlegm bridge: a request line may now be 16 MB (was 1 MB: a 262,000-token prompt's ids are 1.6 MB).
+  `phlegm run --image` PASS; 32,768-token needle through `phlegm serve` PASS (189 s).

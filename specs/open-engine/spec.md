@@ -1680,17 +1680,20 @@ Audited 2026-11-24 on the in-tree engine (`src/open_qwen36`, the phlegm runtime)
 `kernels-q8s` (Q8_0 projections at q8, OPEN-GGUF-Q8-ROLES-QWEN36MOE; shared expert on the host, OPEN-SHARED-HOST-Q8).
 Machine: HX PRO 370 (Strix Point), NPU performance mode, Windows 11, NPU driver 32.0.20102.3930, mlir-aie 1.4.2.
 Development runs, not a release benchmark. Plan: [qwen36moe-production-bar.md](plans/qwen36moe-production-bar.md).
+Updated 2026-11-26 on a second machine: Ryzen AI MAX+ 395 (Strix Halo), Linux 7.2.15-1-omarchy, amdxdna in-tree, NPU
+firmware 1.1.2.65, XRT 2.27.0, kernel set `kernels-fa262k` (the same recipe plus `attn_fa256` and the verify
+images), NPU power mode Default (setting it needs root there), on a box shared with other sessions' work.
 
 | Bar item | State | Evidence |
 |---|---|---|
 | Block prefill | Done. The layer-major block route (T = 256) is the default in the CLI, `phlegm run` and `serve` | speed table |
-| Near optimal | Open. Profiled, with the remainders named below; no tuning pass yet | profile tables |
+| Near optimal | Done, rest named (2026-11-26). Tuning passes: `attn_fa256` (262k prefill 6x), OPEN-MOE-PIPE (4k prefill 1.19-1.29x), OPEN-DN-FUSED (DeltaNet host 1.4x). Decode streams 2.9 GB a step; its floor is about 56 ms at 52 GB/s, the step 85 ms by dispatch minima on Strix Halo and 101-110 ms on Strix Point; what is left is named under "What is left" | profile tables, "What is left" |
 | Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %), on `attn_block` (2026-11-25) and again on `attn_fa256` (2026-11-26): 262,000-token prefill 2,457 s against 14,706 s | speed table, [qwen36moe-attn-fa256.md](plans/qwen36moe-attn-fa256.md) |
-| All on the NPU | Done with named host stages (tables below) | host stages |
+| All on the NPU | Done with named host stages (tables below): in prefill the DeltaNet conv and delta rule (0.77 ms a token at 4k), the layer tails and routers, the MoE gather / scatter (now under the NPU's passes); in decode the router read and the q8 shared expert (overlapped); the vision tower (3.7-4.0 s for 3,200 patches) | host stages, "What is left" |
 | Drafter | Done: the MTP head (`blk.40`) drafts one token and a two-row verify pass checks it (OPEN-VERIFY-ROWS-QWEN36MOE, OPEN-SPEC-MTP-QWEN36MOE); `phlegm serve --speculative mtp` 1.24-1.40x decode, output byte-identical to `off`, also after an image. Prompt lookup runs on the same pass and is kept as an option (1.10-1.25x); combining the two per cycle measured no gain at width 2 | plan phase 5 |
-| `phlegm run` / `serve` | Done: plain, streamed, reasoning on and off, a tool-call round trip | plan log |
-| Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1, the Q6_K head to `lm_head_q8`. Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread | OPEN-SHARED-HOST-Q8 |
-| Benchmarks | Done for the kernel side: `phlegm bench --development` in a measure unit, 512 to 4k (below), with CLI runs to 131k; the docs page and README row are OFLM's | bench table |
+| `phlegm run` / `serve` | Done: plain, streamed, reasoning on and off, a tool-call round trip, images (`phlegm run --image`, `serve` image parts), MTP speculation, a 32,768-token needle through `serve` (PASS, 189 s) | plan log, OPEN-VISION-BLOCK |
+| Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1, the Q6_K head to `lm_head_q8`. Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread. Strix Halo, 2026-11-26 (another text, OPEN-DN-FUSED): block-route KL 0.0241 against llama.cpp Vulkan and 0.0278 against llama.cpp CPU, inside llama.cpp's own CPU-vs-Vulkan 0.0269 | OPEN-SHARED-HOST-Q8, OPEN-DN-FUSED |
+| Benchmarks | Done for the kernel side: `phlegm bench --development` on Strix Point (a measure unit) and on Strix Halo (Linux, Default power mode, a shared box), 512 to 4k (below), with CLI runs to 262k; the docs page and README row are OFLM's | bench tables |
 | Features | Reasoning, tool calling, the MTP head (drafter row) and vision pass. Vision: the mmproj tower on the host CPU (named below), image prompts on the block route at M-RoPE positions, `phlegm serve` image parts, answers equal to llama.cpp's on the test image (OPEN-VISION-BLOCK, SERVER-IMAGE-INPUT). Left out: video input (phlegm takes no video) | this table |
 
 Reliability: about one routed MoE dispatch in 30,000 to 300,000 is lost by the driver or firmware (OPEN-ROUTE-ALT).
@@ -1744,6 +1747,30 @@ about +30 % decode bytes for the KL). Past 32k the attention walk dominates and 
 Prefill of 4,096 tokens (23.1 s, block route): NPU MoE 9.2 s, NPU GEMMs 2.3 s; host DeltaNet conv and delta rule
 3.8 s, transposes 1.4 s, prefill attention host part 1.4 s, tail 1.4 s, MoE prep and read-back 1.4 s, tiling 0.6 s,
 syncs 0.4 s, shared expert 0.2 s.
+
+**What is left (2026-11-26).** Decode, per step at a short position (Strix Halo dispatch minima from
+`OFLM_OPEN_STEP_TRACE=1`, 47 steps; bytes from the manifest's streams):
+
+| part | dispatches | min ms | MB | stream rate | named remainder |
+|---|---|---|---|---|---|
+| `lx0` (q8 projections, conv, DeltaNet, router) | 30 | 1.27 | 48.6 | 38 GB/s | the q8 front streams at 38 of about 52 GB/s; its main core has 80 B of program memory free |
+| `ax0` (q8 projections, attention, router) | 10 | 1.84 | 33.7 | 18 GB/s | always entered from the `lx` context: each full layer costs two context switches (20 a step, 0.8-1.2 ms each, R-0008). One merged image cannot hold the q8 GEMV entries (`merged_image`); a full-ELF configuration (`compose_elf.py`, 0.3-0.7 ms a set change) is the lever |
+| `lx1` / `ax1` (8 routed experts, host shared expert beside) | 40 | 0.46 | 15.3 | 33 GB/s | per expert the hidden h makes a DDR round trip between up / gate and down (about 8 us each, R-0012) |
+| `lm` (q8 head) | 1 | 10.3 | 516 | 50 GB/s | at its floor |
+| host | | 0.4-0.6 | | | router read and patch; the q8 shared expert overlaps `lx1` / `ax1` |
+
+Sum of minima 85 ms against a 56 ms stream floor (1.5x); the means on the busy Strix Halo box were 145 ms (the
+iGPU of another session at 93-99 %), and Strix Point in performance mode 101-110 ms. Past 32k the attention walk
+in `ax0` dominates and is compute-bound (0.37 us a row a full layer).
+
+Prefill at 4,096 tokens (Strix Halo, after OPEN-MOE-PIPE and OPEN-DN-FUSED, 5.6 ms a token): the token-batched
+experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
+sub-tiles, `moe_batch.h`), the DeltaNet conv and delta rule on the host 0.77 ms (the NPU kernel for them is not
+written), GEMM waits 0.5 ms, the layer tails (residual, norms, router) 0.4 ms, attention 0.1 ms. Long context:
+`attn_fa256` runs 7.7 us a 64-key chunk against a 3.35 us transfer floor (plan `qwen36moe-attn-fa256.md`).
+
+Vision: the tower on the host, 3.7-4.0 s for 3,200 patches (a 1280 x 640 image, 800 tokens) on a busy box, under
+the text prefill of the same prompt (about 4.7 s), so its GEMMs stay on the CPU (AVX-512, OPEN-VISION-BLOCK).
 
 **Host stages, decode:** router read and stream patch 0.2-0.3 ms a token; the q8 shared expert about 10 ms a token
 of host time, hidden behind the routed MoE dispatch (107.0 ms with the overlap against 112.7 ms without);
@@ -9144,7 +9171,9 @@ compiles `block_host.cpp` with `-ffp-contract=off`, as phlegm's bridge build doe
 Single thread, min of 25 blocks: conv phase 11.1-14.6 -> 4.9-6.5 ms, rule 27.4-34.0 -> 19.9-25.3 ms. In the model
 (Strix Halo, 4,096-token block prefill, alternating): DeltaNet host 1.05 / 1.21 -> 0.86 / 0.77 ms a token, prefill
 24.4 / 26.4 -> 23.8 / 23.0 s. KL gate (8 x 512 against llama.cpp CPU): mean 0.0278, median 0.0085, same top 93.0 %
-(0.0275 / 0.0080 / 93.4 % before; this text's CPU-vs-Vulkan spread not yet measured).
+(0.0275 / 0.0080 / 93.4 % before). Against llama.cpp Vulkan on the same text (`build-vk`, Mesa RADV, the Strix
+Halo iGPU): mean 0.0241, median 0.0066, same top 93.4 %, PPL 6.254 against 6.239; llama.cpp's own CPU against
+Vulkan there: mean 0.0269, median 0.0077, same top 92.9 %. The NPU sits inside the backends' spread.
 
 ### OPEN-PREFILL-ATTN: the block attention's products on the NPU
 **Applies to:** openflowlm-next (`open_kernels/designs/attn_block/`, `open_kernels/recipes/{qwen36moe,dense}.py`, `src/open_qwen36/{manifest,block_host,core}.cpp`, `utilities/dense-decode-probe/attn_route_check.py`)

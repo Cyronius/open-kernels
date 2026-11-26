@@ -21,7 +21,7 @@ Update this file in the same commit as the evidence. Each model's full audit is 
 | Gemma 4 E2B / E4B | done for E4B text (#238); E2B not rerun | open (unprofiled; prefill fell 85 to 62 tok/s) | open (32k once, not repeated) | open (towers refused) | open (Unsloth MTP, prompt lookup) | open (Google QAT Q4_0; Unsloth reason to record) | [planned](specs/open-engine/plans/gemma4e-production-bar.md); vision, video, audio not open |
 | BERT embeddings (bge x3, minilm, nomic, gte) | ? | ? | ? | ? | n/a | ? | not started |
 | whisper-v3:turbo | ? | ? | ? | open (decoder on host) | ? | ? | not started |
-| qwen3.6-moe:35b-a3b | done (layer-major block route; image prompts too) | open (profiled and named; MoE passes pipelined, DeltaNet host fused; decode 1.8x its stream floor) | done (needle at 262,000; `attn_fa256` 6x at 262k) | done (host stages named; vision tower on the host) | done (MTP head + two-row verify, 1.24-1.40x) | done (Unsloth UD-Q4_K_S, q8 projections kept) | open: near optimal ([audit](specs/open-engine/spec.md), OPEN-FAMILY-QWEN36MOE-GGUF) |
+| qwen3.6-moe:35b-a3b | done (layer-major block route; image prompts too) | done, rest named (MoE passes pipelined, DeltaNet host fused, `attn_fa256`; decode 1.5x its stream floor: lx / ax context switches, routed-expert round trips) | done (needle at 262,000; `attn_fa256` 6x at 262k) | done (host stages named; vision tower on the host) | done (MTP head + two-row verify, 1.24-1.40x) | done (Unsloth UD-Q4_K_S, q8 projections kept) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-QWEN36MOE-GGUF); benches are development runs |
 | gpt-oss:20b | done (`attn_fa_gx` to 131k) | done, rest named (decode 82-84 ms short; 409 ms a step at 131k, compute-bound over a 170 ms stream floor) | done (needle at 130,500) | done (host stages named) | done (measured rejection: prompt lookup, DFlash) | done (ggml-org MXFP4 GGUF) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GPTOSS); bench is a development run |
 | qwen3.5:4b (or :9b) | ? | open (prefill numbers) | open | ? | open | open | not started |
 | Ternary Bonsai 2 27B | ? | ? | open (8k of 262k) | ? | done (DFlash 2 + lookup) | open (reads PQ2_0 via q4nx-build) | not started; work not on main |
@@ -102,8 +102,9 @@ Plans: [qwen36moe-production-bar.md](specs/open-engine/plans/qwen36moe-productio
 - Speed (Strix Point, Windows, performance mode, `phlegm bench --development`, 2026-11-24): prefill 156 / 180 / 188 /
   188 tok/s and decode 9.1 / 8.9 / 8.6 / 8.1 tok/s at 512 / 1k / 2k / 4k; with `attn_fa256` 4k 218 tok/s, 32k 193,
   262k 107 (CLI). Strix Halo, Linux, Default power mode on a shared box: see the audit.
-- Open: near optimal. Decode streams at 36-41 GB/s against a 52 GB/s floor and the routed-expert dispatch is
-  latency-bound (named in the audit); the DeltaNet conv and delta rule and the vision tower are host stages.
+- Left, named in the audit: decode at 1.5x its 56 ms stream floor (20 lx / ax context switches a step, the routed
+  experts' h round trip, the q8 front at 38 GB/s); the DeltaNet conv and delta rule and the vision tower on the host;
+  the token-batched expert kernel core-bound at 8 tokens a visit; `attn_fa256` at 2.3x its transfer floor.
 - OFLM side: registry entry (Unsloth MTP GGUF, `UD-Q4_K_S`, qwen35moe, 262,144, mmproj and MTP drafter); `oflm add` /
   `serve` / `bench`; benchmark page; README row.
 

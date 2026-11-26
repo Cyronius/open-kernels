@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -33,7 +34,11 @@ body = {"messages": [{"role": "user", "content": text}], "max_tokens": 12, "temp
         "chat_template_kwargs": {"enable_thinking": False}}
 req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
 t = time.time()
-r = json.load(urllib.request.urlopen(req, timeout=36000))
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=36000))
+except urllib.error.HTTPError as e:
+    print(f"{N} tokens: HTTP {e.code} after {time.time() - t:.0f} s: {e.read().decode(errors='replace')[:500]}", flush=True)
+    sys.exit(1)
 ans = r["choices"][0]["message"]["content"]
 print(f"{N} tokens: answer {ans!r} {'PASS' if '58213' in ans else 'FAIL'}, {time.time() - t:.0f} s, usage {r.get('usage')}",
       flush=True)
