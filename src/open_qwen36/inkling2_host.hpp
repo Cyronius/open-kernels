@@ -67,6 +67,14 @@ public:
     virtual void read_grouped(bool, size_t, const ExpertRows&, float*) {}
     // Leave nothing in flight and release every lane, including after an error.
     virtual void finish_grouped() noexcept {}
+    // Overlapped groups through gate/up, SiTU (gate and up caps) and down in one launch per group, on lanes 0
+    // and 1 with start_grouped(false, lane) and wait_grouped(), for verify rows (last argument) or prefill.
+    // False keeps the two-launch groups.
+    virtual bool grouped_routed(const GgufFile&, const std::string&, const GgufFile&, const std::string&, float,
+                                float, bool) const { return false; }
+    virtual void stage_grouped_routed(const GgufFile&, const std::string&, const GgufFile&, const std::string&, size_t,
+                                      size_t, const ExpertIds&, const ExpertRows&, const float*) {}
+    virtual void read_grouped_routed(size_t, const ExpertRows&, float*) {}
     virtual bool block_experts_available() const { return false; }
     virtual bool dense_attention_available() const { return false; }
     virtual bool singleton_attention_available() const { return false; }

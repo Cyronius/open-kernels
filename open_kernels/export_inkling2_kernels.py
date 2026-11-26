@@ -30,6 +30,11 @@ def kernel_builds(wide_old_attention=False, head_pair=False, singleton_decode=Fa
                 INKLING2_COMPACT_FORMAT=quant, INKLING2_COMPACT_K=width,
                 INKLING2_COMPACT_TOKENS=16, INKLING2_COMPACT_ROWS=4,
                 INKLING2_COMPACT_SPLIT_SCALE=int(singleton_decode and quant == "q8"))
+        if singleton_decode:
+            # Gate/up, SiTU and down in one launch; reads the paired gate/up order of the singleton pools.
+            yield f"prefill-{quant}-moe", "inkling2/compact_decode.py", dict(
+                INKLING2_COMPACT_FORMAT=quant, INKLING2_COMPACT_K=1152, INKLING2_COMPACT_TOKENS=16,
+                INKLING2_COMPACT_ROWS=4, INKLING2_COMPACT_SPLIT_SCALE=int(quant == "q8"), INKLING2_COMPACT_MOE=1)
         for chunks in ATTENTION_CHUNKS:
             yield f"shared-{quant}-attention-{chunks}", "inkling2/shared_decode.py", dict(
                 INKLING2_SHARED_FORMAT=quant, INKLING2_SHARED_K=0, INKLING2_SHARED_CHUNKS=chunks)

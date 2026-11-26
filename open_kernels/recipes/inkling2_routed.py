@@ -215,6 +215,12 @@ def main():
         block_rows = 16 * check_formats(blocks) if blocks else 0
         if grouped and check_formats(grouped) != 4:
             raise ValueError("grouped prefill requires 32 worker cores")
+        if grouped and args.fused_experts:
+            # One-launch grouped experts share the core image of their format's up and down streams.
+            for name in FUSED_EXPERTS:
+                grouped[name] = args.grouped_blocks / f"prefill-{name}"
+                quant = name.split("-")[0]
+                check_image({leg: grouped[f"{quant}-{leg}"] for leg in ("up", "down", "moe")})
         if dense and check_image(dense) != 32:
             raise ValueError("Q8 dense projections require 32 worker cores")
         if vision_gemm and (check_image(vision_gemm) != 32 or check_image(vision_attention) != 32):
@@ -373,6 +379,7 @@ def main():
         }
         if args.fused_experts:
             manifest["singleton_decode"]["gate_up_order"] = GATE_UP_ORDER
+            manifest["prefill_fused_experts"] = True
         if args.split_prefill_q8:
             manifest["shared_prefill_q8"] = True
     if args.loop_controller:

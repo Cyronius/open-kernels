@@ -396,7 +396,7 @@ struct Layer {
     }
 
     Rows moe(const Rows& x, float route_scale, float gate_cap, float up_cap,
-             size_t layer, Inkling2ExpertProjector* projector) const {
+             size_t layer, Inkling2ExpertProjector* projector, bool verify = false) const {
         struct Routed { size_t token; float weight; };
         std::array<std::vector<Routed>, experts> by_expert;
         Rows scores = router.apply(x);
@@ -493,9 +493,10 @@ struct Layer {
                                          inner.data.data());
             };
             // Reduce in group order to keep each token's FP32 sum in expert order.
-            const auto finish_down = [&](size_t g) {
+            const auto finish_down = [&](size_t g, bool routed = false) {
                 const Group& group = groups[g];
-                projector->read_grouped(true, g & 1, group.counts, values.data.data());
+                if (routed) projector->read_grouped_routed(g & 1, group.counts, values.data.data());
+                else projector->read_grouped(true, g & 1, group.counts, values.data.data());
                 size_t active = 0;
                 for (size_t slot = 0; slot < group.slots; ++slot)
                     for (size_t row = 0; row < group.counts[slot]; ++row) live[active++] = slot * block_rows + row;
@@ -512,6 +513,26 @@ struct Layer {
                     }
                 }
             };
+            if (projector->grouped_routed(*gate_up.file, gate_up.name, *down.file, down.name, gate_cap, up_cap, verify)) {
+                // One launch per group: stage g + 1 and reduce g while g runs.
+                const auto stage = [&](size_t g) {
+                    const Group& group = groups[g];
+                    for (size_t slot = 0; slot < group.slots; ++slot)
+                        for (size_t row = 0; row < group.counts[slot]; ++row)
+                            std::copy_n(x[group.routes[slot][row].token], hidden, input[slot * block_rows + row]);
+                    projector->stage_grouped_routed(*gate_up.file, gate_up.name, *down.file, down.name, layer, g & 1,
+                                                    group.ids, group.counts, input.data.data());
+                };
+                stage(0);
+                projector->start_grouped(false, 0);
+                for (size_t g = 0; g < group_count; ++g) {
+                    if (g + 1 < group_count) stage(g + 1);
+                    projector->wait_grouped();
+                    if (g + 1 < group_count) projector->start_grouped(false, (g + 1) & 1);
+                    finish_down(g, true);
+                }
+                return out;
+            }
             stage_up(0);
             projector->start_grouped(false, 0);
             if (group_count > 1) stage_up(1);
@@ -885,7 +906,7 @@ struct Inkling2Host::Impl {
             }
             f = std::move(projected);
         } else {
-            f = l.moe(f, route_scale, gate_cap, up_cap, i, expert_projector.get());
+            f = l.moe(f, route_scale, gate_cap, up_cap, i, expert_projector.get(), verify_dense);
         }
         f = l.conv[3].run(f, nullptr, next.conv[3], tape(3));
         for (size_t j = 0; j < a.data.size(); ++j) a.data[j] += f.data[j];

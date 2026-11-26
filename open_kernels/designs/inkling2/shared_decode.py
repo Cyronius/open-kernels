@@ -318,6 +318,6 @@ SPECIALIZE = {
     "source_hash": int(hashlib.sha256(IQ4_NL_VALUES.tobytes() + os.environ.get("INKLING2_SHARED_NULL", "").encode()
                                       + b"".join(p.read_bytes() for p in (
         HERE / "shared_decode.cc", HERE / "block_expert.cc", HERE / "iq4_lut.h", HERE / "relative_attention.cc",
-        HERE.parents[1] / "include/vecmath.h", HERE.parents[1] / "recipes/inkling2_attention.py",
+        HERE.parents[1] / "include/vecmath.h", HERE.parents[1] / "recipes/inkling2_attention.py", HERE / "situ.h",
     ))).hexdigest()[:8], 16),
 }

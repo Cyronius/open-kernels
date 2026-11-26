@@ -550,6 +550,15 @@
         "src/open_qwen36/pools.cpp": "44f0ebf75769034466fde17294b9e87b3d5bd0c014480918786a175a2294802c",
         "src/open_qwen36/pools.hpp": "a9e6bdf323d7cc4d2a2fff42cbb5def37cdc5b04c982a07232834e721c22be87"
       }
+    },
+    {
+      "id": "inkling2-fused-grouped-verify-experts",
+      "origin": "open-kernels: verify rows run one grouped launch per group with core SiTU (manifest prefill_fused_experts, streams prefill-iq4-moe and prefill-q8-moe), bit-equal per row to the fused singleton decode; prefill keeps two launches per group",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "8281492288dd60590a9cf20efd00b5e2118ce66f891b747e86a360c423f2169f",
+        "src/open_qwen36/inkling2_host.cpp": "bcef49766d407cccfdf875f997e92fa386ee9cf54a3c3252848bb1ab3648dc87",
+        "src/open_qwen36/inkling2_host.hpp": "10f9b6d220e39c17462faa1d6195f09a31cf17667722a0bdc9317b15f9281b1b"
+      }
     }
   ]
 }

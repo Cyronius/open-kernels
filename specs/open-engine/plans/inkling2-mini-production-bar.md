@@ -5333,8 +5333,18 @@ host SiTU, gate/up readback or down-input pack between them.
   removed, device wait 57.1 to 52.6 ms, configure 1.3 to 0.7 ms. Remaining MoE host work is about 5 ms (routing
   2.4 ms, one token pack, the 8-row readback, finite check, unpack and weighted sum). Prefill is unchanged (same
   bits; 39.9 to 40.8 s for 896 tokens in all four runs). Each route repeated its decode logits bit for bit.
-- Open: speculative verify still uses grouped experts with host SiTU, so verify and direct decode no longer share
-  expert arithmetic (OPEN-SPEC-DSPARK's exactness checks need a rerun); grouped prefill keeps host SiTU.
+- Verify rows. With fused decode, partial accept failed 16 of 20 cases: IQ4_NL verify rows used grouped experts with
+  host SiTU (Q8_0 rows already verify one by one on the singleton stream). The grouped image now has
+  `prefill-{iq4,q8}-moe`: one launch per group of 8 slots x 16 rows with the same core SiTU code (`situ.h`, shared
+  with the singleton kernel) and the same down-input pack per row, through the same DDR hand-off. Padded rows need no
+  mask: their packed input gives zero gate/up, and the core writes the padding the host would. Manifest key
+  `prefill_fused_experts`. Grouped text 11,328 B (IQ4_NL) and 10,560 B (Q8_0) of 16,384; singleton 15,696 B.
+- Grouped fixture: 168 of 168 IQ4_NL slot rows (1, 4 and 16 rows per slot) matched the fused singleton launch bit for
+  bit. Partial accept 20 of 20 and the DSpark forced-acceptance matrix 18 of 18 (rollback, and verify against direct
+  decode including the next draft and target rows), with no environment override. Short greedy parity 64 of 64.
+- Prefill: with the fused group in prefill too, 1,024-token prefill took 21.73 / 20.87 s against 20.49 / 20.43 s
+  (clean, both orders), so prefill keeps two launches per group and only verify rows use the fused group. On that
+  route the 896 + 256 logits match the integration bundle bit for bit in prefill and decode.
 
 ## Rebuild the v11 kernel bundle
 

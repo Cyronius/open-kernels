@@ -139,63 +139,29 @@ struct CompactStream {
     }
 };
 
-struct CompactFormat {
-    xrt::hw_context context;
-    xrt::kernel kernel;
-    std::vector<CompactStream> streams;
-
-    CompactFormat(xrt::device& device, const std::filesystem::path& root, const char* prefix, size_t rows,
-                  bool iq4, bool grouped, const xrt::kernel* singleton = nullptr, bool shared_q8 = false) {
-        const std::string name = std::string(prefix) + (iq4 ? "-iq4" : "-q8");
-        if (singleton) {
-            kernel = *singleton;
-        } else {
-            const xrt::xclbin image((root / (name + ".xclbin")).string());
-            context = xrt::hw_context(device, device.register_xclbin(image));
-            kernel = xrt::kernel(context, "MLIR_AIE");
-        }
-        const auto group = kernel.group_id(1);
-        const bool split_scale = (singleton || shared_q8) && !iq4;
-        streams.reserve(2);
-        streams.emplace_back(device, group, root / (name + "-up.bin"), rows, width, iq4, grouped, width, split_scale);
-        streams.emplace_back(device, group, root / (name + "-down.bin"), rows, expert_width, iq4, grouped, width, split_scale);
-    }
-};
-
-struct SingletonStream {
-    shared_dense::Shape shape;
-    xrt::bo instruction;
-    size_t count;
-
-    SingletonStream(const xrt::device& device, uint32_t group, const std::filesystem::path& path, shared_dense::Shape role)
-        : shape(role) {
-        const auto words = read_stream(path);
-        shared_dense::check_stream(words, {shape.weight_bytes(), shape.input_bytes(), shape.output_bytes()});
-        count = words.size();
-        instruction = xrt::bo(device, count * sizeof(uint32_t), xrt::bo::flags::cacheable, group);
-        std::memcpy(instruction.map<void*>(), words.data(), count * sizeof(uint32_t));
-        instruction.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    }
-};
-
-// One launch for a decode visit: gate/up, SiTU on the cores, and down, for the 8 routed experts.
-// Buffers: gate/up pool, one packed token, down pool, then [down output of all slots | SiTU wire].
+// One launch for 8 routed experts: gate/up, SiTU on the cores, and down. Singleton decode sends one
+// token row to every column; grouped prefill and verify send 16 rows per slot.
+// Buffers: gate/up pool, packed rows, down pool, then [down output of all slots | SiTU wire].
 struct FusedExpertStream {
-    static constexpr size_t wire_bytes = shared_dense::workers * 3 * shared_dense::activations * shared_dense::tile * sizeof(float);
-    static constexpr size_t output_bytes = slots * (width * shared_dense::activations * sizeof(float) + wire_bytes);
+    static constexpr size_t output_bytes(size_t rows) {
+        return slots * (width * rows + shared_dense::workers * 3 * rows * shared_dense::tile) * sizeof(float);
+    }
     xrt::bo instruction;
-    size_t count = 0, up_bytes = 0, up_stride = 0, down_bytes = 0, down_stride = 0;
+    size_t count = 0, up_bytes = 0, up_stride = 0, down_bytes = 0, down_stride = 0, rows = 0;
     // Instruction words that take each column's expert offset, in the up and down pools.
     std::vector<std::pair<size_t, size_t>> up_fills, down_fills;
 
-    FusedExpertStream(const xrt::device& device, uint32_t group, const std::filesystem::path& path, bool iq4) {
+    FusedExpertStream(const xrt::device& device, uint32_t group, const std::filesystem::path& path, bool iq4,
+                      bool split, size_t token_rows) : rows(token_rows) {
         const auto words = read_stream(path);
-        const bool split = !iq4;
         up_bytes = block_layout::weight_bytes(iq4, width, width, split);
         down_bytes = block_layout::weight_bytes(iq4, width, expert_width, split);
         up_stride = (up_bytes + 4095) / 4096 * 4096;
         down_stride = (down_bytes + 4095) / 4096 * 4096;
-        const size_t token_bytes = block_layout::input_bytes(block_layout::decode_tile_m, width);
+        const size_t tile_rows = std::max(rows, block_layout::decode_tile_m);
+        const size_t token_bytes = block_layout::input_bytes(tile_rows, width);
+        // Singleton decode packs its one row once for every column.
+        const bool shared_token = rows == 1;
         std::array<size_t, 4> patches{};
         size_t bd = 0;
         for (size_t at = 4; at < words.size(); at += stream_patch::op_len(words[at])) {
@@ -213,9 +179,9 @@ struct FusedExpertStream {
                 valid = length == bytes && offset == fills.size() * bytes;
                 fills.emplace_back(at + 10, fills.size());
             } else if (arg == 1) {
-                valid = offset == 0 && length == token_bytes;
+                valid = length == token_bytes && offset == (shared_token ? 0 : patches[1] * token_bytes);
             } else if (valid) {
-                valid = offset + length <= output_bytes;
+                valid = offset + length <= output_bytes(tile_rows);
             }
             if (!valid) fail("fused expert DMA does not match the model dimensions in " + path.string());
             ++patches[arg];
@@ -225,6 +191,57 @@ struct FusedExpertStream {
         count = words.size();
         instruction = xrt::bo(device, count * sizeof(uint32_t), xrt::bo::flags::cacheable, group);
         std::memcpy(instruction.map<void*>(), words.data(), count * sizeof(uint32_t));
+    }
+
+    void patch(const std::array<size_t, slots>& ids) {
+        auto* words = instruction.map<uint32_t*>();
+        for (const auto& [word, slot] : up_fills) words[word] = static_cast<uint32_t>(ids[slot] * up_stride);
+        for (const auto& [word, slot] : down_fills) words[word] = static_cast<uint32_t>(ids[slot] * down_stride);
+        instruction.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+};
+
+struct CompactFormat {
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    std::vector<CompactStream> streams;
+    std::unique_ptr<FusedExpertStream> fused;
+
+    CompactFormat(xrt::device& device, const std::filesystem::path& root, const char* prefix, size_t rows,
+                  bool iq4, bool grouped, const xrt::kernel* singleton = nullptr, bool shared_q8 = false,
+                  bool with_fused = false) {
+        const std::string name = std::string(prefix) + (iq4 ? "-iq4" : "-q8");
+        if (singleton) {
+            kernel = *singleton;
+        } else {
+            const xrt::xclbin image((root / (name + ".xclbin")).string());
+            context = xrt::hw_context(device, device.register_xclbin(image));
+            kernel = xrt::kernel(context, "MLIR_AIE");
+        }
+        const auto group = kernel.group_id(1);
+        const bool split_scale = (singleton || shared_q8) && !iq4;
+        streams.reserve(2);
+        streams.emplace_back(device, group, root / (name + "-up.bin"), rows, width, iq4, grouped, width, split_scale);
+        streams.emplace_back(device, group, root / (name + "-down.bin"), rows, expert_width, iq4, grouped, width, split_scale);
+        if (with_fused)
+            fused = std::make_unique<FusedExpertStream>(device, group, root / (name + "-moe.bin"), iq4, split_scale,
+                                                        rows / slots);
+    }
+};
+
+struct SingletonStream {
+    shared_dense::Shape shape;
+    xrt::bo instruction;
+    size_t count;
+
+    SingletonStream(const xrt::device& device, uint32_t group, const std::filesystem::path& path, shared_dense::Shape role)
+        : shape(role) {
+        const auto words = read_stream(path);
+        shared_dense::check_stream(words, {shape.weight_bytes(), shape.input_bytes(), shape.output_bytes()});
+        count = words.size();
+        instruction = xrt::bo(device, count * sizeof(uint32_t), xrt::bo::flags::cacheable, group);
+        std::memcpy(instruction.map<void*>(), words.data(), count * sizeof(uint32_t));
+        instruction.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
 };
 
@@ -267,8 +284,8 @@ struct SingletonDecode {
         dense.emplace_back(device, group, root / "singleton-output.bin", shared_dense::output);
         if (moe) {
             fused.reserve(2);
-            fused.emplace_back(device, group, root / "singleton-iq4-moe.bin", true);
-            fused.emplace_back(device, group, root / "singleton-q8-moe.bin", false);
+            fused.emplace_back(device, group, root / "singleton-iq4-moe.bin", true, false, 1);
+            fused.emplace_back(device, group, root / "singleton-q8-moe.bin", false, true, 1);
         }
     }
 };
@@ -1223,6 +1240,12 @@ public:
                 fail("singleton decode requires an aligned v11 bundle");
             singleton_ = std::make_unique<SingletonDecode>(device_, root_, info.at("singleton_decode"), attention_tiers);
             paired_gate_up_ = !singleton_->fused.empty();
+            grouped_fused_ = info.value("prefill_fused_experts", false);
+            if (grouped_fused_ && (!paired_gate_up_ || !grouped_rows_))
+                fail("fused grouped experts need the paired singleton pools and grouped prefill");
+            for (const char* name : {"prefill-iq4-moe", "prefill-q8-moe"})
+                if (grouped_fused_ && info.at("gguf").at("kernels").at(name).at("insts") != std::string(name) + ".bin")
+                    fail("invalid fused grouped expert stream path");
             if (paired_gate_up_ && (block_rows_ || decode_core_rows_ != block_layout::worker_rows))
                 fail("fused singleton experts need grouped prefill and four expert core rows");
         }
@@ -1259,7 +1282,8 @@ public:
                                                          block_layout::input_bytes(max_rows, width), dense_input})));
         output_ = xrt::ext::bo(device_, padded_bo(std::max({head ? head_rows * head_tokens : values,
                                                           max_rows * width, dense_output,
-                                                          FusedExpertStream::output_bytes / sizeof(float)}) * sizeof(float)));
+                                                          FusedExpertStream::output_bytes(block_layout::tile_m) / sizeof(float)})
+                                                * sizeof(float)));
     }
 
     void project(const GgufFile& file, const std::string& tensor, size_t layer, bool down,
@@ -1335,7 +1359,8 @@ public:
         // Create contexts and buffers, and upload weights, with nothing in flight.
         if (cold) settle();
         if (!format)
-            format = std::make_unique<CompactFormat>(device_, root_, "prefill", slots * grouped_rows_, iq4, true, nullptr, split);
+            format = std::make_unique<CompactFormat>(device_, root_, "prefill", slots * grouped_rows_, iq4, true, nullptr, split,
+                                                     grouped_fused_);
         auto& stream = format->streams[down];
         auto& lane = lane_at((down ? 2 : 0) + index);
         if (&lane == overlap_flight_ || lane.done) fail("an overlapped expert lane is still in use");
@@ -1352,6 +1377,8 @@ public:
         lane.input.sync(XCL_BO_SYNC_BO_TO_DEVICE, slots * a_bytes, 0);
         // The stream takes these expert addresses in launch(), between launches.
         lane.patch = &stream;
+        lane.fused = nullptr;
+        lane.down_weights = nullptr;
         lane.ids = ids;
         lane.instruction = stream.instruction;
         lane.kernel = &format->kernel;
@@ -1378,6 +1405,77 @@ public:
         const float* result = fetch(lanes_[(down ? 2 : 0) + index]);
         block_layout::unpack_grouped_output(result, counts.data(), slots, grouped_rows_, decode_core_rows_, width,
                                             output, paired_gate_up_ && !down);
+    }
+
+    bool grouped_routed(const GgufFile& gate_up_file, const std::string& gate_up, const GgufFile& down_file,
+                        const std::string& down, float gate_cap, float up_cap, bool verify) const override {
+        // Prefill keeps two launches per group: the fused group measured slower over 1,024 tokens.
+        if (!grouped_fused_ || separate_groups_ || (!verify && !fused_prefill_) || gate_cap != 4.0f || up_cap != 25.0f ||
+            !prefill_overlap_available())
+            return false;
+        const auto type = gate_up_file.tensor(gate_up).type;
+        return type == down_file.tensor(down).type &&
+               (type == GgufFile::Type::IQ4_NL || type == GgufFile::Type::Q8_0);
+    }
+
+    void stage_grouped_routed(const GgufFile& gate_up_file, const std::string& gate_up, const GgufFile& down_file,
+                              const std::string& down, size_t layer, size_t index, const ExpertIds& group,
+                              const ExpertRows& counts, const float* input) override {
+        if (failed_) fail("the previous dispatch failed; recreate the projector");
+        const auto& up_info = gate_up_file.tensor(gate_up);
+        const bool iq4 = up_info.type == GgufFile::Type::IQ4_NL;
+        if (index > 1 || layer >= layers || !counts.front() || up_info.dims != std::vector<uint64_t>{width, width, experts} ||
+            down_file.tensor(down).dims != std::vector<uint64_t>{expert_width, width, experts})
+            fail("unsupported fused expert group for " + gate_up);
+        const bool split = shared_prefill_q8_ && !iq4;
+        auto& format = block_formats_[iq4 ? 0 : 1];
+        auto& pools = split ? singleton_pools_ : compact_pools_;
+        auto& up_pool = pools[layer * 2];
+        auto& down_pool = pools[layer * 2 + 1];
+        bool cold = !format || !up_pool.bo || !down_pool.bo;
+        for (size_t slot = 0; slot < slots && !cold; ++slot)
+            cold = counts[slot] && (group[slot] >= experts || !up_pool.packed[group[slot]] || !down_pool.packed[group[slot]]);
+        // Create contexts and buffers, and upload weights, with nothing in flight.
+        if (cold) settle();
+        if (!format)
+            format = std::make_unique<CompactFormat>(device_, root_, "prefill", slots * grouped_rows_, iq4, true, nullptr,
+                                                     split, true);
+        auto& stream = *format->fused;
+        auto& lane = lane_at(index);
+        if (&lane == overlap_flight_ || lane.done) fail("an overlapped expert lane is still in use");
+        const size_t a_bytes = block_layout::input_bytes(grouped_rows_, width);
+        ExpertIds ids = group;
+        auto* activation = lane.input.map<uint8_t*>();
+        for (size_t slot = 0; slot < slots; ++slot) {
+            if (counts[slot]) {
+                pack_expert(up_pool, stream.up_bytes, stream.up_stride, gate_up_file, gate_up, iq4, width, ids[slot], split);
+                pack_expert(down_pool, stream.down_bytes, stream.down_stride, down_file, down, iq4, expert_width, ids[slot],
+                            split);
+            } else {
+                ids[slot] = ids.front();
+            }
+            block_layout::pack_input(input + slot * grouped_rows_ * width, counts[slot], grouped_rows_, width,
+                                     activation + slot * a_bytes);
+        }
+        lane.input.sync(XCL_BO_SYNC_BO_TO_DEVICE, slots * a_bytes, 0);
+        lane.patch = nullptr;
+        lane.fused = &stream;
+        lane.down_weights = &down_pool.bo;
+        lane.ids = ids;
+        lane.instruction = stream.instruction;
+        lane.kernel = &format->kernel;
+        lane.weights = &up_pool.bo;
+        lane.count = stream.count;
+        lane.floats = slots * grouped_rows_ * width;
+        lane.tensor = "fused experts " + down;
+        lane.expert = true;
+        lane.staged = true;
+    }
+
+    void read_grouped_routed(size_t index, const ExpertRows& counts, float* output) override {
+        if (index > 1) fail("invalid overlapped expert lane");
+        const float* result = fetch(lanes_[index]);
+        block_layout::unpack_grouped_output(result, counts.data(), slots, grouped_rows_, decode_core_rows_, width, output);
     }
 
     void finish_grouped() noexcept override { release_lanes(); }
@@ -1626,7 +1724,8 @@ public:
         const bool split = shared_prefill_q8_ && !iq4;
         auto& format = block_formats_[iq4 ? 0 : 1];
         if (!format)
-            format = std::make_unique<CompactFormat>(device_, root_, "prefill", slots * grouped_rows_, iq4, true, nullptr, split);
+            format = std::make_unique<CompactFormat>(device_, root_, "prefill", slots * grouped_rows_, iq4, true, nullptr, split,
+                                                     grouped_fused_);
         project_packed_group(*format, file, tensor, layer, down, iq4, cols, grouped_rows_, ids, counts, input, output, split);
         return true;
     }
@@ -1736,6 +1835,8 @@ private:
                                          lane.input.map<uint8_t*>(), true);
                 lane.input.sync(XCL_BO_SYNC_BO_TO_DEVICE, input_bytes, 0);
                 lane.patch = nullptr;
+                lane.fused = nullptr;
+                lane.down_weights = nullptr;
                 lane.instruction = stream.instruction;
                 lane.kernel = &dense_->kernel;
                 lane.weights = &weights;
@@ -1843,10 +1944,7 @@ private:
         // Every column reads the same packed token.
         block_layout::pack_input(input, 1, block_layout::decode_tile_m, width, input_.map<uint8_t*>());
         input_.sync(XCL_BO_SYNC_BO_TO_DEVICE, block_layout::input_bytes(block_layout::decode_tile_m, width), 0);
-        auto* words = stream.instruction.map<uint32_t*>();
-        for (const auto& [word, slot] : stream.up_fills) words[word] = static_cast<uint32_t>(ids[slot] * stream.up_stride);
-        for (const auto& [word, slot] : stream.down_fills) words[word] = static_cast<uint32_t>(ids[slot] * stream.down_stride);
-        stream.instruction.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        stream.patch(ids);
         const auto* result = dispatch(singleton_->kernel, stream.instruction, stream.count, up_pool.bo, input_,
                                       &down_pool.bo, output_, slots * block_layout::decode_tile_m * width,
                                       "fused experts " + down);
@@ -2087,6 +2185,12 @@ private:
     bool shared_prefill_q8_ = false;
     // Gate/up pools use the paired order of the fused singleton stream, and so does every reader of them.
     bool paired_gate_up_ = false;
+    // Grouped prefill and verify have a fused gate/up, SiTU and down stream (manifest prefill_fused_experts).
+    bool grouped_fused_ = false;
+    // Test-only: keep the two-launch grouped experts on a bundle that has the fused stream.
+    const bool separate_groups_ = std::getenv("INKLING2_TEST_SEPARATE_GROUPS") != nullptr;
+    // Test-only: prefill blocks also use the fused groups.
+    const bool fused_prefill_ = std::getenv("INKLING2_TEST_FUSED_PREFILL_GROUPS") != nullptr;
     // Test-only: keep the two-launch decode experts on a bundle that has the fused stream.
     const bool separate_experts_ = std::getenv("INKLING2_TEST_SEPARATE_EXPERTS") != nullptr;
     size_t block_rows_ = 0, grouped_rows_ = 0, decode_core_rows_ = 0;
@@ -2115,6 +2219,9 @@ private:
         const xrt::bo* weights = nullptr;
         // An expert stream whose weight fills take `ids` at launch. Dense streams need no patch.
         const CompactStream* patch = nullptr;
+        // A fused group also takes the down pool and patches both pools at launch.
+        FusedExpertStream* fused = nullptr;
+        const xrt::bo* down_weights = nullptr;
         ExpertIds ids{};
         size_t count = 0, floats = 0;
         std::string tensor;
@@ -2173,13 +2280,15 @@ private:
                 words[word] = static_cast<uint32_t>(lane.ids[within / lane.patch->bytes] * lane.patch->stride);
             lane.instruction.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
+        if (lane.fused) lane.fused->patch(lane.ids);
         xrt::run next(*lane.kernel);
         next.set_arg(0, 3);
         next.set_arg(1, lane.instruction);
         next.set_arg(2, static_cast<int>(lane.count));
         next.set_arg(3, *lane.weights);
         next.set_arg(4, lane.input);
-        next.set_arg(5, lane.output);
+        if (lane.down_weights) next.set_arg(5, *lane.down_weights);
+        next.set_arg(lane.down_weights ? 6 : 5, lane.output);
         lane.staged = false;
         overlap_run_ = std::move(next);
         overlap_flight_ = &lane;

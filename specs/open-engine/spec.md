@@ -6347,6 +6347,11 @@ With the field, every gate/up pool reader packs and unpacks core r's bands as ga
 on. The reader keeps two launches with host SiTU when the field is absent, the caps differ or the two expert
 tensors differ in type.
 
+The optional `prefill_fused_experts: true` field (with the paired order) adds `prefill-iq4-moe` and `prefill-q8-moe`:
+one launch per overlapped group of 8 slots x 16 rows, with the same core SiTU and down-input pack per row as the
+singleton stream. Verify rows on IQ4_NL layers then match direct decode bit for bit; Q8_0 layers verify row by row
+on the singleton stream because grouped Q8 keeps the one-scale prefill arithmetic.
+
 **Acceptance criteria:** A contiguous prompt and a prompt split across block boundaries preserve the committed
 visit state and match the reference within the measured route tolerances. Report host stages and device timings
 separately during prefill and single-token decode. Verify long prefixes, the sliding boundary and incomplete tails.
