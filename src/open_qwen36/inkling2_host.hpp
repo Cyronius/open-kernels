@@ -83,6 +83,12 @@ public:
     virtual bool project_attention_inputs(const GgufFile&, size_t, size_t, const std::array<const float*, 3>&,
                                           const Inkling2AttentionProjections&) { return false; }
     virtual bool project_attention_output(const GgufFile&, size_t, size_t, const float*, float*) { return false; }
+    // Verify rows through the one-row decode kernels, several tokens a launch: each token's result is bit-equal
+    // to its own one-row launch. Zero when unavailable. The input variant needs one shared Q/K/V input.
+    virtual size_t singleton_rows() const { return 0; }
+    virtual bool project_attention_inputs_rows(const GgufFile&, size_t, size_t, const float*,
+                                               const Inkling2AttentionProjections&) { return false; }
+    virtual bool project_attention_output_rows(const GgufFile&, size_t, size_t, const float*, float*) { return false; }
     // Loop controllers first .. first + count - 1 (q, k, v, ffn) of a core layer over token rows:
     // out[n] = x[n] updated from message[n]. out[n] may equal x[n]. False selects the host route.
     virtual bool apply_loop_controllers(const GgufFile&, size_t, size_t, size_t, size_t, float,

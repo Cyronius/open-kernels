@@ -1612,6 +1612,27 @@ public:
         return true;
     }
 
+    size_t singleton_rows() const override { return singleton_ && dense_ ? shared_dense::activations : 0; }
+
+    bool project_attention_inputs_rows(const GgufFile& file, size_t layer, size_t rows, const float* input,
+                                       const Inkling2AttentionProjections& out) override {
+        if (!singleton_rows() || rows > singleton_rows()) return false;
+        using namespace attention_layout;
+        project_singleton_rows(file, layer, 0, rows, input, {
+            {"attn_q", q_width, 0, out.query}, {"attn_k", kv_width, 1, out.key}, {"attn_v", kv_width, 2, out.value},
+            {"attn_gate", q_width, 0, out.gate}, {"attn_rel", heads * relative_dim, 0, out.relative},
+            {"attn_sink_proj", heads, 0, out.sinks},
+        });
+        return true;
+    }
+
+    bool project_attention_output_rows(const GgufFile& file, size_t layer, size_t rows, const float* input,
+                                       float* output) override {
+        if (!singleton_rows() || rows > singleton_rows()) return false;
+        project_singleton_rows(file, layer, 1, rows, input, {{"attn_output", width, 0, output}});
+        return true;
+    }
+
     bool apply_loop_controllers(const GgufFile& file, size_t layer, size_t first, size_t count, size_t rows, float eps,
                                 const float* const* x, const float* const* message, float* const* out) override {
         using namespace controller_layout;
@@ -1887,6 +1908,27 @@ private:
                                       shape.output_bytes() / sizeof(float), "singleton dense");
         const bool separate = input[0] != input[1] || input[0] != input[2];
         shared_dense::unpack_parts(shape, result, separate, parts);
+    }
+
+    // `rows` tokens of one shared input in the activation rows of one singleton launch. The kernel's rows are
+    // independent (per-row activation scales and integer dots), so each token matches its one-row launch.
+    void project_singleton_rows(const GgufFile& file, size_t layer, size_t role, size_t rows, const float* input,
+                                std::initializer_list<shared_dense::Part> parts) {
+        auto& weights = singleton_->weights.at(layer).at(role);
+        const auto& stream = singleton_->dense.at(role);
+        const auto shape = stream.shape;
+        if (failed_) fail("the previous dispatch failed; recreate the projector");
+        if (!weights) {
+            auto packed = xrt::ext::bo(device_, padded_bo(shape.weight_bytes()));
+            shared_dense::pack_dense(file, layer, shape, parts, packed.map<uint8_t*>());
+            packed.sync(XCL_BO_SYNC_BO_TO_DEVICE, shape.weight_bytes(), 0);
+            weights = std::move(packed);
+        }
+        shared_dense::pack_token_rows(shape, input, rows, input_.map<uint8_t*>());
+        input_.sync(XCL_BO_SYNC_BO_TO_DEVICE, shape.input_bytes(), 0);
+        const auto* result = dispatch(singleton_->kernel, stream.instruction, stream.count, weights,
+                                      shape.output_bytes() / sizeof(float), "singleton dense");
+        for (size_t token = 0; token < rows; ++token) shared_dense::unpack_token_row(shape, result, token, parts);
     }
 
     void project_dense(const GgufFile& file, size_t layer, dense_layout::Role role, size_t count, const float* input,

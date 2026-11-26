@@ -574,6 +574,16 @@
       "files": {
         "src/open_qwen36/inkling2_npu.cpp": "ec9fe0efe1bfa4f28188ef98d5d8bde2e6b9af7514c3308b3567830cf21a1f83"
       }
+    },
+    {
+      "id": "inkling2-verify-singleton-rows",
+      "origin": "open-kernels: verify passes put up to four tokens of a shared input (and every attention output) in the activation rows of one singleton dense launch, and run the routed experts row by row on the singleton fused launch instead of the grouped image (INKLING2_TEST_GROUPED_VERIFY); each row stays bit-equal to decode",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "16c54174dfae473d1be1e0247bccab5f0343ad91235fe3c3a777b1aa86ea8cd1",
+        "src/open_qwen36/inkling2_host.cpp": "96981c4968ac1bb88662d45789af98eee9c4aa188c7f4277a6f538626c1877da",
+        "src/open_qwen36/inkling2_host.hpp": "7c73d9394765f2c80dfe015e1522308694e98c04108b4f9b7bd1b238ff976c48",
+        "src/open_qwen36/inkling2_singleton_io.hpp": "4d7d58db3916b4a224e3fd51cd3ec008494bbc1219b01346a81d52771c6062b7"
+      }
     }
   ]
 }

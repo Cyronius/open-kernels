@@ -112,6 +112,33 @@ inline void pack_inputs(Shape shape, const std::array<const float*, 3>& inputs,
     for (size_t col = 1; col < columns; ++col) std::memcpy(destination + col * bytes, destination, bytes);
 }
 
+// Several tokens of one shared input, one activation row each (at most `activations`).
+inline void pack_token_rows(Shape shape, const float* values, size_t tokens, uint8_t* destination) {
+    if (!tokens || tokens > activations) fail("bad singleton token row count");
+    block::pack_input(values, tokens, activations, shape.inputs, destination, true);
+    const size_t bytes = shape.input_bytes() / columns;
+    for (size_t col = 1; col < columns; ++col) std::memcpy(destination + col * bytes, destination, bytes);
+}
+
+// The outputs of activation row `token` into each part's row `token` (parts hold token-major rows).
+inline void unpack_token_row(Shape shape, const float* source, size_t token, std::initializer_list<Part> parts) {
+    constexpr size_t lanes = 8, frame = activations * tile;
+    size_t at = 0;
+    for (const auto& part : parts) {
+        if (part.outputs % lanes || part.outputs > shape.outputs() - at || token >= activations)
+            fail("bad dense output part");
+        float* destination = part.destination + token * part.outputs;
+        for (size_t row = 0; row < part.outputs; row += lanes) {
+            const size_t output_row = at + row, group = output_row / tile;
+            const size_t col = group % columns, worker = group / columns % workers, band = group / (columns * workers);
+            const size_t wire_frame = (col * shape.bands + band) * workers + worker;
+            const size_t offset = wire_frame * frame + (output_row % tile / lanes * activations + token) * lanes;
+            std::copy_n(source + offset, lanes, destination + row);
+        }
+        at += part.outputs;
+    }
+}
+
 inline void unpack_parts(Shape shape, const float* source, bool separate, std::initializer_list<Part> parts) {
     constexpr size_t lanes = 8, frame = activations * tile;
     size_t at = 0;

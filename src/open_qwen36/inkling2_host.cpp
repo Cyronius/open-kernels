@@ -4,6 +4,7 @@
 #include "open_qwen36/q4nx_file.hpp"  // bf16 conversions
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cmath>
 #include <numeric>
@@ -802,7 +803,15 @@ struct Inkling2Host::Impl {
             const float* q_data = q_input.data.data();
             const std::array<const float*, 3> normalized{q_data,
                 shared_input ? q_data : k_input.data.data(), shared_input ? q_data : v_input.data.data()};
-            if (match_singleton) {
+            const size_t batch = shared_input ? expert_projector->singleton_rows() : 0;
+            if (match_singleton && batch > 1) {
+                for (size_t t = 0; t < count; t += batch) {
+                    const size_t n = std::min(batch, count - t);
+                    if (!expert_projector->project_attention_inputs_rows(file, i, n, normalized[0] + t * hidden,
+                            {q[t], k[t], v[t], r[t], sinks[t], gate[t]}))
+                        fail("singleton verification input projection is unavailable");
+                }
+            } else if (match_singleton) {
                 for (size_t t = 0; t < count; ++t) {
                     const std::array<const float*, 3> row{normalized[0] + t * hidden,
                         normalized[1] + t * hidden, normalized[2] + t * hidden};
@@ -871,7 +880,13 @@ struct Inkling2Host::Impl {
         Rows attention_output;
         if (dense) {
             attention_output = Rows(x.count(), hidden);
-            if (match_singleton) {
+            const size_t batch = match_singleton ? expert_projector->singleton_rows() : 0;
+            if (batch > 1) {
+                for (size_t t = 0; t < x.count(); t += batch)
+                    if (!expert_projector->project_attention_output_rows(file, i, std::min(batch, x.count() - t), a[t],
+                                                                         attention_output[t]))
+                        fail("singleton verification output projection is unavailable");
+            } else if (match_singleton) {
                 for (size_t t = 0; t < x.count(); ++t)
                     if (!expert_projector->project_attention_output(file, i, 1, a[t], attention_output[t]))
                         fail("singleton verification output projection is unavailable");
@@ -897,7 +912,11 @@ struct Inkling2Host::Impl {
             if (!on_device) l.controller[3].apply(f, messages[3], eps);
         }
         norm(f, eps, l.ffn_norm);
-        if (match_singleton && l.gate_up.file->tensor(l.gate_up.name).type == GgufFile::Type::Q8_0) {
+        // Verify rows take the one-row fused expert launch of decode, row by row: the same bits as decode, and
+        // no switch to the grouped image (two context entries a visit). INKLING2_TEST_GROUPED_VERIFY keeps the
+        // grouped fused launch for IQ4_NL layers.
+        static const bool grouped_verify = std::getenv("INKLING2_TEST_GROUPED_VERIFY") != nullptr;
+        if (match_singleton && (!grouped_verify || l.gate_up.file->tensor(l.gate_up.name).type == GgufFile::Type::Q8_0)) {
             Rows projected(f.count(), hidden), row(1, hidden);
             for (size_t t = 0; t < f.count(); ++t) {
                 std::copy_n(f[t], hidden, row[0]);

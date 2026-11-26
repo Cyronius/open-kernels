@@ -127,7 +127,8 @@ def main():
     parser.add_argument("--wide-old-attention", action="store_true", help="include the experimental 4K/16K older-key streams")
     parser.add_argument("--reclaim-packed-keys", action="store_true",
                         help="release duplicate raw key pages on Windows with wide older-key attention")
-    parser.add_argument("--head-pair", action="store_true", help="include the two-row Q8 verification head")
+    parser.add_argument("--head-pair", action=argparse.BooleanOptionalAction, default=True,
+                        help="include the two-row Q8 verification head (halves the head time of verify passes)")
     parser.add_argument("--near-attention", action="store_true",
                         help="include the 256-row near-range block attention stream")
     parser.add_argument("--singleton-decode", action=argparse.BooleanOptionalAction, default=True,

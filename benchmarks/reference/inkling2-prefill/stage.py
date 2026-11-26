@@ -168,8 +168,12 @@ def instrument_npu(src):
                  '            perf::add(view.window ? perf::attention_sliding_dispatch : perf::attention_full_dispatch,\n'
                  '                      dispatch_start);\n'
                  '            perf::Measure merge{perf::attention_merge};')
-    npu = insert(npu, 'const Inkling2AttentionProjections& out) override {', '        perf::Measure measure{perf::dense_input};')
-    npu = insert(npu, 'const float* input,\n                                  float* output) override {', '        perf::Measure measure{perf::dense_output};')
+    anchor = 'const Inkling2AttentionProjections& out) override {'
+    npu = change_all(npu, anchor, anchor + '\n        perf::Measure measure{perf::dense_input};')
+    for anchor in ('const float* input,\n                                  float* output) override {',
+                   'const float* input,\n                                       float* output) override {'):
+        if anchor in npu:
+            npu = insert(npu, anchor, '        perf::Measure measure{perf::dense_output};')
     group_signature = 'ExpertIds ids, const ExpertRows& counts, const float* input, float* output'
     split_scale = ', bool split_scale = false'
     if group_signature + split_scale in npu:
