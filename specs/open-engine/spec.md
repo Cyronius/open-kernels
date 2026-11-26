@@ -1786,7 +1786,11 @@ measure unit, `OFLM_OPEN_STEP_TRACE=1`, 63 steps; bytes from the manifest's stre
 | `ln` + the two context changes of the tail | 1 | 0.20 | | | `lx0` after `lm` costs 2.75 ms against 1.15 in place: about 1.6 ms a step |
 | host | | 0.1 | | | router read and patch; the q8 shared expert overlaps the MoE dispatch |
 
-Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.24x / 1.31x). Before today the step
+Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.24x / 1.31x). A build with the main cores' GEMV and DeltaNet
+arithmetic compiled out and every DMA kept (`LX_NULL_GEMV=1 LX_NULL_DN=1`, timing only, 2026-11-26, two alternating
+rounds) steps in 73.1 / 73.4 ms against 74.5 / 74.3 (`lx0` 1.11 against 1.13 ms): the arithmetic is hidden, and what
+is left above the floor is the data movement -- the streams' issue order and waits, the hidden's round trips, the
+tail's two context changes -- not the cores. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
