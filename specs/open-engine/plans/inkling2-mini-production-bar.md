@@ -5445,6 +5445,34 @@ DSpark wins 3-8% on code and JSON and loses 4-17% elsewhere. Each extra verify r
 draft pays only above about 60% acceptance. Prompt lookup drafted rarely (37-141 drafts over 131-286 cycles) and was
 slower on every prompt. Both stay opt-in; the registry entry ships `speculative: off`.
 
+### Phlegm acceptance on Linux (2026-11-26)
+
+Phlegm: `~/code/phlegm-inkling2`, branch `feat/inkling2-phlegm` (handoff patch, the contraction fix, an
+`inkling2:mini` registry entry, Phlegm `origin/main` merged), open-kernels at `3485bfa`, bundle with the two-row head.
+
+- `phlegm run` (reasoning none): a one-sentence answer with a reasoning block.
+- `phlegm serve` (`serve_smoke.py`, max context 8,192): plain chat (17 x 23 = 391), streamed chat (87 chunks, separate
+  reasoning stream), a tool call (`get_weather` with `{"city": "Paris"}`, finish `tool_calls`) and its tool-result turn
+  ("14°C with rain"), image input (a 224 px red/blue split read as "Left: red; right: blue"), and reasoning effort
+  none, low and high (221 = 13 x 17). Effort `max` is rejected with HTTP 400: Phlegm's effort names stop at `xhigh`,
+  so the model's top level is not reachable through the OpenAI field.
+- 32K recall through `phlegm serve` (31,817 prompt tokens, key at 50% depth): exact (`ZIRCON-7429`), 542 s for the
+  request including 209 output tokens. A first try with a 64-token cap spent every token on reasoning (effort none
+  still reasons briefly) and returned no answer.
+- `phlegm bench --development` (block route, 6 threads, 1 warmup and 3 runs of 128 output tokens, NOISY, validated):
+
+| Input tokens | Prefill tok/s | Decode tok/s | First token ms |
+| ---: | ---: | ---: | ---: |
+| 512 | 35.90 | 3.45 | 14,261 |
+| 1,024 | 51.77 | 4.71 | 19,780 |
+| 2,048 | 44.30 | 3.60 | 46,228 |
+| 4,096 | 37.95 | 3.46 | 107,918 |
+
+  Driver: in-tree `amdxdna` (Linux 7.2.15-1-omarchy), NPU firmware 1.1.2.65 (`phlegm bench` needs
+  `--driver-version` on Linux). The release benchmark still needs a published Phlegm tag that carries the Inkling
+  adapter.
+- A SIGTERM'd `phlegm serve` leaves `/tmp/phlegm-npu.lock` behind; the next tool refuses to start until it is removed.
+
 ## Rebuild the v11 kernel bundle
 
 From the repository root, use the IRON Python environment with Peano and the XRT packaging tools
