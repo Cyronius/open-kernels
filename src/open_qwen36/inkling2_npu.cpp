@@ -921,6 +921,109 @@ struct Dense {
 };
 } // namespace dense_layout
 
+// Operand layouts of designs/inkling2/loop_controller.py; recipes/inkling2_controller.py packs the same.
+namespace controller_layout {
+constexpr size_t rows = 256, rank = 64, chunk = 32, chunks = width / chunk, object = 4096;
+constexpr size_t values = 2 * chunks * object, bytes = values * sizeof(uint16_t);
+constexpr size_t activation_floats = rows * 2 * width, output_floats = rows * width;
+constexpr size_t first_layer = 6, core_layers = 12;
+constexpr std::array<const char*, 4> kinds{"q", "k", "v", "ffn"};
+
+struct Program {
+    xrt::bo instruction;
+    size_t count = 0;
+
+    Program(const xrt::device& device, uint32_t group, const std::filesystem::path& path, size_t controllers) {
+        const auto words = read_stream(path);
+        const std::array<size_t, 3> spans{4 * bytes, controllers * activation_floats * sizeof(float),
+                                         controllers * output_floats * sizeof(float)};
+        std::array<size_t, 3> patches{};
+        for (size_t i = 4; i < words.size(); i += stream_patch::op_len(words[i])) {
+            if (words[i] != 0x81) continue;
+            if (i + 11 >= words.size()) fail("truncated DMA patch in " + path.string());
+            const size_t arg = words[i + 8], offset = words[i + 10];
+            if (arg >= spans.size() || words[i + 11] || offset >= spans[arg])
+                fail("controller DMA outside its buffer in " + path.string());
+            ++patches[arg];
+        }
+        // Four weight shims, and one activation fill and one drain for each column and controller.
+        if (patches != std::array<size_t, 3>{4, 8 * controllers, 8 * controllers})
+            fail("controller DMA does not match the stream in " + path.string());
+        count = words.size();
+        instruction = xrt::bo(device, count * sizeof(uint32_t), xrt::bo::flags::cacheable, group);
+        std::memcpy(instruction.map<void*>(), words.data(), count * sizeof(uint32_t));
+        instruction.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+};
+
+uint16_t exact_bf16(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if (bits & 0xffffu) fail("loop controller weights are not bf16 values");
+    return static_cast<uint16_t>(bits >> 16);
+}
+
+// One layer's four controllers in stream order: phase 1 [frame][k tile][z tile][8 k][8 z], then
+// phase 2 [chunk][gain, forget][z tile][h tile][8 z][8 h].
+void pack(const GgufFile& file, size_t layer, uint16_t* out) {
+    const std::string prefix = "blk." + std::to_string(layer) + ".loop_";
+    for (size_t c = 0; c < kinds.size(); ++c, out += values) {
+        const auto weights = [&](const char* part, size_t k, size_t n) {
+            const auto name = prefix + kinds[c] + "_ctrl_" + part + ".weight";
+            const auto& tensor = file.tensor(name);
+            size_t size = 0;
+            const auto* raw = file.raw(name, &size);
+            if (tensor.type != GgufFile::Type::F32 || tensor.dims != std::vector<uint64_t>{k, n} ||
+                size != k * n * sizeof(float))
+                fail("unsupported loop controller tensor " + name);
+            return reinterpret_cast<const float*>(raw);
+        };
+        const float* down = weights("down", 2 * width, rank);
+        const std::array<const float*, 2> gates{weights("gain", rank, width), weights("forget", rank, width)};
+        size_t at = 0;
+        for (size_t j = 0; j < chunks; ++j)
+            for (size_t kt = 0; kt < 8; ++kt)
+                for (size_t zt = 0; zt < 8; ++zt)
+                    for (size_t kl = 0; kl < 8; ++kl)
+                        for (size_t zl = 0; zl < 8; ++zl) {
+                            const size_t k = (kt < 4 ? 0 : width) + j * chunk + (kt % 4) * 8 + kl;
+                            out[at++] = exact_bf16(down[(zt * 8 + zl) * 2 * width + k]);
+                        }
+        for (size_t j = 0; j < chunks; ++j)
+            for (const float* gate : gates)
+                for (size_t zt = 0; zt < 8; ++zt)
+                    for (size_t ht = 0; ht < 4; ++ht)
+                        for (size_t zl = 0; zl < 8; ++zl)
+                            for (size_t hl = 0; hl < 8; ++hl)
+                                out[at++] = exact_bf16(gate[(j * chunk + ht * 8 + hl) * rank + zt * 8 + zl]);
+    }
+}
+
+struct Controller {
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    std::vector<Program> programs;  // q, k and v together, then ffn
+    std::array<xrt::bo, core_layers> weights;
+    xrt::bo activations, outputs;
+    uint32_t eps_bits = 0;
+
+    Controller(xrt::device& device, const std::filesystem::path& root, const nlohmann::json& info) {
+        if (info.at("format") != "inkling2-controller-v1" || info.at("image") != "controller.xclbin" ||
+            info.at("rows").get<size_t>() != rows || info.at("streams").at("qkv") != "controller-qkv.bin" ||
+            info.at("streams").at("ffn") != "controller-ffn.bin")
+            fail("unsupported loop controller bundle");
+        eps_bits = info.at("eps_bits").get<uint32_t>();
+        const xrt::xclbin image((root / "controller.xclbin").string());
+        context = xrt::hw_context(device, device.register_xclbin(image));
+        kernel = xrt::kernel(context, "MLIR_AIE");
+        programs.emplace_back(device, kernel.group_id(1), root / "controller-qkv.bin", 3);
+        programs.emplace_back(device, kernel.group_id(1), root / "controller-ffn.bin", 1);
+        activations = xrt::ext::bo(device, padded_bo(3 * activation_floats * sizeof(float)));
+        outputs = xrt::ext::bo(device, padded_bo(3 * output_floats * sizeof(float)));
+    }
+};
+} // namespace controller_layout
+
 class NpuExperts final : public Inkling2ExpertProjector {
 public:
     NpuExperts(const std::filesystem::path& root, unsigned timeout_ms)
@@ -1082,6 +1185,8 @@ public:
         }
         if (head) head_ = std::make_unique<Head>(device_, root, "head", 1);
         if (dense) dense_ = std::make_unique<dense_layout::Dense>(device_, root);
+        if (const auto loop = info.find("loop_controller"); loop != info.end())
+            controller_ = std::make_unique<controller_layout::Controller>(device_, root, *loop);
         const size_t max_rows = std::max({block_rows_, grouped_rows_ * slots, compact ? compact_m : size_t{0}});
         const size_t dense_input = dense ? block_layout::input_bytes(dense_layout::rows, attention_layout::q_width) : 0;
         const size_t dense_output = dense ? dense_layout::rows * dense_layout::shapes.front().outputs : 0;
@@ -1256,6 +1361,48 @@ public:
         if (singleton_ && rows == 1)
             project_singleton(file, layer, 1, {input, input, input}, {{"attn_output", width, 0, output}});
         else project_dense(file, layer, dense_layout::Output, rows, input, {{"attn_output", width, output}});
+        return true;
+    }
+
+    bool apply_loop_controllers(const GgufFile& file, size_t layer, size_t first, size_t count, size_t rows, float eps,
+                                const float* const* x, const float* const* message, float* const* out) override {
+        using namespace controller_layout;
+        uint32_t eps_bits;
+        std::memcpy(&eps_bits, &eps, sizeof(eps_bits));
+        const bool known = (first == 0 && count == 3) || (first == 3 && count == 1);
+        if (!controller_ || eps_bits != controller_->eps_bits || !known) return false;
+        if (failed_) fail("the previous dispatch failed; recreate the projector");
+        if (layer < first_layer || layer >= first_layer + core_layers) fail("loop controller outside the core layers");
+        auto& weights = controller_->weights[layer - first_layer];
+        if (!weights) {
+            auto packed = xrt::ext::bo(device_, padded_bo(4 * bytes));
+            pack(file, layer, packed.map<uint16_t*>());
+            packed.sync(XCL_BO_SYNC_BO_TO_DEVICE, 4 * bytes, 0);
+            weights = std::move(packed);
+        }
+        const auto& program = controller_->programs[first == 3];
+        auto* staged = controller_->activations.map<float*>();
+        for (size_t at = 0; at < rows; at += controller_layout::rows) {
+            const size_t valid = std::min(controller_layout::rows, rows - at);
+            for (size_t n = 0; n < count; ++n) {
+                float* dst = staged + n * activation_floats;
+                for (size_t row = 0; row < valid; ++row) {
+                    const float* xs = x[n] + (at + row) * width;
+                    const float* ms = message[n] + (at + row) * width;
+                    for (size_t j = 0; j < width; j += chunk, dst += 2 * chunk) {
+                        std::memcpy(dst, xs + j, chunk * sizeof(float));
+                        std::memcpy(dst + chunk, ms + j, chunk * sizeof(float));
+                    }
+                }
+                std::fill_n(dst, (controller_layout::rows - valid) * 2 * width, 0.0f);
+            }
+            controller_->activations.sync(XCL_BO_SYNC_BO_TO_DEVICE, count * activation_floats * sizeof(float), 0);
+            const float* result = dispatch(controller_->kernel, program.instruction, program.count, weights,
+                                           controller_->activations, nullptr, controller_->outputs,
+                                           count * output_floats, "loop controller");
+            for (size_t n = 0; n < count; ++n)
+                std::memcpy(out[n] + at * width, result + n * output_floats, valid * width * sizeof(float));
+        }
         return true;
     }
 
@@ -1838,6 +1985,7 @@ private:
     static constexpr size_t decode_rows = 8;
     bool near_bypass_ = false;
     std::unique_ptr<dense_layout::Dense> dense_;
+    std::unique_ptr<controller_layout::Controller> controller_;
     std::unique_ptr<SingletonDecode> singleton_;
     std::array<Pool, 2 * layers> compact_pools_, singleton_pools_;
     std::chrono::milliseconds timeout_;

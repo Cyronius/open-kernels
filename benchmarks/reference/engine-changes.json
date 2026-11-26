@@ -519,6 +519,15 @@
       "files": {
         "src/open_qwen36/inkling2_npu.cpp": "1e04f75137d432650f95c8dbcf49711e4834bce7903bbf0e21f9a0eaa328b8dd"
       }
+    },
+    {
+      "id": "inkling2-npu-loop-controller",
+      "origin": "open-kernels: loop controllers of prefill blocks of 64 or more rows on the NPU (manifest key loop_controller, controller.xclbin); decode and verify keep the host controller",
+      "files": {
+        "src/open_qwen36/inkling2_host.hpp": "2d1c305ea851df511d675f6fec09fd9f3c5b5a5acbd54a2be5a2f063ae3385d9",
+        "src/open_qwen36/inkling2_host.cpp": "f88250b5d821cfc4ea5f7ac148d5b8cddb0aeca0ddce87cfdaa699a1db48eec0",
+        "src/open_qwen36/inkling2_npu.cpp": "261d65a63b3de09188a75ffc5b61aedcae3efaf2f51e6621b407be1ff1b29412"
+      }
     }
   ]
 }

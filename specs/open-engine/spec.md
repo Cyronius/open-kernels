@@ -6332,6 +6332,13 @@ block projections. Each dispatch uses a validated stream and buffer layout from 
 The exported `inkling2-routed-v*` ABI and the native reader advance together. Version 11 adds optional
 vision streams while preserving the existing text bundle layout.
 
+The optional `loop_controller` field (`format: inkling2-controller-v1`, `rows: 256`, `eps_bits`) names
+`controller.xclbin` and two streams, `controller-qkv` (the q, k and v controllers) and `controller-ffn`.
+For blocks of at least 64 rows in loop passes 2 and 3, the reader runs the loop controllers on the NPU, padding
+each 256-row dispatch with zero rows. The kernel keeps the GGUF controller weights exact as bf16 (the reader
+rejects any F32 weight that is not a bf16 value) and splits F32 activations into bf16 high and low halves.
+Decode and verify passes of up to 8 rows keep the host controller. Bundles without the field keep the host route.
+
 **Acceptance criteria:** A contiguous prompt and a prompt split across block boundaries preserve the committed
 visit state and match the reference within the measured route tolerances. Report host stages and device timings
 separately during prefill and single-token decode. Verify long prefixes, the sliding boundary and incomplete tails.

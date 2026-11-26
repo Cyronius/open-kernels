@@ -5251,6 +5251,55 @@ group) cut their host time from 3.7 to 1.3 s at 512 tokens, but device wait rose
 device-bound. Narrow F32 projections (controller down at 64 rows, router at 128) now walk token tiles outside so each
 tile stays in cache, with the same dot-product code. The attention gate is threaded.
 
+## Loop controller on the NPU (2026-11-25)
+
+Design and feasibility: `.plans/inkling2/controller-kernel/design.md`. Evidence in `.plans/inkling2/controller-kernel/`.
+
+The host runs four controllers (q, k, v, ffn) for each core-layer visit in loop passes 2 and 3: 24 visits and 96
+calls a token. Each call is the rms of x and of the message, a 64 x 4,608 down projection, two 2,304 x 64
+projections, tanh and the update.
+
+- Decode stays on the host. The singleton decode image has 1.5 KB of program memory and 3.8 KB of L1 left
+  (14,864 of 16,384 B and 61,724 of 65,536 B), and all 32 cores are in use. Controller 3 depends on the attention
+  output, so it cannot join the dense input dispatch. Two extra dispatches for each visit (48 a token) at the
+  0.08-0.25 ms floor, plus 226 MB of F32 weights a token, cost about as much as the 18 ms host stage.
+- Prefill blocks of 64 rows or more use a new image, `controller.xclbin` (`designs/inkling2/loop_controller.py`).
+  Each of the 32 cores owns 8 of the 256 token rows end to end, and the weights are broadcast to them. Two
+  dispatches for each looped visit: q, k and v together (`controller-qkv`), then ffn (`controller-ffn`).
+- All 28.3M controller weights in the GGUF are exact bf16 values stored as F32. The kernel keeps them as one bf16
+  plane, which is exact, and splits activations into bf16 high and low halves (two bf16 mmul terms, F32 sums). tanh
+  is 2 sigmoid(2y) - 1 with `vecmath.h`; rsqrt uses an integer seed and Newton steps.
+- Budgets: program 9,600 B, data top 37,436 B, largest stack frame about 2 KB of 4 KB.
+
+| Check | Result |
+| --- | --- |
+| Fixture against an F64 reference, real blk.6 weights, 200 and 256 rows | largest row relative L2 error of u 1.6e-5 to 2.3e-5, padded rows exactly 0 |
+| Fixture time, 256 rows (not a clean run) | q, k, v 2.85-2.96 ms, null-compute copy 1.94-2.0 ms; ffn 1.0 ms |
+| Block-route logits, 512 rows in 64-row passes after 256 tokens | 508 of 512 top tokens equal, mean KL 0.00023, largest 0.024; the 4 flips have margins 0.005-0.045 |
+| Real-text NLL of those rows | 1.4703 to 1.4698, top-1 344 and 344 |
+| Decode logits after a 512-token prefill, 512 positions | 510 of 512 equal, mean KL 0.00019, largest 0.0062; NLL 1.2920 to 1.2918 |
+| Greedy, 512-token prompt, 64 tokens | equal for 9 tokens, then a near tie (0.16 logits); on the current route's sequence 63 of 64 top tokens equal |
+| Private memory after the first decode token | 17.98 to 18.12 GiB |
+
+Paired prefill timing, 1,024 tokens in 256-row blocks after a 256-token warm-up, 6 host threads, same bridge.
+The current-route arms ran CLEAN. Both controller arms were NOISY (another process held one core for 2-16 s),
+so their times are not reliable; that noise only slows them down.
+
+| Arm | Prefill | Steady blocks | Controller a block |
+| --- | ---: | ---: | ---: |
+| Current route (1) | 28.1 s | 6.97, 7.03 s | 1.08, 1.11 s |
+| NPU controller (2, noisy) | 20.2 s | 4.92, 4.82 s | 0.30, 0.30 s |
+| NPU controller (3, noisy) | 20.5 s | 5.18, 5.05 s | 0.32, 0.31 s |
+| Current route (4) | 23.5 s | 5.80, 5.51 s | 0.62, 0.63 s |
+
+- The host controller moved between 0.62 and 1.11 s a block in two clean arms. The NPU controller takes 0.30 s a
+  block in both arms: 6.3 ms a call, of which about 3.9 ms a visit is kernel time. The rest is two context entries a
+  visit (the first run after a context load took 3.6 ms longer in the fixture) and the host staging copy, sync,
+  finite check and unpack.
+- Left: put the controller on the dense or expert image to remove the two context entries a visit (about 0.1 s a
+  block, estimated); cut the kernel's 4x weight broadcast and repeated activation read (DMA-bound, null copy 2.0 ms).
+  A clean paired timing is still owed.
+
 ## Rebuild the v11 kernel bundle
 
 From the repository root, use the IRON Python environment with Peano and the XRT packaging tools
