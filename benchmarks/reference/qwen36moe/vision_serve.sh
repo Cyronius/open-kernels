@@ -7,5 +7,5 @@ QWEN36_BRIDGE_STATS=1 QWEN36_BRIDGE_TRACE=${TRACE:-} "$QPHLEGM" serve --model-di
   --max-ctx ${CTX:-8192} --speculative ${SPEC:-mtp} --port $PORT > $O/serve_${SPEC:-mtp}.log 2>&1 &
 pid=$!
 "$QPY" -P "$QD/vision_serve.py" http://127.0.0.1:$PORT "${1:-$QW/vision/llama0-banner.png}" | tee $O/answers_${SPEC:-mtp}.txt
-kill $pid; wait $pid 2>/dev/null; pkill -f "qwen36moe-bar/target/release/phlegm-reference-bench"
+kids=$(pgrep -P $pid); kill $pid; wait $pid 2>/dev/null; [ -n "$kids" ] && kill $kids 2>/dev/null
 grep -E "bridge:|prompt [0-9]+ tokens|error|Error" $O/serve_${SPEC:-mtp}.log | tail -12

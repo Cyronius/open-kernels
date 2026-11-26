@@ -1721,6 +1721,21 @@ NOISY after because another session's `llama-bench.exe` started at the end; `ben
 An earlier run beside another session's builds (19:31) read 90-129 tok/s prefill and 6.3-7.2 tok/s decode; it is
 not used.
 
+`phlegm bench --development` on the Strix Halo box (Ryzen AI MAX+ 395, Linux 7.2.15-1-omarchy, amdxdna in-tree, NPU
+firmware 1.1.2.65, XRT 2.27.0, `kernels-fa262k`, 128 output tokens, 2026-11-26 12:00; NPU power mode Default because
+`--pmode` needs root there; a shared box: another session's iGPU training at 93-99 % and CPU load average 16-28;
+`bench/phlegm_bench_20261126_1200.json`). With OPEN-MOE-PIPE and OPEN-DN-FUSED; plain decode (`--speculative off`):
+
+| input tokens | prefill tok/s | decode tok/s | first token ms |
+|---|---|---|---|
+| 512 | 111.6 | 5.84 | 4,590 |
+| 1,024 | 138.8 | 5.54 | 7,379 |
+| 2,048 | 161.4 | 6.79 | 12,689 |
+| 4,096 | 181.1 | 5.94 | 22,623 |
+
+The decode rate here is not comparable with the Strix Point table (performance mode, a quiet box): decode at
+position 1 read 150-250 ms a step on this box the same day.
+
 **Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
 norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
 the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
@@ -7299,7 +7314,9 @@ a 64 x 96 image: max difference 1.2e-7. llama.cpp's `llama0-banner.png` (1280 x 
   animal's fur?") answers "Yellow", reusing 804 prompt tokens; the same image after text in a new conversation is
   described correctly. `--speculative mtp` and `off` give byte-identical answers.
 - Host stage: the vision tower, 3,200 patches, 4.1-7.6 s on this busy box (llama.cpp's CPU encoder 4.8 s);
-  prefill of the 834-token prompt 5.1-10.6 s.
+  prefill of the 834-token prompt 5.1-10.6 s. Later, on a quieter box: the tower 3.7-4.0 s for the same 3,200
+  patches (`vit_bench`), text prefill about 4.7 s for 834 tokens, so the tower stays on the host (named host stage).
+- `phlegm run --image llama0-banner.png` (thinking off, greedy): the same answer, 49 s wall with the load.
 
 ### OPEN-VISION-IMAGE-READ: a PNG decodes whatever FFmpeg is linked
 **Applies to:** openflowlm-next (`src/common/image/png_decode.cpp`, `image_reader.cpp`)

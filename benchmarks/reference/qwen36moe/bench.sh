@@ -9,6 +9,6 @@ NPUQ_ETA=${NPUQ_ETA:-25m} "$QD/npuq.sh" "$QPHLEGM" bench --development --referen
   --kernels "${KERN:-$QW/kernels-fa262k}" --model-id unsloth/Qwen3.6-35B-A3B-MTP-GGUF \
   --model-revision 5bc3e238d916f48a861bac2f8a1990a0e9b7e98d --quantization UD-Q4_K_S --context ${CTX:-8192} \
   --driver-version "${QDRIVER:-amdxdna in-tree (Linux $(uname -r)), NPU firmware $(env -u LD_LIBRARY_PATH -u XILINX_XRT /usr/bin/xrt-smi examine 2>/dev/null | sed -n "s/.*NPU Firmware Version : //p")}" \
-  --notes "$notes" --output "$out" > "${out%.json}.log" 2>&1
+  ${QXRT:+--xrt-smi "$QXRT/bin/xrt-smi"} --notes "$notes" --output "$out" > "${out%.json}.log" 2>&1
 echo "exit $?"
 tail -12 "${out%.json}.log"
