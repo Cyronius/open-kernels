@@ -5344,7 +5344,11 @@ host SiTU, gate/up readback or down-input pack between them.
   decode including the next draft and target rows), with no environment override. Short greedy parity 64 of 64.
 - Prefill: with the fused group in prefill too, 1,024-token prefill took 21.73 / 20.87 s against 20.49 / 20.43 s
   (clean, both orders), so prefill keeps two launches per group and only verify rows use the fused group. On that
-  route the 896 + 256 logits match the integration bundle bit for bit in prefill and decode.
+  route the 896 + 256 logits match the integration bundle bit for bit in prefill and decode, and a paired timing
+  (order new, integration, integration, new) gave prefill 20.59 / 20.98 s against 20.66 / 20.52 s and decode
+  168.5 / 171.7 against 169.1 / 168.8 ms per token (the first new run was flagged NOISY for a 2 s burst).
+- Open: the verify-row cost of the fused group against two launches per group was not measured as a pair. One clean
+  fused arm at 1,024 tokens: verify 2 / 4 / 8 rows took 675 / 914 / 1,355 ms.
 
 ## Rebuild the v11 kernel bundle
 
