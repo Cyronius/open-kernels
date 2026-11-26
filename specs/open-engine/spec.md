@@ -1794,7 +1794,8 @@ tail's two context changes -- not the cores. The tail's switches, measured: `lm`
 10.12-10.21 in the step, `ln` 0.074 against 0.18-0.20, and `lx0` after `lm` 2.73 against 1.13: about 2.2 ms a step.
 The head cannot join the layer image: every shim tile's two input channels already carry the layer image's streams
 (eight weight fifos plus x, the norm helper, the glue, post, attention and the router's second channel), and the
-main cores have 128 B of program memory left. Before today the step
+main cores have 128 B of program memory left. A 24-deep weight ring (`UX_WRING=24`) steps in 73.9 / 73.7 ms against
+74.1 / 74.2 (noise; `lx0` 1.115 either way): the ring's depth is not what holds the linear front at 43 GB/s. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
