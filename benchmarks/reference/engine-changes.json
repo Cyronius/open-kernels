@@ -181,13 +181,20 @@
         "src/open_qwen36/block_host.hpp": "a3a5d735e4e684432af16d1903e4f083027bff808d5e9296aaa343278bd5ec63",
         "src/open_qwen36/build.cmd": "eb80c448f5041186e37a632edaf6e45a6d5d1bc00ae9f394169296dfa228ac2c",
         "src/open_qwen36/cli.cpp": "00363ec9bb31209a8c2715e64787e3171633e8db3ebfa96a93c1d1c0f49f20b3",
-        "src/open_qwen36/core.cpp": "77f77fd1290a166a377cb3d92e82e4ac7f6ff44e4d8b097f74489dd589115f78",
         "src/open_qwen36/core.hpp": "c59c3e06bbdc2e85fe0cc15a053d0d3eef8768b18659c3a43bad92b88972a10b",
         "src/open_qwen36/manifest_test.cpp": "57cbd1156e9ca1468d788e187c0fc618351a9585c7e82f42e29743b17524f947",
+        "src/open_qwen36/README.md": "46f527674827a506184dcf017d2447bd940dfa9eee472f99a258efd180661632",
         "src/open_qwen36/vision/vit.cpp": "ce5f9619f97adf2a79c6aa420af86feaa38678596a044cb779a206542885db7d",
         "src/open_qwen36/vision/vit.hpp": "65d4649a82d601751c22197e7d910543a4b6ade5b54497b0b1d2fa456ebab142",
         "src/open_qwen36/vision/prompt.cpp": "9fe9f28401d686d5c094deae9b1c1239ac6d9adbdf3fb11ee2ed858ff2c602c5",
         "src/open_qwen36/vision/prompt.hpp": "08b056863b941d2d8a2299f9f97e159ae85d3ba42922082a9a33013cda238934"
+      }
+    },
+    {
+      "id": "qwen36moe-moe-pipe",
+      "origin": "open-kernels: the prefill's token-batched MoE passes pipelined (OPEN-MOE-PIPE): two x / y buffer pairs, the host gathers pass i + 1 and scatters pass i - 1 while the NPU runs pass i; scatter order unchanged, logits bit-identical; OFLM_OPEN_MOE_PIPE=0 restores the serial loop",
+      "files": {
+        "src/open_qwen36/core.cpp": "153b20ade318040b581b5b44f7c18cb893936909f1c99ed9ab607102e04b1904"
       }
     }
   ]

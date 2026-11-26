@@ -24,6 +24,15 @@ else
   : "${QXRTBIN:=$HOME/code/phlegm/target/npu-dev/xrt/bin}"
   case ":$PATH:" in *":$(dirname "$QPY"):"*) ;; *) PATH="$(dirname "$QPY"):$PATH:$QXRTBIN" ;; esac
   export PATH
+  # XRT: phlegm's npu-dev build (2.27) when present. The distro's 2.21.75 refuses userptr device buffers on this
+  # kernel (the engine then falls back to shmem ones); 2.27 takes them. Unset QXRT to use the system XRT.
+  if [ -z "${QXRT+x}" ] && [ -f "$HOME/code/phlegm/target/npu-dev/xrt/lib/libxrt_coreutil.so.2" ]; then
+    QXRT=$HOME/code/phlegm/target/npu-dev/xrt
+  fi
+  if [ -n "${QXRT:-}" ]; then
+    export XILINX_XRT=$QXRT XRT_INCLUDE_DIR=$QXRT/include XRT_LIB_DIR=$QXRT/lib
+    case ":${LD_LIBRARY_PATH:-}:" in *":$QXRT/lib:"*) ;; *) export LD_LIBRARY_PATH=$QXRT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ;; esac
+  fi
   qpath() { printf '%s' "$1"; }
 fi
 : "${QM:=$QW/Qwen3.6-35B-A3B-UD-Q4_K_S}"             # model dir: model.gguf, mmproj, tokenizer, config

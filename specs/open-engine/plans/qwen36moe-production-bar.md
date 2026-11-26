@@ -607,3 +607,18 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   (17.8 tok/s; GEMMs and block attention 9,943 s, host 3,974 s). Against 131k (910 s and 1,066 s) the NPU part grew
   10.9x for 2x the tokens, more than the 4x of the attention area (cause not measured). Decode at 262,004-262,010
   1,120-1,189 ms a step, of which `part0` (the attention walks) 1,057-1,090 ms. Log: `ctx/needle/n262000_0.5.log`.
+- 2026-11-26, moved to the Strix Halo box (Ryzen AI MAX+ 395, Linux 7.2.15-omarchy, amdxdna in-tree, NPU firmware
+  1.1.2.65, XRT 2.21.75 from the distro and phlegm's npu-dev XRT 2.27.0, mlir-aie 1.4.2 in `~/ironenv142`). Model
+  `~/models/qwen36moe/Qwen3.6-35B-A3B-UD-Q4_K_S` (same Unsloth revision `5bc3e238`; sha256 in `gguf/SHA256SUMS`).
+  `benchmarks/reference/qwen36moe/paths.sh` holds both machines' paths; every helper has a Linux form.
+  - Setup traps: the distro XRT has no `aiebu-asm` (the export takes it from phlegm's npu-dev XRT); XRT 2.21.75
+    refuses userptr device buffers at every size on this kernel (`amdxdna_insert_pages: Failed to mmap dma buf
+    -22`), so the engine now falls back to shmem buffers, and the helpers use XRT 2.27, which takes them;
+    `xrt-smi configure --pmode` needs root here (`DRM_IOCTL_AMDXDNA_SET_STATE ... Permission denied`), so the NPU
+    stays in the Default power mode until someone runs it with sudo.
+  - Cold export of `kernels-fa262k` (all images, attn_fa256 tiers to 262,144 rows, verify images): about 15 min at -j 8.
+  - Reproduced: needle 8192 PASS (prefill 40.1 s on a busy box); `--verify-check 8` PASS; `--spec-mtp 128` SPEC
+    IDENTICAL; KL gate against a llama.cpp CPU base on a regenerated haystack (the first 40 essays of
+    `sgoel9/paul_graham_essays` @ `0c7155a5`, sha256 `ce2f77f5...`): mean 0.0275, median 0.0080, p95 0.108, same top
+    93.4 %, PPL 6.301 against 6.291. The CPU-vs-Vulkan control on this text is not run yet.
+  - Vision end to end (OPEN-VISION-BLOCK, SERVER-IMAGE-INPUT): see the spec.

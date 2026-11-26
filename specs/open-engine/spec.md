@@ -1685,13 +1685,13 @@ Development runs, not a release benchmark. Plan: [qwen36moe-production-bar.md](p
 |---|---|---|
 | Block prefill | Done. The layer-major block route (T = 256) is the default in the CLI, `phlegm run` and `serve` | speed table |
 | Near optimal | Open. Profiled, with the remainders named below; no tuning pass yet | profile tables |
-| Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %, 2026-11-25). Prefill of 262,000 tokens takes 4.1 h (named under near optimal) | speed table |
+| Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %), on `attn_block` (2026-11-25) and again on `attn_fa256` (2026-11-26): 262,000-token prefill 2,457 s against 14,706 s | speed table, [qwen36moe-attn-fa256.md](plans/qwen36moe-attn-fa256.md) |
 | All on the NPU | Done with named host stages (tables below) | host stages |
-| Drafter | Open. No two-row verify pass exists for this family; the MTP head (`blk.40`) needs one. Prompt lookup needs the same pass | plan phase 5 |
+| Drafter | Done: the MTP head (`blk.40`) drafts one token and a two-row verify pass checks it (OPEN-VERIFY-ROWS-QWEN36MOE, OPEN-SPEC-MTP-QWEN36MOE); `phlegm serve --speculative mtp` 1.24-1.40x decode, output byte-identical to `off`, also after an image. Prompt lookup runs on the same pass and is kept as an option (1.10-1.25x); combining the two per cycle measured no gain at width 2 | plan phase 5 |
 | `phlegm run` / `serve` | Done: plain, streamed, reasoning on and off, a tool-call round trip | plan log |
 | Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1, the Q6_K head to `lm_head_q8`. Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread | OPEN-SHARED-HOST-Q8 |
 | Benchmarks | Done for the kernel side: `phlegm bench --development` in a measure unit, 512 to 4k (below), with CLI runs to 131k; the docs page and README row are OFLM's | bench table |
-| Features | Reasoning and tool calling pass. Open: vision (not started; it needs phlegm's chat image input, which another session has in progress) and MTP (drafter row) | this table |
+| Features | Reasoning, tool calling, the MTP head (drafter row) and vision pass. Vision: the mmproj tower on the host CPU (named below), image prompts on the block route at M-RoPE positions, `phlegm serve` image parts, answers equal to llama.cpp's on the test image (OPEN-VISION-BLOCK, SERVER-IMAGE-INPUT). Left out: video input (phlegm takes no video) | this table |
 
 Reliability: about one routed MoE dispatch in 30,000 to 300,000 is lost by the driver or firmware (OPEN-ROUTE-ALT).
 The engine runs the layer again on a new hardware context (OPEN-ROUTE-REDO); 8 real losses in one gate run were
@@ -9109,6 +9109,14 @@ long 25 / 48 -> 48 / 48. Two short-prompt decodes departed from their old refere
 and Nex Q4K at token 43 (no longer BF16's 64 / 64 but 42; the NPU went from -0.48 / -0.96 to -0.72 / -0.67, llama.cpp Q4_K
 on that path gives -0.49 / -0.95). Ornith Q4K long greedy 8 -> 3 / 48 against llama.cpp CPU. The other greedy runs are
 unchanged. Every folder's `open_kernels/` is the rebuilt set; the old set is kept as `open_kernels.prefix-rnd`.
+
+**OPEN-MOE-PIPE (2026-11-26).** The passes of a layer's MoE are pipelined: two x / y buffer pairs (the manifest's
+globals and a `#2` twin), and while the NPU runs pass i the host scatters pass i - 1's y into the token rows and
+gathers pass i + 1's x. One dispatch is outstanding at a time (the GEMM phase's rule) and every token's row still
+takes its passes' contributions in pass order, so the logits do not change: Qwen3.6-35B-A3B, 1,024-token prompt,
+last-position logits byte-identical with `OFLM_OPEN_MOE_PIPE=0` and 1, same greedy tokens. 4,096-token block
+prefill on the Strix Halo box (busy, load average about 35, two alternating rounds): 43.98 / 39.78 s serial,
+33.99 / 33.48 s piped (1.19-1.29x).
 
 ### OPEN-PREFILL-ATTN: the block attention's products on the NPU
 **Applies to:** openflowlm-next (`open_kernels/designs/attn_block/`, `open_kernels/recipes/{qwen36moe,dense}.py`, `src/open_qwen36/{manifest,block_host,core}.cpp`, `utilities/dense-decode-probe/attn_route_check.py`)

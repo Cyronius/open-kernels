@@ -6550,35 +6550,50 @@ void Core::moe_block(int l, const float* xm, const float* res, const int32_t* id
     std::vector<std::pair<uint32_t, size_t>> visits;             // (expert, first token of its NT)
     for (size_t e = 0; e < E; ++e)
         for (size_t off = 0; off < owed[e].size(); off += NT) visits.push_back({static_cast<uint32_t>(e), off});
-    xrt::bo& xb = buffer(mb.args[1], 0);
-    xrt::bo& yb = buffer(mb.args[3], 0);
-    std::vector<std::vector<std::pair<size_t, float>>> per_token(t_real);   // (slot * NT + column, weight)
     static const bool log_passes = std::getenv("OFLM_OPEN_MOE_BATCH_LOG") != nullptr;
-    for (size_t done = 0; done < visits.size();) {
-        const size_t left = visits.size() - done;
-        size_t slots = 0;
+    // OPEN-MOE-PIPE: two x / y buffer pairs, so the host gathers pass i + 1 and scatters pass i - 1 while the NPU
+    // runs pass i. The scatter still adds each pass into a token's row in pass order, so the bits do not change.
+    // OFLM_OPEN_MOE_PIPE=0 (or the redispatch probe) runs the passes one after another as before.
+    static const bool pipe = [] { const char* e = std::getenv("OFLM_OPEN_MOE_PIPE"); return !e || std::string(e) != "0"; }();
+    const bool piped = pipe && !moe_redispatch_;
+    std::vector<std::string> args[2] = {mb.args, mb.args};
+    if (piped)
+        for (int a : {1, 3}) {
+            const std::string alt = mb.args[a] + "#2";
+            if (!globals_.count(alt)) globals_.emplace(alt, alloc(buffer(mb.args[a], 0).size()));
+            args[1][a] = alt;
+        }
+    struct Pass {
+        size_t n = 0, slots = 0;
         const std::string* kname = nullptr;
-        for (const auto& [s, k] : mb.kernels) {   // ascending: the shortest stream that holds them, else the longest
-            slots = s;
-            kname = &k;
-            if (s >= left) break;
-        }
-        const size_t n = std::min(left, slots);
+        std::vector<uint32_t> ex;
+        std::vector<std::vector<std::pair<size_t, float>>> per_token;   // (slot * NT + column, weight)
+    };
+    // the shortest stream that holds the visits still owed, else the longest; gather x[slot] as the kernel's
+    // A tiles: [hid / 8][NT tokens][8 k] bf16, which is already the kernel's [k-block][NG sub-tiles][8 tokens][8 k]
+    // -- the sub-tile axis is the high bits of the token index (designs/moe_batch/layout.py)
+    auto prepare = [&](size_t done, int buf, Pass& ps) {
         auto t0 = std::chrono::steady_clock::now();
-        uint16_t* xh = xb.map<uint16_t*>();
-        std::vector<uint32_t> ex(slots, 0);   // unused slots stream expert 0: a valid read, ignored
-        for (auto& v : per_token) v.clear();
-        for (size_t i = 0; i < n; ++i) {
-            const auto& [e, off] = visits[done + i];
-            ex[i] = e;
-            for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j)
-                per_token[owed[e][off + j].first].push_back({i * NT + j, owed[e][off + j].second});
+        const size_t left = visits.size() - done;
+        for (const auto& [sl, k] : mb.kernels) {
+            ps.slots = sl;
+            ps.kname = &k;
+            if (sl >= left) break;
         }
-        // x[slot] as the kernel's A tiles: [hid / 8][NT tokens][8 k] bf16, which is already the
-        // kernel's [k-block][NG sub-tiles][8 tokens][8 k] -- the sub-tile axis is the high bits
-        // of the token index (designs/moe_batch/layout.py)
+        ps.n = std::min(left, ps.slots);
+        ps.ex.assign(ps.slots, 0);    // unused slots stream expert 0: a valid read, ignored
+        ps.per_token.resize(t_real);
+        for (auto& v : ps.per_token) v.clear();
+        for (size_t i = 0; i < ps.n; ++i) {
+            const auto& [e, off] = visits[done + i];
+            ps.ex[i] = e;
+            for (size_t j = 0; j < std::min(NT, owed[e].size() - off); ++j)
+                ps.per_token[owed[e][off + j].first].push_back({i * NT + j, owed[e][off + j].second});
+        }
+        xrt::bo& xb = buffer(args[buf][1], 0);
+        uint16_t* xh = xb.map<uint16_t*>();
 #pragma omp parallel for
-        for (long long i = 0; i < static_cast<long long>(n); ++i) {
+        for (long long i = 0; i < static_cast<long long>(ps.n); ++i) {
             const auto& [e, off] = visits[done + i];
             uint16_t* xs = xh + i * hid * NT;
             // A visit with fewer than NT tokens owed leaves the rest of its columns holding
@@ -6591,39 +6606,30 @@ void Core::moe_block(int l, const float* xm, const float* res, const int32_t* id
                     for (size_t kl = 0; kl < 8; ++kl) xs[(kb * NT + j) * 8 + kl] = f32_to_bf16(row[kb * 8 + kl]);
             }
         }
-        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, n * hid * NT * 2, 0);
+        xb.sync(XCL_BO_SYNC_BO_TO_DEVICE, ps.n * hid * NT * 2, 0);
         timing_.moe_prep_ms += ms_since(t0);
+    };
+    auto patch = [&](const Pass& ps) -> Kern& {
         auto t1 = std::chrono::steady_clock::now();
-        Kern& mk = kerns_.at(*kname);
-        stream_patch::moe2_apply(mk.iw(), mk.moe2, ex.data(), w_->moe);
+        Kern& mk = kerns_.at(*ps.kname);
+        stream_patch::moe2_apply(mk.iw(), mk.moe2, ps.ex.data(), w_->moe);
         mk.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         timing_.moe_patch_ms += ms_since(t1);
-        const double run_ms = run(mk, mb.args, l);
-        timing_.moe_run_ms += run_ms;
-        // Why the same dispatch costs 17.4 ms here and 12.4 ms under `--bench`: run it a
-        // SECOND time, same stream, same buffers, no host work in between. If the repeat is
-        // the bench's figure then what the first one pays for is the host work before it; if
-        // both are 17.4 the hardware really is in a different state during a prefill.
-        if (moe_redispatch_) {
-            const double again = run(mk, mb.args, l);
-            std::fprintf(stderr, "open_qwen36: layer %d moe redispatch: %.3f then %.3f ms\n", l, run_ms, again);
-        }
-
-        if (log_passes)
-            std::fprintf(stderr, "open_qwen36: layer %d moe pass: %zu of %zu visits on %s, %.2f ms\n", l, n, visits.size(),
-                         kname->c_str(), run_ms);
+        return mk;
+    };
+    // y[slot] comes back as C tiles: per 64-row band, [4 groups][even / odd rows][NG mmul sub-tiles][8 tokens][8];
+    // row 64 band + 16 g + 2 jj + p, token 8 sub + tt. A column belongs to exactly one token, so the un-interleave
+    // is the scatter -- read the tiles straight into the token's row rather than staging 20 MB a layer.
+    auto scatter = [&](int buf, const Pass& ps) {
         auto t2 = std::chrono::steady_clock::now();
-        read_back(yb, n * hid * NT * 4, 0);
+        xrt::bo& yb = buffer(args[buf][3], 0);
+        read_back(yb, ps.n * hid * NT * 4, 0);
         const float* yh = yb.map<float*>();
-        // y[slot] comes back as C tiles: per 64-row band, [4 groups][even / odd rows][NG mmul
-        // sub-tiles][8 tokens][8]; row 64 band + 16 g + 2 jj + p, token 8 sub + tt. A column
-        // belongs to exactly one token, so the un-interleave is the scatter -- read the tiles
-        // straight into the token's row rather than staging 20 MB a layer and reading it back.
         const size_t NG = NT / 8;                      // mmul sub-tiles a slot holds
 #pragma omp parallel for
         for (long long t = 0; t < static_cast<long long>(t_real); ++t) {
             float* o = out + t * hid;
-            for (const auto& [col, wt] : per_token[t]) {
+            for (const auto& [col, wt] : ps.per_token[t]) {
                 const size_t tt = col % NT;
                 const float* base = yh + (col / NT) * hid * NT + (tt / 8) * 64 + (tt % 8) * 8;
                 for (size_t band = 0; band < hid / 64; ++band)
@@ -6639,7 +6645,56 @@ void Core::moe_block(int l, const float* xm, const float* res, const int32_t* id
             }
         }
         timing_.moe_read_ms += ms_since(t2);
-        done += n;
+    };
+    if (!piped) {
+        Pass ps;
+        for (size_t done = 0; done < visits.size(); done += ps.n) {
+            prepare(done, 0, ps);
+            Kern& mk = patch(ps);
+            const double run_ms = run(mk, args[0], l);
+            timing_.moe_run_ms += run_ms;
+            // Why the same dispatch costs 17.4 ms here and 12.4 ms under `--bench`: run it a
+            // SECOND time, same stream, same buffers, no host work in between. If the repeat is
+            // the bench's figure then what the first one pays for is the host work before it; if
+            // both are 17.4 the hardware really is in a different state during a prefill.
+            if (moe_redispatch_) {
+                const double again = run(mk, args[0], l);
+                std::fprintf(stderr, "open_qwen36: layer %d moe redispatch: %.3f then %.3f ms\n", l, run_ms, again);
+            }
+            if (log_passes)
+                std::fprintf(stderr, "open_qwen36: layer %d moe pass: %zu of %zu visits on %s, %.2f ms\n", l, ps.n,
+                             visits.size(), ps.kname->c_str(), run_ms);
+            scatter(0, ps);
+        }
+        timing_.route_ms += ms_since(tp);
+        return;
+    }
+    // piped: pass [cur] runs on the NPU while the host scatters the pass before it (its y is the other buffer)
+    // and then gathers the pass after it into the other x (the scatter reads only y, so x is free)
+    Pass ps[2];
+    size_t done = 0;
+    int cur = 0;
+    bool pending = false;
+    if (!visits.empty()) prepare(0, 0, ps[0]);
+    while (!visits.empty()) {
+        Kern& mk = patch(ps[cur]);                     // every earlier dispatch has been waited for
+        Inflight f = start_run(mk, args[cur], l);
+        if (pending) scatter(1 - cur, ps[1 - cur]);
+        const size_t next = done + ps[cur].n;
+        const bool more = next < visits.size();
+        if (more) prepare(next, 1 - cur, ps[1 - cur]);
+        const auto [elapsed, blocked] = wait_run(f);
+        timing_.moe_run_ms += blocked;                 // what the host waited, not the overlapped dispatch time
+        if (log_passes)
+            std::fprintf(stderr, "open_qwen36: layer %d moe pass: %zu of %zu visits on %s, %.2f ms (waited %.2f)\n", l,
+                         ps[cur].n, visits.size(), ps[cur].kname->c_str(), elapsed, blocked);
+        if (!more) {
+            scatter(cur, ps[cur]);
+            break;
+        }
+        pending = true;
+        done = next;
+        cur = 1 - cur;
     }
     timing_.route_ms += ms_since(tp);
 }
