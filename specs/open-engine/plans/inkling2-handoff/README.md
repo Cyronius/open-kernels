@@ -20,6 +20,27 @@ Branch `feat/inkling2-integration` on `origin` holds all the work. Nothing is me
 The local branches `feat/inkling2-production-bar`, `feat/inkling2-controller-kernel` and `feat/inkling2-situ-kernel`
 are only on the first machine. Their commits are all in the integration branch.
 
+## Linux machine (2026-11-26)
+
+The work continued on a Strix Halo Linux machine. The full record is the production-bar plan, section "Linux on
+Strix Halo". New commits on `feat/inkling2-integration`:
+
+| Commit | Change |
+| --- | --- |
+| `d085750` | The overlap route and fused verify groups run on Linux; GCC builds without FMA contraction (both were needed for verify to stay bit-equal to decode on Linux) |
+| `c9b1736` | Resident decode K/V buffers per visit and key tile |
+| `3485bfa` | Verify: up to four tokens a singleton dense launch, row-wise singleton experts, two-row head exported by default |
+
+The Phlegm side is on the local branch `feat/inkling2-phlegm` of `~/code/phlegm-inkling2` (not pushed): the handoff
+patch as one commit, the `build.py` contraction fix and an `inkling2:mini` registry entry, and the `--development`
+bench commits `44f812a` and `1dc18d8`. Merging Phlegm `origin/main` conflicts in `benchmarks/reference/bridge.cpp`
+and `phlegm-core/src/bench/reference.rs` (main's own protocol-2 work); that merge is still to do.
+
+Linux build: `source phlegm/target/npu-dev/env.sh` (mlir-aie 1.4.2, Peano `c9c5ecb7`, XRT 2.27), export as below,
+bridge with Phlegm's `benchmarks/reference/build.py --reference-root <open-kernels>`. NPU processes need unlimited
+memlock (`phlegm/target/npu-dev/npu-run.sh`). The gate tools run unchanged; `decode_dump.py` reads `/proc` when psutil
+is missing. A SIGTERM'd `phlegm serve` leaves `/tmp/phlegm-npu.lock`; remove it only when its PID is gone.
+
 ## Measured state (Strix Point, Windows 11 26200, 6 host threads)
 
 These are the last clean numbers. Do not carry them to another machine or stack. Measure again.

@@ -5399,6 +5399,15 @@ power mode `default`; a `performance` or `turbo` run is the next measurement and
 is system-wide). The host work left a token: controller ~20 ms, K/V ~13 ms, route ~4 ms, attention merge and head
 readback a few ms.
 
+**Prefill on this machine** (profiled bridge, 256-row blocks after a 1,024-token prompt, NOISY): steady blocks
+6.57-6.76 s (38-39 tokens/s). The first block of a process took 26.8 s, 19.4 s of it packing expert weights into the
+NPU pools (once a process). Stage split of the block at 768: experts 3.87 s (2,258 grouped launches: device wait 1.78 s;
+host per launch about 0.5 ms for weight preparation 0.35 s, activation pack 0.23 s, unpack 0.18 s, finite scan 0.17 s,
+configure 0.07 s; host SiTU 0.60 s, gather 0.13 s, reduce 0.10 s), dense input and output 1.09 s, attention 0.60 s
+(near-range dispatch 0.48 s), head 0.21 s, residual mix 0.18 s, convolutions 0.18 s. A block reads about 29.6 GB of
+expert weights (all 128 experts of each visit), 1.4 s at the 21 GB/s decode rate, so the expert device wait is near the
+DMA floor; the host work around each grouped launch (about 1.9 s a block) is what is left.
+
 **DSpark on `phlegm run`** (`--speculative auto`, 400-token cap, code prompt, order off/auto/auto/off, NOISY): output
 byte-identical in all four runs, wall 112.6 / 176.2 / 176.2 / 112.6 s. Verify passes keep the one-row dense kernels
 to stay bit-equal to decode, so a k-row verify reads the dense weights k times; the routed experts of k tokens are
