@@ -94,7 +94,7 @@ def router_split(spec: ModelSpec | None = None) -> bool:
 
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
 # is unchanged. In the build key so a probe set never shares a key with a real one.
-_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX")
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX", "QWEN36MOE_MB_NT")
 
 
 def probe_env() -> dict[str, str]:
@@ -1320,6 +1320,17 @@ GEMM_T = 256          # gemm_q4_prefill.py's GQP_T: a multiple of tile_n * 8 col
 # mb_x / mb_h / mb_y and spending the core's last 4 KB of L1. Raise it once the core rate is
 # up (the plan's B(3)); the design and the driver are ready for it.
 MB_NT = 8   # tokens a visit (16 measured no faster: the kernel is core-bound at 8; production-bar plan, step 2)
+# OPEN-MOE-DQBUF: with the dequantised k-tile kept in L1 for every 8-token sub-tile, a 16-token visit costs the core
+# 4.6 us a token against 6.3 at 8 tokens (32 slots: 2.34 ms against 1.62 for half the tokens; the weight stream alone
+# 1.53), the same bits. Measured geometries take 16 tokens a visit and the buffer; `QWEN36MOE_MB_NT` overrides.
+MB16_MEASURED: tuple[str, ...] = (
+    "sha256:9a635603a58ef7634a48b0645aefd7d38ab23bb3aa0a7827e497746f6dbd3404",   # Unsloth Qwen3.6-35B-A3B q8 projections
+)
+
+
+def mb_nt(spec: ModelSpec | None) -> int:
+    default = 16 if spec is not None and spec.kernel_hash() in MB16_MEASURED else MB_NT
+    return int(os.environ.get("QWEN36MOE_MB_NT", default))
 ATTN_LMAX = 4096      # the widest attention GEMM stream (rows of window); a longer window is chunked on the host
 # The q4_1 GEMM reads the band law; an all-q8 MoE route runs every GEMM on bf16 instead (bf16_route), and
 # a q8 projection elsewhere runs as its exact q4_1 split (gemm_weight): every q8 code is 16 hi + lo, so two q4_1 halves sum
@@ -1466,7 +1477,7 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
     mb_args = ["pool", "mb_x", "mb_h", "mb_y"]
     if not dense:
         check_buffer_args("moe_batch", mb_args)
-    moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": MB_NT}
+    moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": mb_nt(spec)}
 
     # Block attention as two bf16 GEMMs per kv head (OPEN-PREFILL-ATTN, designs/attn_block): the
     # group's 8 query heads x T tokens against the window, scores then values, the row softmax on
@@ -1613,13 +1624,14 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         name = f"mb_s{s}"
         out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
         out["builds"][name] = {"design": "moe_batch/moe_batch.py", "build_dir": f"moe_batch/build_s{s}{sfx}",
-                               "env": {"MB_SLOTS": str(s), "MB_NT": str(MB_NT), "MB_HID": str(hid), "MB_FF": str(ff),
+                               "env": {"MB_SLOTS": str(s), "MB_NT": str(mb_nt(spec)), "MB_HID": str(hid), "MB_FF": str(ff),
                                        "MB_EXPERTS": str(E), "MB_POOL_DOWN": str(L.POOL_DOWN),
-                                       "MB_POOL_BYTES": str(L.POOL_BYTES)}}
+                                       "MB_POOL_BYTES": str(L.POOL_BYTES),
+                                       **({"MB_DQBUF": "1"} if mb_nt(spec) > 8 else {})}}
     if not dense:
-        out["globals"]["mb_x"] = mb_slots[0] * hid * MB_NT * 2
-        out["globals"]["mb_h"] = mb_slots[0] * ff * MB_NT * 2
-        out["globals"]["mb_y"] = mb_slots[0] * hid * MB_NT * 4
+        out["globals"]["mb_x"] = mb_slots[0] * hid * mb_nt(spec) * 2
+        out["globals"]["mb_h"] = mb_slots[0] * ff * mb_nt(spec) * 2
+        out["globals"]["mb_y"] = mb_slots[0] * hid * mb_nt(spec) * 4
     if attn_block:
         hd = spec.head_dim
         # AG_M is baked into the build; the 35B's directories keep the names they have always had

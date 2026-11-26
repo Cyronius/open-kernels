@@ -9174,6 +9174,18 @@ and Nex Q4K at token 43 (no longer BF16's 64 / 64 but 42; the NPU went from -0.4
 on that path gives -0.49 / -0.95). Ornith Q4K long greedy 8 -> 3 / 48 against llama.cpp CPU. The other greedy runs are
 unchanged. Every folder's `open_kernels/` is the rebuilt set; the old set is kept as `open_kernels.prefix-rnd`.
 
+**OPEN-MOE-DQBUF (2026-11-26).** At 8 tokens a visit the expert kernel sits near its weight stream (32 slots: 1.62 ms
+against 1.37 with the core work compiled out), and a 16-token visit halves the stream per token but was core-bound:
+the dequantisation ran once per 8-token sub-tile (32 slots at 16 tokens: 3.13 ms; 2.22 without the dequant; stream
+1.53). `MB_DQBUF` dequantises each k-tile of a 16-row group once into a 1 KB L1 buffer and runs every sub-tile's
+eight macs on it, one accumulator live at a time: 2.34 ms for 32 slots of 16 tokens, 4.6 us a token against 6.3 at 8
+tokens, the same products in the same order (rel_fro against the fp64 reference identical, 3.022e-3). aie2p's native
+`mmul<4, 8, 8>` was slower in both shapes (1.79 against 1.62 ms at 8 tokens; 2.57 against 2.37 with the buffer), and
+the fully unrolled mac loop overflows program memory. The recipe takes 16 tokens a visit and the buffer for measured
+geometries (`MB16_MEASURED`, the Unsloth Qwen3.6-35B-A3B q8 spec); `QWEN36MOE_MB_NT` overrides. Model (Strix Halo,
+two alternating rounds): 1,032 prefill-logit files of a 1,024-token prompt byte-identical; 4,096-token prefill
+14.5 / 14.5 -> 12.6 / 12.5 s, 8,192 28.8 / 29.1 -> 24.7 / 24.6 s (1.16-1.17x); needles PASS.
+
 **OPEN-MOE-PIPE (2026-11-26).** The passes of a layer's MoE are pipelined: two x / y buffer pairs (the manifest's
 globals and a `#2` twin), and while the NPU runs pass i the host scatters pass i - 1's y into the token rows and
 gathers pass i + 1's x. One dispatch is outstanding at a time (the GEMM phase's rule) and every token's row still

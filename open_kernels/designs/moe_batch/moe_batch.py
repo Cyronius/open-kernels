@@ -101,7 +101,7 @@ CONTIG = os.environ.get("MB_CONTIG") == "1"
 # Compile flags every kernel in the design takes. MB_SHARE_NG is a shape (one dequantised
 # weight shared across the slot's sub-tiles, MB_NG accumulators live); the other two are
 # timing ablations whose output is garbage.
-FLAGS = ("MB_NULL_MM", "MB_NULL_DQ", "MB_SHARE_NG")
+FLAGS = ("MB_NULL_MM", "MB_NULL_DQ", "MB_SHARE_NG", "MB_NATIVE", "MB_DQBUF", "MB_DQNATIVE", "MB_DQUNROLL")
 X_BYTES = SLOTS * HID * NT * 2
 H_BYTES = SLOTS * FF * NT * 2
 Y_BYTES = SLOTS * HID * NT * 4

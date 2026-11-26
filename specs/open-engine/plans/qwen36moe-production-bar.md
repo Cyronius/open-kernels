@@ -663,3 +663,6 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   (142.5 -> 121.8 ms). All gates bit-identical. Speculation is then near break-even on this box (plain 73 ms against a
   1.67-step verify pass): phlegm drafts only while it pays (SERVER-SPEC-COST). Measure unit: decode 13.2 / 12.9 /
   12.3 / 11.2 tok/s at 512 / 1k / 2k / 4k, prefill unchanged (212-287 tok/s).
+- 2026-11-26 15:40, OPEN-MOE-DQBUF: the expert kernel at 16 tokens a visit with the dequantised k-tile kept in L1
+  (4.6 us a token against 6.3); prefill 1.16-1.17x at 4k and 8k (8k 24.6 s, 333 tok/s), logits byte-identical.
+  Rejected on the way: native `mmul<4,8,8>` (slower in both shapes), the full mac unroll (program memory).
