@@ -15,7 +15,8 @@ enum Part {
     attention_kv, attention_query, attention_sliding_dispatch, attention_full_dispatch, attention_merge,
     attention_old_prepare, attention_old_upload, attention_old_dispatch_4k, attention_old_dispatch_16k,
     attention_old_merge, attention_near_prepare, attention_near_dispatch, attention_near_merge,
-    dense_host_input, dense_host_output, count
+    dense_host_input, dense_host_output, attention_kv_sync, dispatch_configure, dispatch_wait, dispatch_readback,
+    count
 };
 inline constexpr const char* names[] = {
     "block", "residual_mix", "controller", "controller_update", "conv", "attention", "attention_gate",
@@ -27,7 +28,8 @@ inline constexpr const char* names[] = {
     "attention_kv", "attention_query", "attention_sliding_dispatch", "attention_full_dispatch", "attention_merge",
     "attention_old_prepare", "attention_old_upload", "attention_old_dispatch_4k", "attention_old_dispatch_16k",
     "attention_old_merge", "attention_near_prepare", "attention_near_dispatch", "attention_near_merge",
-    "dense_host_input", "dense_host_output"
+    "dense_host_input", "dense_host_output", "attention_kv_sync", "dispatch_configure", "dispatch_wait",
+    "dispatch_readback"
 };
 static_assert(sizeof(names) / sizeof(names[0]) == count);
 inline thread_local std::array<double, count> ms{};

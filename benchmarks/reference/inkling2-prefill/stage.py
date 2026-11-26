@@ -155,6 +155,9 @@ def instrument_npu(src):
                      '            near_stage = perf::Clock::now();')
     npu = insert(npu, 'const auto upload_keys = [&](size_t position, size_t first, size_t last, const Tier& tier) {',
                  '            perf::Measure kv{perf::attention_kv};')
+    npu = change(npu, '            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);\n',
+                 '            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);\n'
+                 '            perf::Measure kv_sync{perf::attention_kv_sync};\n')
     npu = insert(npu, 'const auto attend_tile = [&](size_t token, size_t rows, size_t first, size_t last, bool sink, const Tier& tier) {',
                  '            const auto query_start = perf::Clock::now();')
     npu = insert(npu, '            attn.query.sync(XCL_BO_SYNC_BO_TO_DEVICE, query_size, 0);',
@@ -191,14 +194,15 @@ def instrument_npu(src):
                       '        perf::Measure unpack{perf::group_unpack};\n        block_layout::unpack_grouped_output(')
     npu = change(npu, '        xrt::run run(kernel);', '        auto stage = perf::Clock::now();\n        xrt::run run(kernel);')
     npu = insert(npu, '        failed_ = true;\n        run.start();',
+                 '        perf::add(perf::dispatch_configure, stage);\n'
                  '        if (perf::grouped) perf::add(perf::configure, stage);\n        stage = perf::Clock::now();')
-    npu = insert(npu, '        const auto state = run.wait(timeout_);', '        if (perf::grouped) perf::add(perf::wait, stage);')
+    npu = insert(npu, '        const auto state = run.wait(timeout_);', '        perf::add(perf::dispatch_wait, stage);\n        if (perf::grouped) perf::add(perf::wait, stage);')
     npu = change(npu, '        output.sync(XCL_BO_SYNC_BO_FROM_DEVICE, rows * sizeof(float), 0);',
-                 '        stage = perf::Clock::now();\n'
+                 '        stage = perf::Clock::now();\n        const auto readback_start = stage;\n'
                  '        output.sync(XCL_BO_SYNC_BO_FROM_DEVICE, rows * sizeof(float), 0);\n'
                  '        if (perf::grouped) perf::add(perf::readback_sync, stage);\n'
                  '        stage = perf::Clock::now();')
-    npu = insert(npu, '            fail("non-finite output from " + tensor);', '        if (perf::grouped) perf::add(perf::finite_scan, stage);')
+    npu = insert(npu, '            fail("non-finite output from " + tensor);', '        perf::add(perf::dispatch_readback, readback_start);\n        if (perf::grouped) perf::add(perf::finite_scan, stage);')
     return instrument_npu_overlap(npu) if has_overlap else npu
 
 
