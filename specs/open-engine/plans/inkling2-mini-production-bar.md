@@ -5251,6 +5251,42 @@ group) cut their host time from 3.7 to 1.3 s at 512 tokens, but device wait rose
 device-bound. Narrow F32 projections (controller down at 64 rows, router at 128) now walk token tiles outside so each
 tile stays in cache, with the same dot-product code. The attention gate is threaded.
 
+### SiTU in the singleton expert kernel (2026-11-25)
+
+Evidence lives under `.plans/inkling2/situ-kernel/` (design and budgets in `design.md`). One singleton launch per
+decode visit now runs the 8 experts' gate/up, SiTU and down: 48 expert launches per token instead of 96, and no
+host SiTU, gate/up readback or down-input pack between them.
+
+- Placement: the gate/up pools use a paired band order, so each core holds three gate tiles and their up tiles
+  (`pools.cpp paired_band`). A gate band goes to a core scratch, its up band to the output frame, and the core
+  writes three down-input K32 tiles over that frame. The runtime sequence drains those tiles to a DDR region of the
+  output buffer, waits, and feeds them back as the down leg's activations. No fifo or channel was added: all
+  6 + 6 memtile channels per column were already in use.
+- Program memory went from 14,864 to 15,616 B of 16,384. The first build overflowed at 17,072 B. It fit after
+  four changes: a bit-pattern reciprocal seed (`aie::inv` on 32 floats expands to 32 scalar ops), one K32 tile per
+  SiTU call (a loop spilled every constant across the calls), the 16-lane attention exponential running on
+  `vexpN<32>` (lane-identical), and one project kernel for both formats with a runtime flag.
+- Two device bugs found on the way: the halves' flag offset leaked into the records-per-frame count (the launch
+  completed with B records left over and the next launch timed out), and the last pair waited for the down leg's
+  first weight record before draining its own frame (deadlock).
+- Fixture (`fused_check.cpp`, `fixture.jsonl`): 192 slot rows over layers 0, 7, 13, 19 (IQ4_NL) and 20, 23 (Q8_0),
+  inputs at scale 1 and 4 (gate peaks to 18), against the two-launch route with host SiTU. Mean relative L2
+  `2.45e-4`, worst `1.17e-3`.
+- Bundle logits at 896 prompt tokens plus 256 decode positions (`compare_logits.py`, same bridge): the new bundle
+  with `INKLING2_TEST_SEPARATE_EXPERTS=1` matched the a6b8e3f bundle bit for bit in prefill and decode, which checks
+  the paired order, the shared project kernel and the 16-lane exponential. The fused route kept prefill bit-equal and
+  matched 251 of 256 decode top-1 tokens. All five flips were near ties (reference margins 0.019 to 0.093). KL mean
+  `4.4e-4`, max `4.95e-3`. Real-text NLL 1.2769 against 1.2754, top-1 178 against 180 of 256.
+- Five-token prompt with 64 greedy tokens (`inkling2_npu_check`): both bundles matched all 64 native host IDs.
+- Timing with the staged profiler bridge, 256 decode tokens after 896, 6 host threads, Arbiter `--measure`, order
+  reference, fused, fused, reference (the second fused run was flagged NOISY for a 2 s outside burst): decode median
+  179.1 / 180.0 ms per token against 171.4 / 170.8 ms. MoE fell from 68.5 to 57.7 ms per token: host SiTU 3.7 ms
+  removed, device wait 57.1 to 52.6 ms, configure 1.3 to 0.7 ms. Remaining MoE host work is about 5 ms (routing
+  2.4 ms, one token pack, the 8-row readback, finite check, unpack and weighted sum). Prefill is unchanged (same
+  bits; 39.9 to 40.8 s for 896 tokens in all four runs). Each route repeated its decode logits bit for bit.
+- Open: speculative verify still uses grouped experts with host SiTU, so verify and direct decode no longer share
+  expert arithmetic (OPEN-SPEC-DSPARK's exactness checks need a rerun); grouped prefill keeps host SiTU.
+
 ## Rebuild the v11 kernel bundle
 
 From the repository root, use the IRON Python environment with Peano and the XRT packaging tools
