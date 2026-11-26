@@ -37,8 +37,8 @@ stage named, near optimal with the remainders named. New today:
    streams run at 38-43 GB/s against 52; the routed experts' hidden round trip; the tail's two context changes
    (`ln`, `lm`, about 1.6 ms). The verify pass costs 1.67 plain steps (two-row glue / DeltaNet / post serialized,
    twice the experts), which keeps MTP near break-even on Strix Halo.
-2. **Prefill**: the token-batched expert kernel (core-bound at 8 tokens a visit: native `mmul<4,8,8>`, one unpacked
-   weight for both sub-tiles); the DeltaNet conv and delta rule on the NPU (a chunked kernel); `attn_fa256` at 2.3x
+2. **Prefill** (2.99 ms a token at 8k): the token-batched expert kernel at 16 tokens a visit (OPEN-MOE-DQBUF) is
+   core-bound again (2.34 ms for 32 slots against a 1.53 ms stream; native `mmul<4,8,8>` measured slower); the DeltaNet conv and delta rule on the NPU (a chunked kernel); `attn_fa256` at 2.3x
    its transfer floor (hardware bf16 exp2 with an accuracy gate, fewer PV calls, Q to bfp16 once a pass).
 3. **Vision on the NPU** only if the tower outgrows the text prefill (3.7-4.0 s for 3,200 patches against about
    4.7 s of text prefill today).

@@ -1687,7 +1687,7 @@ images), NPU power mode Default (setting it needs root there), on a box shared w
 | Bar item | State | Evidence |
 |---|---|---|
 | Block prefill | Done. The layer-major block route (T = 256) is the default in the CLI, `phlegm run` and `serve` | speed table |
-| Near optimal | Done (2026-11-26). Decode streams 2.9 GB a step: floor about 56 ms at 52 GB/s; measured 73.5 ms a step (13.6 tok/s), dispatch minima 69.2 ms, after the tuning passes OPEN-DECODE-ONE-CONTEXT-Q8 (the 20 lx / ax context switches a step gone: 94.0 -> 78.9 ms) and OPEN-DECODE-STREAM-UX's knobs on the merged image (-> 73.5 ms), bit-identical. Prefill 3.49 ms a token at 4k and 8k (287 tok/s) after `attn_fa256`, OPEN-MOE-PIPE and OPEN-DN-FUSED. What is left is spread over the streams' rates (35-42 GB/s against 52) and named under "What is left" | measure units, "What is left" |
+| Near optimal | Done (2026-11-26). Decode streams 2.9 GB a step: floor about 56 ms at 52 GB/s; measured 73.0 ms a step (13.7 tok/s), dispatch minima 68.5 ms, after OPEN-DECODE-ONE-CONTEXT-Q8 (the 20 lx / ax context switches a step gone: 94.0 -> 78.9 ms) and OPEN-DECODE-STREAM-UX's knobs (-> 73.5 ms), bit-identical. Prefill 2.99 ms a token at 8k (334 tok/s) after `attn_fa256`, OPEN-MOE-PIPE, OPEN-DN-FUSED and OPEN-MOE-DQBUF (the experts at 16 tokens a visit: 1.17x). What is left is spread over the streams' rates (38-43 GB/s against 52) and named under "What is left" | measure units, "What is left" |
 | Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %), on `attn_block` (2026-11-25) and again on `attn_fa256` (2026-11-26): 262,000-token prefill 2,457 s against 14,706 s. Through `phlegm serve` on Strix Halo (MTP on, `--max-ctx 263168`, a 262,005-token chat prompt): PASS, 2,163 s end to end | speed table, [qwen36moe-attn-fa256.md](plans/qwen36moe-attn-fa256.md) |
 | All on the NPU | Done with named host stages (tables below): in prefill the DeltaNet conv and delta rule (0.77 ms a token at 4k), the layer tails and routers, the MoE gather / scatter (now under the NPU's passes); in decode the router read and the q8 shared expert (overlapped); the vision tower (3.7-4.0 s for 3,200 patches) | host stages, "What is left" |
 | Drafter | Done: the MTP head (`blk.40`) drafts one token and a two-row verify pass checks it (OPEN-VERIFY-ROWS-QWEN36MOE, OPEN-SPEC-MTP-QWEN36MOE), on one context since 2026-11-26 (`vux`, verify 142.5 -> 121.8 ms); output byte-identical to `off`, also after an image. Strix Point (split decode): `phlegm serve --speculative mtp` 1.24-1.40x. Strix Halo with one-context decode (plain 73 ms): 1.05x on code, and phlegm's cost-aware policy (SERVER-SPEC-COST) falls back to plain steps where drafting does not pay (prose 0.97x). Prompt lookup runs on the same pass (1.06x / 0.98x). The verify pass costs 1.67 plain steps: glue, DeltaNet and post run once a row, and two rows stream twice the experts | plan phase 5, OPEN-DECODE-ONE-CONTEXT-Q8 |
@@ -1759,6 +1759,12 @@ With the one-context images (OPEN-DECODE-ONE-CONTEXT-Q8, 2026-11-26 15:09, the s
 one other process at one core for 365 s; `bench/phlegm_bench_measure_1509.json`): prefill 212.2 / 251.6 / 275.0 / 287.4
 tok/s and decode 13.22 / 12.89 / 12.28 / 11.21 tok/s at 512 / 1k / 2k / 4k; CLI decode 73.5 ms a step (13.6 tok/s).
 
+With OPEN-MOE-DQBUF as well (2026-11-26 15:44, measure unit; NOISY only for kswapd at 93 % of a core for 14 s;
+`bench/phlegm_bench_measure_1544.json`): prefill 227.0 / 280.0 / 315.1 / 333.7 tok/s and decode 13.33 / 12.98 / 12.35 /
+11.25 tok/s at 512 / 1k / 2k / 4k; CLI 4k / 8k prefill 3.03 / 2.99 ms a token (330-334 tok/s), decode 73.0 ms a step.
+Prefill at 8k, ms a token: linear layers 2.14 (experts 0.97, GEMMs 0.43, DeltaNet host 0.27, tails 0.09), full layers
+0.85 (experts 0.32, GEMMs 0.35, attention 0.03).
+
 **Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
 norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
 the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
@@ -1783,14 +1789,16 @@ measure unit, `OFLM_OPEN_STEP_TRACE=1`, 63 steps; bytes from the manifest's stre
 Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.24x / 1.31x). Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
-Prefill at 4,096 tokens (Strix Halo, after OPEN-MOE-PIPE and OPEN-DN-FUSED; 3.48 ms a token in the quiet measure unit, the split below is from a busy-box run at 5.6 ms a token): the token-batched
+Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
 sub-tiles, `moe_batch.h`), the DeltaNet conv and delta rule on the host 0.77 ms (the NPU kernel for them is not
 written), GEMM waits 0.5 ms, the layer tails (residual, norms, router) 0.4 ms, attention 0.1 ms. Long context:
 `attn_fa256` runs 7.7 us a 64-key chunk against a 3.35 us transfer floor (plan `qwen36moe-attn-fa256.md`).
 
-Vision: the tower on the host, 3.7-4.0 s for 3,200 patches (a 1280 x 640 image, 800 tokens) on a busy box, under
-the text prefill of the same prompt (about 4.7 s), so its GEMMs stay on the CPU (AVX-512, OPEN-VISION-BLOCK).
+Vision: the tower on the host, 2.2 s for 3,200 patches (a 1280 x 640 image, 800 tokens) on a quiet box, attention
+1.2 s of it at about 1.1 TFLOPS; the text prefill of the same 834-token prompt is about 2.5 s, so its GEMMs stay on
+the CPU (AVX-512, OPEN-VISION-BLOCK). AVX-512 BF16 dot products for the linears measured no faster (2.05-2.30 s) and
+2 % less exact, and were dropped.
 
 **Host stages, decode:** router read and stream patch 0.2-0.3 ms a token; the q8 shared expert about 10 ms a token
 of host time, hidden behind the routed MoE dispatch (107.0 ms with the overlap against 112.7 ms without);
