@@ -5404,6 +5404,38 @@ byte-identical in all four runs, wall 112.6 / 176.2 / 176.2 / 112.6 s. Verify pa
 to stay bit-equal to decode, so a k-row verify reads the dense weights k times; the routed experts of k tokens are
 mostly disjoint (8 of 128 each), so expert bytes also grow with k. Both make a verify cost close to k decode tokens.
 
+**Cheaper verify (`3485bfa`).** The singleton dense kernel already computes four activation rows (`BLOCK_ROWS=4`,
+per-row activation scales, independent integer dots), and decode used one. Verify passes now put up to four tokens of
+a shared Q/K/V input, and every attention output, into one launch. Verify rows also run the routed experts row by row
+on decode's fused singleton launch: the grouped fused launch (16-row slots) took about 4.9 ms a group and switched to
+the grouped image twice a visit. The export now includes the two-row head by default. `verify_cost --dspark` at
+1,024 tokens (NOISY, load 4-28):
+
+| Verify rows | Before | Multi-row dense | + row-wise experts | + head pair |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 784-816 ms | 784-789 | 313-321 | 304-307 |
+| 4 | 975-1,096 | 975-988 | 546-553 | 514-525 |
+| 8 | 1,295-1,563 | 1,295-1,347 | 1,025-1,035 | 957-973 |
+
+Decode was 190-207 ms in the same runs. Partial accept 30 of 30 (prefixes 5, 1,021, 3,000) for each change.
+
+**Speculation survey** (`phlegm serve`, six greedy prompts of up to 320 tokens, reasoning none, `PHLEGM_SPEC_STATS=1`,
+NOISY, load 4-13). Output text was identical across off, DSpark and prompt lookup.
+
+| Prompt | Off | DSpark | Tokens a cycle | Draft acceptance | Lookup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| code | 70.5 s | 64.8 s | 2.01 | 64% | 67.9 s |
+| code edit | 25.6 | 24.7 | 2.25 | 70% | 32.9 |
+| prose | 33.6 | 39.2 | 1.37 | 45% | 54.4 |
+| math | 26.2 | 27.3 | 2.21 | 65% | 57.1 |
+| list | 46.0 | 50.0 | 1.74 | 57% | 95.7 |
+| json | 46.2 | 43.3 | 2.76 | 76% | 75.6 |
+
+DSpark wins 3-8% on code and JSON and loses 4-17% elsewhere. Each extra verify row costs about 0.6 of a decode token
+(mostly routed experts, which differ per token, plus the separate-input dense visits that cannot share a launch), so a
+draft pays only above about 60% acceptance. Prompt lookup drafted rarely (37-141 drafts over 131-286 cycles) and was
+slower on every prompt. Both stay opt-in; the registry entry ships `speculative: off`.
+
 ## Rebuild the v11 kernel bundle
 
 From the repository root, use the IRON Python environment with Peano and the XRT packaging tools
