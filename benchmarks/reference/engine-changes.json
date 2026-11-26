@@ -512,6 +512,13 @@
         "src/open_qwen36/inkling2_host.cpp": "a8f4510a79655ab7973040f8c9bed0e060c045f244be03512105c787486e2017",
         "src/open_qwen36/inkling2_host.hpp": "8fb9abea7ea6f27b031501fc7804968dfc652dd17dd138629bb5a75802fb41b3"
       }
+    },
+    {
+      "id": "inkling2-used-kv-chunks",
+      "origin": "open-kernels: row-mode attention packs and syncs only the K/V chunks before the key end; the kernel never reads the rest (bit-equal)",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "1e04f75137d432650f95c8dbcf49711e4834bce7903bbf0e21f9a0eaa328b8dd"
+      }
     }
   ]
 }

@@ -417,14 +417,18 @@ void pack_kv(const Inkling2AttentionView& view, const std::vector<uint16_t>& tab
     }
 }
 
+// The kernel returns before it reads a chunk that starts at or after the key end.
+constexpr size_t used_chunks(size_t first, size_t end) { return (end - first + key_rows - 1) / key_rows; }
+
 // Decode and verify records (at most 8 rows): K transposed, V, then FP32 bias [row][head in group][key]
 // with masked keys at -1e30. The kernel needs no relative strip in this mode.
 void pack_kv_rows(const Inkling2AttentionView& view, size_t query, size_t rows, size_t first, size_t end,
                   size_t chunks, uint16_t* dst) {
     constexpr float hidden = -1.0e30f;
     const size_t row0 = query - view.position;
+    const size_t used = used_chunks(first, end);
 #pragma omp parallel for schedule(static)
-    for (long long item = 0; item < static_cast<long long>(chunks * kv_heads); ++item) {
+    for (long long item = 0; item < static_cast<long long>(used * kv_heads); ++item) {
         const size_t chunk = static_cast<size_t>(item) / kv_heads, head = static_cast<size_t>(item) % kv_heads;
         const size_t at = first + chunk * key_rows;
         auto* block = dst + (head * chunks + chunk) * key_words;
@@ -1295,7 +1299,10 @@ public:
             const auto* archive = wide_old_ && wide_old_->packed_keys.has_retired() ? &wide_old_->packed_keys : nullptr;
             if (row_mode) pack_kv_rows(view, position, view.rows, first, last, tier.chunks, attn.kv.map<uint16_t*>());
             else pack_kv(view, table, position, first, last, tier.chunks, attn.kv.map<uint16_t*>(), archive);
-            attn.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE, kv_heads * tier.chunks * key_words * sizeof(uint16_t), 0);
+            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);
+            if (used == tier.chunks) attn.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE, kv_heads * used * bytes, 0);
+            else for (size_t head = 0; head < kv_heads; ++head)
+                attn.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE, used * bytes, head * tier.chunks * bytes);
         };
         const auto attend_tile = [&](size_t token, size_t rows, size_t first, size_t last, bool sink, const Tier& tier) {
             const QueryHeader header{static_cast<int32_t>(view.position + token), static_cast<int32_t>(first),
