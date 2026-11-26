@@ -9118,6 +9118,17 @@ last-position logits byte-identical with `OFLM_OPEN_MOE_PIPE=0` and 1, same gree
 prefill on the Strix Halo box (busy, load average about 35, two alternating rounds): 43.98 / 39.78 s serial,
 33.99 / 33.48 s piped (1.19-1.29x).
 
+**OPEN-DN-FUSED (2026-11-26).** The block prefill's host delta rule reads and writes a head's S once a token:
+token t + 1's S^T k pass is folded into token t's update pass, every element taking the same operations in the same
+order without contraction, so og and S are bit-identical to the two-pass loop (`dn_bench`, 256 tokens, 32 heads);
+AVX-512 where the CPU has it. The DeltaNet conv's SiLU runs on 16 lanes with a polynomial exp (about 1 ulp from
+`expf`; og relative difference 3e-7). `OFLM_OPEN_DN_UNFUSED=1` keeps both old loops. The CLI's CMake build now
+compiles `block_host.cpp` with `-ffp-contract=off`, as phlegm's bridge build does, so the two compute the same bits.
+Single thread, min of 25 blocks: conv phase 11.1-14.6 -> 4.9-6.5 ms, rule 27.4-34.0 -> 19.9-25.3 ms. In the model
+(Strix Halo, 4,096-token block prefill, alternating): DeltaNet host 1.05 / 1.21 -> 0.86 / 0.77 ms a token, prefill
+24.4 / 26.4 -> 23.8 / 23.0 s. KL gate (8 x 512 against llama.cpp CPU): mean 0.0278, median 0.0085, same top 93.0 %
+(0.0275 / 0.0080 / 93.4 % before; this text's CPU-vs-Vulkan spread not yet measured).
+
 ### OPEN-PREFILL-ATTN: the block attention's products on the NPU
 **Applies to:** openflowlm-next (`open_kernels/designs/attn_block/`, `open_kernels/recipes/{qwen36moe,dense}.py`, `src/open_qwen36/{manifest,block_host,core}.cpp`, `utilities/dense-decode-probe/attn_route_check.py`)
 **Test category:** manual (needs the NPU; the harness measurement and the full-model check are the artifact, `tests/test_prefill_attn.py` documents the procedure); the recipe emission and the manifest schema are unit-tested in `tests/test_prefill_attn.py` and `src/open_qwen36/manifest_test.cpp`

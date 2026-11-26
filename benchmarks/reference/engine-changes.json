@@ -196,6 +196,14 @@
       "files": {
         "src/open_qwen36/core.cpp": "153b20ade318040b581b5b44f7c18cb893936909f1c99ed9ab607102e04b1904"
       }
+    },
+    {
+      "id": "qwen36moe-dn-fused",
+      "origin": "open-kernels: the prefill delta rule with S read once a token (the next token's S^T k folded into this token's update, same operations in the same order: bit-identical; AVX-512), the DeltaNet conv's SiLU vectorized (AVX-512 exp, about 1 ulp from expf); OFLM_OPEN_DN_UNFUSED=1 keeps the old loops; the CLI's CMake build compiles block_host.cpp without FP contraction, as phlegm's bridge does (OPEN-DN-FUSED)",
+      "files": {
+        "src/open_qwen36/block_host.cpp": "a6d04ae1f40b6d8e2b393a536dc8cc21203394ac639483a8205fc5ca36e4d40f",
+        "src/open_qwen36/CMakeLists.txt": "1a155fa13c3e24dec7801733514f7428cbc60ecce933236fc3e5352222c244e8"
+      }
     }
   ]
 }

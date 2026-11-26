@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -29,6 +31,43 @@ float bf16r(float x) { return bf16_to_f32(f32_to_bf16(x)); }
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 float softplus(float x) { return x > 0 ? x + std::log1p(std::exp(-x)) : std::log1p(std::exp(x)); }
+
+// silu over n floats in place (OPEN-DN-FUSED). AVX-512: exp(-x) by a Cephes-style range reduction and a degree-6
+// polynomial (about 1 ulp from expf), so the results move by rounding, not by model-visible amounts; elsewhere
+// the scalar silu. OFLM_OPEN_DN_UNFUSED=1 keeps the scalar one everywhere.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512f")))
+#endif
+void silu_rows_avx512(float* x, size_t n) {
+    const __m512 one = _mm512_set1_ps(1.f), log2e = _mm512_set1_ps(1.44269504088896341f);
+    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
+    const __m512 lo = _mm512_set1_ps(-87.3f), hi = _mm512_set1_ps(88.3f);
+    size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m512 v = _mm512_loadu_ps(x + j);
+        __m512 a = _mm512_min_ps(_mm512_max_ps(_mm512_sub_ps(_mm512_setzero_ps(), v), lo), hi);   // -x, clamped
+        const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(a, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        a = _mm512_sub_ps(_mm512_sub_ps(a, _mm512_mul_ps(fx, c1)), _mm512_mul_ps(fx, c2));
+        __m512 y = _mm512_set1_ps(1.9875691500e-4f);
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(1.3981999507e-3f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(8.3334519073e-3f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(4.1665795894e-2f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(1.6666665459e-1f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(5.0000001201e-1f));
+        y = _mm512_fmadd_ps(y, _mm512_mul_ps(a, a), _mm512_add_ps(a, one));
+        const __m512 e = _mm512_scalef_ps(y, fx);                                // exp(-x)
+        _mm512_storeu_ps(x + j, _mm512_div_ps(v, _mm512_add_ps(one, e)));
+    }
+    for (; j < n; ++j) x[j] = silu(x[j]);
+}
+
+void silu_rows(float* x, size_t n) {
+#if defined(__GNUC__) || defined(__clang__)
+    static const bool fast = __builtin_cpu_supports("avx512f") && !std::getenv("OFLM_OPEN_DN_UNFUSED");
+    if (fast) { silu_rows_avx512(x, n); return; }
+#endif
+    for (size_t j = 0; j < n; ++j) x[j] = silu(x[j]);
+}
 
 // bf16r over eight floats: f32_to_bf16's integer rounding, so the same bits
 inline __m256 bf16r8(const float* p) {
@@ -160,6 +199,72 @@ void delta_token(size_t dim, float* Sh, const float* kk, const float* qq, const 
             }
         }
     }
+}
+
+// The delta rule over one head's R tokens with S read and written once a token (OPEN-DN-FUSED): token t + 1's
+// S^T k pass is folded into token t's update pass. Every element takes the same operations in the same order as
+// R calls of delta_token (tv[j] += k_i * (S_ij * dc), S_ij = S_ij * dc + k_i * delta_j, o_j += S_ij * q_i, i
+// ascending), and none of them is contracted into an FMA, so the results are bit-identical. AVX-512, 16 lanes;
+// dim a multiple of 16. post(t, o) takes token t's output row before the next token runs.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+__attribute__((target("avx512f")))
+#endif
+void delta_head_avx512(size_t dim, size_t R, float* Sh, const float* K, size_t kstride, const float* Q, size_t qstride,
+                       const float* V, size_t vstride, const float* dcs, const float* bts, size_t gstride, float* tv,
+                       float* tvn, float* delta, float* o, const std::function<void(size_t, float*)>& post) {
+    std::fill(tv, tv + dim, 0.f);
+    {
+        const __m512 dc = _mm512_set1_ps(dcs[0]);
+        for (size_t i = 0; i < dim; ++i) {
+            const float* Si = Sh + i * dim;
+            const __m512 ki = _mm512_set1_ps(K[i]);
+            for (size_t j = 0; j < dim; j += 16)
+                _mm512_storeu_ps(tv + j, _mm512_add_ps(_mm512_loadu_ps(tv + j),
+                                                       _mm512_mul_ps(ki, _mm512_mul_ps(_mm512_loadu_ps(Si + j), dc))));
+        }
+    }
+    for (size_t t = 0; t < R; ++t) {
+        const float* k = K + t * kstride;
+        const float* q = Q + t * qstride;
+        const float* v = V + t * vstride;
+        const float bt = bts[t * gstride];
+        for (size_t j = 0; j < dim; ++j) delta[j] = bt * (v[j] - tv[j]);
+        std::fill(o, o + dim, 0.f);
+        const bool next = t + 1 < R;
+        const float* kn = next ? K + (t + 1) * kstride : nullptr;
+        if (next) std::fill(tvn, tvn + dim, 0.f);
+        const __m512 dc = _mm512_set1_ps(dcs[t * gstride]);
+        const __m512 dcn = _mm512_set1_ps(next ? dcs[(t + 1) * gstride] : 0.f);
+        for (size_t i = 0; i < dim; ++i) {
+            float* Si = Sh + i * dim;
+            const __m512 ki = _mm512_set1_ps(k[i]), qi = _mm512_set1_ps(q[i]);
+            const __m512 kni = _mm512_set1_ps(next ? kn[i] : 0.f);
+            for (size_t j = 0; j < dim; j += 16) {
+                const __m512 sv = _mm512_add_ps(_mm512_mul_ps(_mm512_loadu_ps(Si + j), dc),
+                                                _mm512_mul_ps(ki, _mm512_loadu_ps(delta + j)));
+                _mm512_storeu_ps(Si + j, sv);
+                _mm512_storeu_ps(o + j, _mm512_add_ps(_mm512_loadu_ps(o + j), _mm512_mul_ps(sv, qi)));
+                if (next)
+                    _mm512_storeu_ps(tvn + j, _mm512_add_ps(_mm512_loadu_ps(tvn + j), _mm512_mul_ps(kni, _mm512_mul_ps(sv, dcn))));
+            }
+        }
+        post(t, o);
+        if (next) std::copy(tvn, tvn + dim, tv);
+    }
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#endif
+
+bool have_avx512f() {
+#if defined(__GNUC__) || defined(__clang__)
+    static const bool ok = __builtin_cpu_supports("avx512f") && !std::getenv("OFLM_OPEN_DN_UNFUSED");
+    return ok;
+#else
+    return false;
+#endif
 }
 
 }  // namespace
@@ -541,7 +646,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     for (; j < nch; ++j) c[j] += cw[j] * (g.conv_f32 ? v[j] : bf16r(v[j]));
                 }
             }
-            for (size_t j = 0; j < nch; ++j) c[j] = silu(c[j]);
+            silu_rows(c.data(), nch);
             for (size_t hh = 0; hh < g.key_heads; ++hh)
                 for (int which = 0; which < 2; ++which) {
                     const float* src = c.data() + which * key_w + hh * dim;
@@ -602,6 +707,19 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         std::vector<float> tv(dim), delta(dim), o(dim), on(dim);
         float* Sh = S + h * g.s_rows * dim;
         const size_t kh = g.key_head_tiled ? h % g.key_heads : h / (g.value_heads / g.key_heads);
+        if (have_avx512f() && dim % 16 == 0 && R > 0) {
+            std::vector<float> tvn(dim);
+            delta_head_avx512(dim, R, Sh, Kk.data() + kh * dim, key_w, Q.data() + kh * dim, key_w, V.data() + h * dim, vw,
+                              decay.data() + h, beta.data() + h, g.value_heads, tv.data(), tvn.data(), delta.data(),
+                              o.data(), [&](size_t t, float* ot) {
+                                  for (size_t j = 0; j < dim; ++j) ot[j] *= inv_sqrt;
+                                  rms_vec(ot, dim, nw, g.eps, on.data());
+                                  float* out = og + t * vw + h * dim;
+                                  const float* zz = z + t * vw + h * dim;
+                                  for (size_t j = 0; j < dim; ++j) out[j] = on[j] * silu(zz[j]);
+                              });
+            continue;
+        }
         for (size_t t = 0; t < R; ++t) {
             delta_token(dim, Sh, Kk.data() + t * key_w + kh * dim, Q.data() + t * key_w + kh * dim,
                         V.data() + t * vw + h * dim, decay[t * g.value_heads + h], beta[t * g.value_heads + h],
