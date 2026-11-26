@@ -653,3 +653,7 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   0.98x). The MTP cycle: verify pass 144.7 ms (1.51 plain steps here against 1.35 on Strix Point), draft 12.2, commit
   3.9. MTP stays the shipped drafter; its gain here is bounded by the verify pass's cost, which has the same context
   switches as decode (`vlx` / `vax`).
+- 2026-11-26 14:25, measure unit (`scratch/measure_unit.sh` under `arbiter run --measure`, NOISY only for one other
+  process at one core for 407 s): `phlegm bench --development` 212 / 251 / 276 / 287 tok/s prefill and 10.4 / 10.2 /
+  9.8 / 9.1 tok/s decode at 512 / 1k / 2k / 4k; CLI 4k and 8k prefill 3.48 / 3.47 ms a token; decode 94 ms a step.
+  The busy-box numbers earlier in the day were 1.6-1.9x slower: the box's load, not the engine.

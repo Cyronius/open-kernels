@@ -1739,6 +1739,22 @@ firmware 1.1.2.65, XRT 2.27.0, `kernels-fa262k`, 128 output tokens, 2026-11-26 1
 The decode rate here is not comparable with the Strix Point table (performance mode, a quiet box): decode at
 position 1 read 150-250 ms a step on this box the same day.
 
+The same on a quiet box: one `arbiter run --measure` unit (2026-11-26 14:25, load 2.3 before and 5.0 after, the iGPU idle;
+arbiter's verdict NOISY because one other process used one core for 407 s), the OPEN-DECODE-STREAM-LX set, NPU
+power mode Default, `bench/phlegm_bench_measure_1425.json`:
+
+| input tokens | prefill tok/s | decode tok/s | first token ms |
+|---|---|---|---|
+| 512 | 211.9 | 10.39 | 2,416 |
+| 1,024 | 250.6 | 10.18 | 4,087 |
+| 2,048 | 275.7 | 9.79 | 7,429 |
+| 4,096 | 287.3 | 9.10 | 14,256 |
+
+In the same unit (CLI): 4,096- and 8,192-token block prefill 14.2 s and 28.4 s (3.48 / 3.47 ms a token, 288 tok/s);
+decode 94 ms a step at position 24-87 (10.6 tok/s; step-trace minima sum 79.0 ms). Prefill profile at 8k, ms a token:
+linear layers 2.49 (token-batched experts 1.31, GEMMs 0.40, DeltaNet host 0.27, tails 0.09), full layers 0.98
+(experts 0.44, GEMMs 0.34, attention 0.03).
+
 **Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
 norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
 the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
@@ -1763,7 +1779,7 @@ Sum of minima 85 ms against a 56 ms stream floor (1.5x); the means on the busy S
 iGPU of another session at 93-99 %), and Strix Point in performance mode 101-110 ms. Past 32k the attention walk
 in `ax0` dominates and is compute-bound (0.37 us a row a full layer).
 
-Prefill at 4,096 tokens (Strix Halo, after OPEN-MOE-PIPE and OPEN-DN-FUSED, 5.6 ms a token): the token-batched
+Prefill at 4,096 tokens (Strix Halo, after OPEN-MOE-PIPE and OPEN-DN-FUSED; 3.48 ms a token in the quiet measure unit, the split below is from a busy-box run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
 sub-tiles, `moe_batch.h`), the DeltaNet conv and delta rule on the host 0.77 ms (the NPU kernel for them is not
 written), GEMM waits 0.5 ms, the layer tails (residual, norms, router) 0.4 ms, attention 0.1 ms. Long context:
