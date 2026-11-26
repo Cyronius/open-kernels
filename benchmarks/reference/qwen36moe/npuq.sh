@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# Run a command under arbiter npu once no other loaded NPU client is alive (2026-11-23).
+# Run a command under arbiter npu once no other loaded NPU client is alive (2026-11-23; Linux 2026-11-26).
 # Another process on the NPU can hang this run's queue (F-0185), so foreign contexts seen during the run are logged too.
+# NPUQ_MEASURE=1 takes the whole machine (arbiter --measure) for benchmark numbers.
+if [ -z "${WINDIR:-}" ]; then
+  # Linux: arbiter run makes its own process group, so it waits, runs and releases in one call
+  m=(); [ -n "${NPUQ_MEASURE:-}" ] && m=(--measure)
+  exec arbiter run npu "${m[@]}" --label "${NPUQ_LABEL:-qwen36moe}" --eta "${NPUQ_ETA:-20m}" -- bash -c '
+    xrt-smi examine -r aie-partitions 2>&1 | grep -q "No hardware contexts" ||
+      echo "npuq $(date +%H:%M:%S): NPU contexts already open when the run started" >&2
+    exec "$@"' npuq "$@"
+fi
 others() {
   # any process with an NPU hardware context, except Windows' own (their contexts sit idle on the NPU)
   /c/Windows/System32/AMD/xrt-smi.exe examine -r aie-partitions 2>&1 | grep -oE '[A-Za-z0-9_.-]+\.exe' |

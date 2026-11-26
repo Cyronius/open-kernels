@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Decode ms/token from the wall time of phlegm run at two lengths, speculative off and lookup (2026-11-25).
-P=/c/code/phlegm-qwen36moe/target/release/phlegm.exe
-O=/c/models/qwen36moe/mtp
+. "$(dirname "$0")/paths.sh"
+O=$QW/mtp; mkdir -p $O
 PROMPT=${PROMPT:-'Here is a Python class:
 
 class Inventory:
@@ -26,8 +26,8 @@ class Inventory:
 Rewrite the whole class exactly as it is, but rename Inventory to Stock and items to goods. Output only the code.'}
 for mode in ${MODES:-off lookup mtp}; do for n in 8 ${N:-200}; do
   s=$(date +%s%N)
-  OFLM_OPEN_MTP=1 OFLM_OPEN_VERIFY=1 "$P" run --model-dir 'C:\models\qwen36moe\Qwen3.6-35B-A3B-UD-Q4_K_S' --kernels 'C:\models\qwen36moe\kernels-v' \
-    --bridge 'C:\models\qwen36moe\bridge\phlegm-reference-bench.exe' --max-ctx 4096 --think false --temperature 0 \
+  OFLM_OPEN_MTP=1 OFLM_OPEN_VERIFY=1 "$QPHLEGM" run --model-dir "$(qpath "$QM")" --kernels "${KERN:-$(qpath "$QW/kernels-v")}" \
+    --bridge "$(qpath "$QBRIDGE")" --max-ctx 4096 --think false --temperature 0 \
     --speculative $mode --max-tokens $n --prompt "$PROMPT" > $O/st_${mode}_$n.out 2> $O/st_${mode}_$n.err
   rc=$?; e=$(date +%s%N); echo "$mode $n exit $rc wall_ms $(( (e - s) / 1000000 )) chars $(wc -c < $O/st_${mode}_$n.out)"
 done; done

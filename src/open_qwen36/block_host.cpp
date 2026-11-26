@@ -57,6 +57,16 @@ void rope_angles(size_t pairs, const double* inv_freq, double pos, float* c, flo
     }
 }
 
+// M-RoPE: pair i turns by the position on its own axis (t, h, w); with every axis equal this is rope_angles
+void mrope_angles(size_t pairs, const double* inv_freq, const int64_t pos3[3], const int* section, bool il,
+                  float* c, float* s) {
+    for (size_t i = 0; i < pairs; ++i) {
+        const double a = static_cast<double>(pos3[mrope_axis(i, section, il)]) * inv_freq[i];
+        c[i] = static_cast<float>(std::cos(a));
+        s[i] = static_cast<float>(std::sin(a));
+    }
+}
+
 // the `pairs` rotations from rope_angles' tables; rope() below is the half-split case, dist == pairs
 void rope_pairs_cs(float* x, size_t pairs, size_t dist, const float* c, const float* s) {
     for (size_t i = 0; i < pairs; ++i) {
@@ -766,6 +776,7 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, rows = g.pos0 + g.t_real;
     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < (g.kv_pair ? 4 : 2) * kvw)
         throw std::runtime_error("open_qwen36: attention_block: inconsistent geometry");
+    if (g.mpos) throw std::runtime_error("open_qwen36: attention_block (host route) has no M-RoPE positions");
     const size_t v_off = (g.kv_pair ? 2 : 1) * kvw;
     const size_t grp = g.nh / g.kvh, R = g.t_real;
     const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
@@ -854,6 +865,8 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
     const size_t dist = g.pair ? g.pair : half;
     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw || dist < half || dist + half > g.hd)
         throw std::runtime_error("open_qwen36: attention_prep: inconsistent geometry");
+    if (g.mpos && g.rope_il)
+        throw std::runtime_error("open_qwen36: attention_prep: M-RoPE positions with interleaved rope pairs");
     const float scale = g.scale > 0 ? static_cast<float>(g.scale) : 1.0f / std::sqrt(static_cast<float>(g.hd));
     std::fill(Q, Q + g.T * qw, 0.f);
 #pragma omp parallel
@@ -862,7 +875,8 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
 #pragma omp for
     for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
         const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
-        rope_angles(half, inv_freq, static_cast<double>(p), cs.data(), cs.data() + half);
+        if (g.mpos) mrope_angles(half, inv_freq, g.mpos + 3 * t, g.msec, g.mrope_il, cs.data(), cs.data() + half);
+        else rope_angles(half, inv_freq, static_cast<double>(p), cs.data(), cs.data() + half);
         for (size_t h = 0; h < g.nh; ++h) {
             float* dst = Q + t * qw + h * g.hd;
             const float* src = q + t * qw + h * g.hd;

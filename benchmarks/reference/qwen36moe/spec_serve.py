@@ -1,5 +1,6 @@
 # Decode rate through phlegm serve, from streamed chunk times: (chunks - 1) / (last - first); greedy (2026-11-25).
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -31,7 +32,7 @@ for name, text in [("rewrite", PROMPTS["rewrite"]),
                 out.append(d["content"])
     n = len(times)
     rate = (n - 1) / (times[-1] - times[0]) if n > 1 else 0
-    open(f"C:/models/qwen36moe/mtp/serve_{tag}_{name}.txt", "w", encoding="utf-8").write("".join(out))
+    open(os.path.join(os.environ.get("QW", os.path.expanduser("~/models/qwen36moe")), "mtp", f"serve_{tag}_{name}.txt"), "w", encoding="utf-8").write("".join(out))
     print(f"{tag} {name}: {n} chunks, {rate:.2f} chunks/s, {1000 / rate if rate else 0:.1f} ms/chunk")
 # one more short request makes the bridge print the explain request's stats
 body = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 1, "temperature": 0,

@@ -7258,6 +7258,49 @@ segfaults on the local 1.0.2 / 0.9.45 containers (it expects the Q4_K branch),
 so on this box only the open engine can serve these files. Log:
 `.claude/plans/issue-16-hw-results.md`.
 
+### OPEN-VISION-BLOCK: an image prompt on the block route, through the CLI and phlegm's bridge
+**Applies to:** `src/open_qwen36/core.cpp` (`step_gemm_prompt_mrope`, `step_gemm_prompt`, `step_verify`,
+`verify_commit`, `seek`), `block_host.cpp` (`attention_prep` M-RoPE), `vision/prompt.cpp` (`patchify`,
+`smart_resize`, `prefill_images`), `vision/vit.cpp` (the packed GEMM), `cli.cpp` (`--image`); phlegm
+`benchmarks/reference/bridge.cpp` (SERVER-IMAGE-INPUT)
+**Verification:** manual (`benchmarks/reference/qwen36moe/vision_check.sh`; the phlegm serve check below)
+
+A prompt with images shall prefill on the MoE layer-major block route, not one decode step a row: each image
+row's input is the vision tower's output, and every row of a full-attention layer turns by its M-RoPE position
+(t, h, w) on the host (`attention_prep`, the axis of each rotary pair as `pools::build_ptab_record` picks it).
+Text after an image, in the same prompt or a later one, continues from the M-RoPE counter on the block route
+too; the block-major route (`step_gemm_block`) refuses a prompt after an image. The verify pass writes the
+counter's position records for its rows and the commit moves the counter, so speculative decoding stays exact
+after an image.
+
+The patches follow Qwen2VLImageProcessor (rescale, normalise, a still image repeated over the temporal patch,
+merge block major); the caller resizes (Qwen2-VL `smart_resize`, factor patch x merge) and expands the
+placeholder into the image's token run. phlegm's bridge reports the tower in `init` (`vision`) and takes the
+images' RGB8 bytes after a `prefill_logits` line; a mark never splits an image's run.
+
+**Acceptance criteria:**
+- `patchify` equals the processor's reshape / transpose on a 64 x 96 image (max difference at float rounding).
+- The same image prompt on the block route and one step a row: the same greedy answer, last-position KL under
+  the block-vs-sequential level of a text prompt.
+- The answer about a fixed image is correct, through the CLI and `phlegm serve`; a text-only follow-up turn in
+  the same conversation answers about the image.
+- The vision tower's time for the image is named (a host stage).
+
+**Result 2026-11-26 (Strix Halo, Linux 7.2.15, XRT 2.21.75, `kernels-fa262k`; development runs on a busy box, load
+average 35-60 from other sessions, so the times are upper bounds).** `patchify` against the processor's reshape on
+a 64 x 96 image: max difference 1.2e-7. llama.cpp's `llama0-banner.png` (1280 x 640, alpha over white), question
+"What text is written in this image, and what animal is shown?":
+- CLI (`vision_check.sh`, the image at 640 x 320 = 200 image tokens, 234-token prompt): block route 2.5 s of
+  prefill against 25.2 s one step a row; last-position KL 0.00002, the same top five; both answers name the llama
+  and the crossed-out word (read "BSCM" / "BSGM" at this size).
+- `phlegm serve` (`vision_serve.sh`, full size: 800 image tokens, 834-token prompt, greedy, thinking off): "The text
+  reads "LLaMA C++" and "Can it run DOOM LLaMA?" with "DOOM" crossed out. The animal shown is a llama." -- word for
+  word llama.cpp's answer (`llama-mtmd-cli`, CPU, same GGUF and mmproj). The text-only follow-up ("What colour is the
+  animal's fur?") answers "Yellow", reusing 804 prompt tokens; the same image after text in a new conversation is
+  described correctly. `--speculative mtp` and `off` give byte-identical answers.
+- Host stage: the vision tower, 3,200 patches, 4.1-7.6 s on this busy box (llama.cpp's CPU encoder 4.8 s);
+  prefill of the 834-token prompt 5.1-10.6 s.
+
 ### OPEN-VISION-IMAGE-READ: a PNG decodes whatever FFmpeg is linked
 **Applies to:** openflowlm-next (`src/common/image/png_decode.cpp`, `image_reader.cpp`)
 **Test category:** unit (`src/common/image/png_decode_test.cpp`, `ctest -R OPEN-VISION-IMAGE-READ`

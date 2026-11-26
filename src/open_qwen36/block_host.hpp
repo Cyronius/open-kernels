@@ -148,7 +148,25 @@ struct AttnGeom {
     bool rope_il = false;   ///< interleaved rope pairs (2i, 2i + 1) -- llama.cpp's NORM layout;
                             ///< false = half-split (i, i + rot/2), everything before this shipped
     bool kv_pair = false;   ///< cache planes [K hi, K lo, V hi, V lo]
+    /// M-RoPE (Qwen3-VL / Qwen3.5 / Qwen3.6 with an image in the prompt): row t of the block
+    /// turns by the (t, h, w) position at mpos[3 t..3 t + 2] instead of pos0 + t; pair i takes
+    /// its axis from msec (config.json mrope_section) as pools::build_ptab_record does.
+    /// nullptr = the plain position on every axis.
+    const int64_t* mpos = nullptr;
+    const int* msec = nullptr;
+    bool mrope_il = false;  ///< mrope_interleaved: pairs i % 3 = 1 / 2 below 3 * section take h / w
 };
+
+/// The axis (0 t, 1 h, 2 w) rotary pair i takes under M-RoPE; pools::build_ptab_record's rule.
+inline int mrope_axis(size_t i, const int* section, bool interleaved) {
+    if (!section) return 0;
+    if (interleaved) {
+        const int a = static_cast<int>(i % 3);
+        return (a != 0 && i < 3 * static_cast<size_t>(section[a])) ? a : 0;
+    }
+    const size_t s0 = static_cast<size_t>(section[0]), s1 = s0 + static_cast<size_t>(section[1]);
+    return i < s0 ? 0 : (i < s1 ? 1 : 2);
+}
 
 /// The first cached row any query of the block reads: 0, or pos0 + 1 - window under a window.
 inline size_t attn_first_row(const AttnGeom& g) {

@@ -33,6 +33,8 @@
 /// run once without --gemm-block, once with, then diff `_p<position>.bin`
 /// pairs (correlation / argmax / top-5).
 #include <algorithm>
+#include <cctype>
+#include <stdexcept>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -50,6 +52,7 @@
 #include "open_qwen36/core.hpp"
 #include "open_qwen36/omp_policy.hpp"
 #include "open_qwen36/spec_lookup.hpp"
+#include "open_qwen36/vision/prompt.hpp"
 
 using open_qwen36::Core;
 using open_qwen36::CoreConfig;
@@ -132,6 +135,8 @@ void dump_pos(const std::string& prefix, int pos, const std::vector<float>& v) {
 struct Args {
     CoreConfig cfg;
     std::vector<int> ids;
+    std::vector<std::string> images;  // --image <file.ppm>: binary PPM, both sides multiples of patch * merge (OPEN-VISION-BLOCK)
+    bool image_seq = false;           // --image-seq: the image prompt one step a row, not on the block route
     std::string ids_list, list_out;  // --ids-list: one prompt a line; its logits at every position and greedy ids go to --list-out
     std::vector<int> ids2;          // a second prompt prefilled after ids at the position they ended (a chat turn)
     int max_tokens = 16;
@@ -261,6 +266,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--dump-kv") a.dump_kv = val();
         else if (k == "--quiet") a.cfg.verbose = false;
         else if (k == "--gemm-block") a.gemm_block = true;
+        else if (k == "--image") a.images.push_back(val());
+        else if (k == "--image-seq") a.image_seq = true;
         else if (k == "--block-major") a.block_major = true;
         else if (k == "--prefill-logits") a.prefill_logits = true;
         else if (k == "--bench") {
@@ -809,6 +816,74 @@ std::vector<int> request(Core& core, const Args& a) {
 
 }  // namespace
 
+// A binary PPM (P6, maxval 255) as the vision prompt's RGB image.
+open_qwen36::vision::RgbImage read_ppm(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    auto word = [&]() {
+        std::string w;
+        char c;
+        while (f.get(c)) {
+            if (c == '#') { std::string skip; std::getline(f, skip); continue; }
+            if (std::isspace(static_cast<unsigned char>(c))) { if (!w.empty()) break; continue; }
+            w += c;
+        }
+        return w;
+    };
+    if (word() != "P6") throw std::runtime_error(path + " is not a binary PPM (P6)");
+    open_qwen36::vision::RgbImage im;
+    im.width = std::stoi(word());
+    im.height = std::stoi(word());
+    if (std::stoi(word()) != 255) throw std::runtime_error(path + ": maxval must be 255");
+    im.rgb.resize(static_cast<size_t>(im.width) * im.height * 3);
+    f.read(reinterpret_cast<char*>(im.rgb.data()), static_cast<std::streamsize>(im.rgb.size()));
+    if (!f) throw std::runtime_error(path + " is short");
+    return im;
+}
+
+// --image: the prompt's image placeholders (one image_token_id each, as the tokenizer gives them) become each
+// image's tokens; the vision tower runs on the host, the prompt on the block route (or one step a row with
+// --image-seq), then greedy decode. --dump-logits writes the prompt's last-position logits.
+int run_images(Core& core, const Args& a) {
+    namespace vis = open_qwen36::vision;
+    using Ms = std::chrono::duration<double, std::milli>;
+    auto t0 = std::chrono::steady_clock::now();
+    const vis::VitConfig vcfg = vis::VitConfig::for_model_dir(a.cfg.model_dir);
+    const vis::VitWeights vw = vis::load_vit(a.cfg.model_dir + "/" + vis::vision_weights_path(a.cfg.model_dir), vcfg);
+    std::fprintf(stderr, "vision tower: %d blocks, resident in %.1f s\n", vcfg.depth,
+                 Ms(std::chrono::steady_clock::now() - t0).count() / 1000);
+    const float mean[3] = {0.5f, 0.5f, 0.5f}, stdv[3] = {0.5f, 0.5f, 0.5f};
+    std::vector<vis::PromptImage> imgs;
+    for (const auto& p : a.images) imgs.push_back(vis::patchify(vcfg, read_ppm(p), mean, stdv));
+    std::vector<int> ids;
+    size_t k = 0;
+    for (int t : a.ids) {
+        if (t != core.image_token_id()) { ids.push_back(t); continue; }
+        if (k >= imgs.size()) throw std::runtime_error("more image placeholders in the prompt than --image files");
+        ids.insert(ids.end(), imgs[k++].tokens(vcfg.merge), t);
+    }
+    if (k != imgs.size()) throw std::runtime_error("fewer image placeholders in the prompt than --image files");
+    const bool block = !a.image_seq && core.layer_major_ok();
+    const auto st = vis::prefill_images(core, vcfg, vw, ids, imgs, block, true);
+    std::fprintf(stderr, "image prompt %zu tokens (%zu image tokens, %zu images): vision tower %.0f ms, prefill %.0f ms (%s)\n",
+                 ids.size(), st.image_tokens, imgs.size(), st.vit_ms, st.prefill_ms, block ? "block" : "sequential");
+    if (!a.dump_prefix.empty()) dump_pos(a.dump_prefix, static_cast<int>(ids.size() - 1), core.logits());
+    const size_t V = core.real_vocab();
+    int tok = argmax(core.logits(), V);
+    auto td = std::chrono::steady_clock::now();
+    for (int n = 0; n < a.max_tokens; ++n) {
+        std::printf("token %d\n", tok);
+        std::fflush(stdout);
+        if (n + 1 == a.max_tokens) break;
+        core.step(tok, true);
+        tok = argmax(core.logits(), V);
+    }
+    if (a.max_tokens > 1)
+        std::fprintf(stderr, "decode %d tokens: %.0f ms/token\n", a.max_tokens - 1,
+                     Ms(std::chrono::steady_clock::now() - td).count() / (a.max_tokens - 1));
+    return 0;
+}
+
 int run_list(Core& core, const Args& a) {
     std::ifstream f(a.ids_list);
     std::string line;
@@ -870,6 +945,7 @@ int main(int argc, char** argv) {
             std::printf("DONE\n");
             return 0;
         }
+        if (!a.images.empty()) return run_images(core, a);
         if (a.spec_mtp) {
             if (!core.mtp_ready() || core.verify_rows() != 2) {
                 std::fprintf(stderr, "--spec-mtp: needs OFLM_OPEN_MTP=1, OFLM_OPEN_VERIFY=1 and a 2-row verify pass\n");

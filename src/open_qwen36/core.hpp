@@ -284,6 +284,14 @@ public:
     /// The MoE kinds (linear / full) here; the dense kind goes to step_gemm_prompt_dense --
     /// layer_major_ok() says whether either can run.
     void step_gemm_prompt(const std::vector<int>& ids, bool want_logits);
+    /// step_gemm_prompt with input rows and M-RoPE positions of the caller's (OPEN-VISION-BLOCK): row t is
+    /// embeds[t] (hidden floats: an image patch from the vision tower) when that is not null, else token
+    /// ids[t]'s embedding, and turns by the (t, h, w) position at mpos[3 t]. Starts the M-RoPE counter
+    /// (mrope_begin) and leaves it at `next_mpos`, the position the next text token takes. The MoE layer-major
+    /// route only (moe_layer_major_ok()); a text prompt after an image goes through step_gemm_prompt, which
+    /// takes the counter's positions by itself.
+    void step_gemm_prompt_mrope(const std::vector<int>& ids, const std::vector<const float*>& embeds,
+                                const std::vector<int64_t>& mpos, int64_t next_mpos, bool want_logits);
     /// Whether step_gemm_prompt() can run this kernel set: a block route whose every
     /// layer is a MoE kind, or the dense kind where dense_layer_major_ok() says so, and
     /// OFLM_OPEN_LAYER_MAJOR not set to 0 -- or GPT-OSS's own route (gptoss_prefill_ok()).
@@ -491,6 +499,13 @@ private:
     int image_token_id_ = -1;
     bool mrope_on_ = false;
     int64_t mrope_pos_ = 0;
+    // step_gemm_prompt's M-RoPE inputs (step_gemm_prompt_mrope, or the counter after an image): row t of the
+    // prompt starting at position mpos_base_ takes mpos_block_[3 t..]; embeds_ replaces some rows' embeddings
+    const int64_t* mpos_block_ = nullptr;
+    size_t mpos_base_ = 0;
+    const std::vector<const float*>* embeds_ = nullptr;
+    /// the AttnGeom's M-RoPE fields for a block starting at position pos0 (nothing without a prompt's mpos)
+    void block_mrope(size_t pos0, host::AttnGeom& g) const;
     size_t ptab_dirty_ = 0;                    ///< rows [0, dirty) hold per-request records; reset() restores them
 
     // ---- the block route (manifest.hpp's GemmBlockProgram)

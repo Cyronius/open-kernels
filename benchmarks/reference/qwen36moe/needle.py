@@ -1,18 +1,20 @@
 # Needle prompts for qwen36moe: needle.py make <tokens> <depth> <out.txt> | needle.py check <cli.log> (2026-11-24).
+import os
 import re
 import sys
 from pathlib import Path
 
 from tokenizers import Tokenizer
 
-M = Path(r"C:\models\qwen36moe\Qwen3.6-35B-A3B-UD-Q4_K_S")
+W = Path(os.environ.get("QW", os.path.expanduser("~/models/qwen36moe")))
+M = Path(os.environ.get("QM", W / "Qwen3.6-35B-A3B-UD-Q4_K_S"))
 tok = Tokenizer.from_file(str(M / "tokenizer.json"))
 NEEDLE = "The secret code for the blue vault is 58213."
 ASK = "\n\nWhat is the secret code for the blue vault? Reply with the number only."
 
 
 def make(n, depth, out):
-    essays = Path(r"C:\models\qwen36moe\kl\essays.txt").read_text(encoding="utf-8")
+    essays = (W / "kl" / "essays.txt").read_text(encoding="utf-8")
     hay = tok.encode(essays, add_special_tokens=False).ids
     pre = tok.encode("<|im_start|>user\n", add_special_tokens=False).ids
     post = tok.encode(ASK + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", add_special_tokens=False).ids

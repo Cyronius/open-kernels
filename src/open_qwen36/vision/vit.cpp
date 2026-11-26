@@ -1,11 +1,15 @@
 #include "open_qwen36/vision/vit.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <stdexcept>
 
 // The tower is host arithmetic, so the projections are worth vectorising. AVX2
@@ -268,7 +272,125 @@ inline void axpy_f32(float* acc, const float* x, float p, int n) {
 /// the whole activation matrix once per block - 160 times over for a 1280-wide
 /// projection - and at a 40x56 grid that matrix is 11 MB, so it comes back from L3 every
 /// time. A 128-row panel is under a megabyte and stays in L2 across the sweep.
+#if defined(OFLM_VIT_AVX2)
+/// The packed weight of L: [out / 16][in][16] bf16, made once (OPEN-VISION-GEMM).
+const std::vector<uint16_t>& packed16(const Linear& L) {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!L.packed) {
+        auto pk = std::make_shared<std::vector<uint16_t>>(L.w.size());
+        const int in = L.in;
+        for (int o = 0; o < L.out; ++o)
+            for (int k = 0; k < in; ++k)
+                (*pk)[(static_cast<size_t>(o / 16) * in + k) * 16 + o % 16] = L.w[static_cast<size_t>(o) * in + k];
+        L.packed = pk;
+    }
+    return *L.packed;
+}
+
+/// MR rows of x against one 16-column panel: 2 * MR accumulators, the panel's bf16 widened as it streams.
+template <int MR>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma")))
+#endif
+void gemm_tile16(const float* x, int in, const uint16_t* pw, const float* bias, float* y, int ldy) {
+    __m256 acc[MR][2];
+    for (int r = 0; r < MR; ++r) acc[r][0] = acc[r][1] = _mm256_setzero_ps();
+    for (int k = 0; k < in; ++k) {
+        const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pw + static_cast<size_t>(k) * 16));
+        const __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+        const __m128i h1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pw + static_cast<size_t>(k) * 16 + 8));
+        const __m256 w1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h1), 16));
+        for (int r = 0; r < MR; ++r) {
+            const __m256 xv = _mm256_broadcast_ss(x + static_cast<size_t>(r) * in + k);
+            acc[r][0] = _mm256_fmadd_ps(xv, w0, acc[r][0]);
+            acc[r][1] = _mm256_fmadd_ps(xv, w1, acc[r][1]);
+        }
+    }
+    const __m256 b0 = _mm256_loadu_ps(bias), b1 = _mm256_loadu_ps(bias + 8);
+    for (int r = 0; r < MR; ++r) {
+        _mm256_storeu_ps(y + static_cast<size_t>(r) * ldy, _mm256_add_ps(acc[r][0], b0));
+        _mm256_storeu_ps(y + static_cast<size_t>(r) * ldy + 8, _mm256_add_ps(acc[r][1], b1));
+    }
+}
+
+/// AVX-512: MR rows against one 16-column panel over keys [k0, k1); acc starts from y (or the bias at k0 == 0).
+template <int MR>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512f")))
+#endif
+void gemm_tile16_512(const float* x, int in, const uint16_t* pw, const float* bias, float* y, int ldy, int k0, int k1) {
+    __m512 acc[MR];
+    for (int r = 0; r < MR; ++r)
+        acc[r] = k0 == 0 ? _mm512_loadu_ps(bias) : _mm512_loadu_ps(y + static_cast<size_t>(r) * ldy);
+    for (int k = k0; k < k1; ++k) {
+        const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pw + static_cast<size_t>(k) * 16));
+        const __m512 w = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
+        for (int r = 0; r < MR; ++r)
+            acc[r] = _mm512_fmadd_ps(_mm512_set1_ps(x[static_cast<size_t>(r) * in + k]), w, acc[r]);
+    }
+    for (int r = 0; r < MR; ++r) _mm512_storeu_ps(y + static_cast<size_t>(r) * ldy, acc[r]);
+}
+
+bool have_avx512() {
+#if defined(_MSC_VER)
+    return false;
+#else
+    return __builtin_cpu_supports("avx512f");
+#endif
+}
+
+/// y = x . W^T + b on the packed panels: tasks of (96 rows, one panel), six rows a tile.
+void linear_packed(const float* x, int n, const Linear& L, float* y, int ldy) {
+    const std::vector<uint16_t>& pk = packed16(L);
+    const int in = L.in, np = L.out / 16;
+    constexpr int RB = 96;
+    const int nrb = (n + RB - 1) / RB;
+    static const bool avx512 = have_avx512() && !std::getenv("OFLM_VIT_AVX2_ONLY");
+    if (avx512) {
+        // twelve rows a tile, the keys in blocks of 512 so a tile's x rows and the panel's block stay in L1
+        constexpr int KB = 512;
+#pragma omp parallel for schedule(dynamic, 1) collapse(2)
+        for (int rb = 0; rb < nrb; ++rb)
+            for (int p = 0; p < np; ++p) {
+                const uint16_t* pw = pk.data() + static_cast<size_t>(p) * in * 16;
+                const float* bias = L.b.data() + p * 16;
+                const int r1 = std::min(n, (rb + 1) * RB);
+                for (int k0 = 0; k0 < in; k0 += KB) {
+                    const int k1 = std::min(in, k0 + KB);
+                    int r = rb * RB;
+                    for (; r + 12 <= r1; r += 12)
+                        gemm_tile16_512<12>(x + static_cast<size_t>(r) * in, in, pw, bias,
+                                            y + static_cast<size_t>(r) * ldy + p * 16, ldy, k0, k1);
+                    for (; r < r1; ++r)
+                        gemm_tile16_512<1>(x + static_cast<size_t>(r) * in, in, pw, bias,
+                                           y + static_cast<size_t>(r) * ldy + p * 16, ldy, k0, k1);
+                }
+            }
+        return;
+    }
+#pragma omp parallel for schedule(dynamic, 1) collapse(2)
+    for (int rb = 0; rb < nrb; ++rb)
+        for (int p = 0; p < np; ++p) {
+            const uint16_t* pw = pk.data() + static_cast<size_t>(p) * in * 16;
+            const float* bias = L.b.data() + p * 16;
+            const int r1 = std::min(n, (rb + 1) * RB);
+            int r = rb * RB;
+            for (; r + 6 <= r1; r += 6)
+                gemm_tile16<6>(x + static_cast<size_t>(r) * in, in, pw, bias, y + static_cast<size_t>(r) * ldy + p * 16, ldy);
+            for (; r < r1; ++r)
+                gemm_tile16<1>(x + static_cast<size_t>(r) * in, in, pw, bias, y + static_cast<size_t>(r) * ldy + p * 16, ldy);
+        }
+}
+#endif
+
 void linear(const float* x, int n, const Linear& L, float* y, int ldy = 0) {
+#if defined(OFLM_VIT_AVX2)
+    if (L.out % 16 == 0 && have_avx2() && !std::getenv("OFLM_VIT_DOT8")) {
+        linear_packed(x, n, L, y, ldy ? ldy : L.out);
+        return;
+    }
+#endif
     const int in = L.in, out = L.out;
     if (ldy == 0) ldy = out;
     const int nb = (out + 7) / 8;
@@ -425,6 +547,68 @@ void rope_tables(const VitConfig& cfg, const std::vector<int>& ph, const std::ve
 /// the work list is (segment, query block) pairs rather than query blocks - a windowed
 /// layer has many short segments and a full layer one long one, and collapsing over heads
 /// x query blocks alone starves on the first.
+#if defined(OFLM_VIT_AVX2)
+/// AVX-512 attention over one segment for one head (OPEN-VISION-GEMM): kt is K re-laid [m16 / 16][HD][16] (keys
+/// as lanes, zero past m), vp is V [m][VP] with VP = HD rounded up to 16 (zero padded). Four query rows a tile:
+/// scores as a broadcast GEMM, exp on the vector unit, P.V as a broadcast GEMM.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512f")))
+#endif
+void attn_rows_512(const float* q, int nq, int HD, const float* kt, const float* vp, int VP, int m, float scale,
+                   float* sc, float* out, int ldo) {
+    const int m16 = (m + 15) / 16 * 16;
+    for (int i0 = 0; i0 < nq; i0 += 4) {
+        const int R = std::min(4, nq - i0);
+        // scores: R rows x 16 keys a step
+        for (int c = 0; c < m16; c += 16) {
+            const float* kc = kt + static_cast<size_t>(c) * HD;   // [HD][16]
+            __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            const float* q0 = q + static_cast<size_t>(i0) * HD;
+            for (int d = 0; d < HD; ++d) {
+                const __m512 kv = _mm512_loadu_ps(kc + static_cast<size_t>(d) * 16);
+                a0 = _mm512_fmadd_ps(_mm512_set1_ps(q0[d]), kv, a0);
+                if (R > 1) a1 = _mm512_fmadd_ps(_mm512_set1_ps(q0[HD + d]), kv, a1);
+                if (R > 2) a2 = _mm512_fmadd_ps(_mm512_set1_ps(q0[2 * HD + d]), kv, a2);
+                if (R > 3) a3 = _mm512_fmadd_ps(_mm512_set1_ps(q0[3 * HD + d]), kv, a3);
+            }
+            const __m512 sv = _mm512_set1_ps(scale);
+            _mm512_storeu_ps(sc + c, _mm512_mul_ps(a0, sv));
+            if (R > 1) _mm512_storeu_ps(sc + m16 + c, _mm512_mul_ps(a1, sv));
+            if (R > 2) _mm512_storeu_ps(sc + 2 * m16 + c, _mm512_mul_ps(a2, sv));
+            if (R > 3) _mm512_storeu_ps(sc + 3 * m16 + c, _mm512_mul_ps(a3, sv));
+        }
+        // softmax per row (the padded keys masked out)
+        for (int r = 0; r < R; ++r) {
+            float* sr = sc + static_cast<size_t>(r) * m16;
+            float mx = -1e30f;
+            for (int t = 0; t < m; ++t) mx = std::max(mx, sr[t]);
+            float sum = 0;
+            for (int t = 0; t < m; ++t) { sr[t] = std::exp(sr[t] - mx); sum += sr[t]; }
+            const float inv = 1.0f / sum;
+            for (int t = 0; t < m; ++t) sr[t] *= inv;
+        }
+        // P.V: R rows x VP columns
+        const int nv = VP / 16;   // at most 8 vectors (HD <= 128)
+        __m512 acc[4][8];
+        for (int r = 0; r < 4; ++r)
+            for (int j = 0; j < 8; ++j) acc[r][j] = _mm512_setzero_ps();
+        for (int t = 0; t < m; ++t) {
+            const float* vr = vp + static_cast<size_t>(t) * VP;
+            for (int j = 0; j < nv; ++j) {
+                const __m512 vv = _mm512_loadu_ps(vr + 16 * j);
+                for (int r = 0; r < R; ++r)
+                    acc[r][j] = _mm512_fmadd_ps(_mm512_set1_ps(sc[static_cast<size_t>(r) * m16 + t]), vv, acc[r][j]);
+            }
+        }
+        for (int r = 0; r < R; ++r) {
+            float tmp[128];
+            for (int j = 0; j < nv; ++j) _mm512_storeu_ps(tmp + 16 * j, acc[r][j]);
+            std::memcpy(out + static_cast<size_t>(i0 + r) * ldo, tmp, static_cast<size_t>(HD) * sizeof(float));
+        }
+    }
+}
+#endif
+
 void attention(const VitConfig& cfg, const float* qkv, int n, const std::vector<float>& cs, const std::vector<float>& sn,
                const std::vector<int>& cu, float* o) {
     const int NH = cfg.heads, HD = cfg.head_dim, H = cfg.hidden, half = HD / 2;
@@ -457,6 +641,40 @@ void attention(const VitConfig& cfg, const float* qkv, int n, const std::vector<
             std::memcpy(vd, vs, static_cast<size_t>(HD) * sizeof(float));
         }
     }
+#if defined(OFLM_VIT_AVX2)
+    static const bool avx512 = have_avx512() && !std::getenv("OFLM_VIT_AVX2_ONLY");
+    if (avx512 && HD <= 128) {
+        const int VP = (HD + 15) / 16 * 16;
+        for (size_t sgi = 0; sgi + 1 < cu.size(); ++sgi) {
+            const int a = cu[sgi], m = cu[sgi + 1] - a, m16 = (m + 15) / 16 * 16;
+            std::vector<float> kt(static_cast<size_t>(NH) * m16 * HD, 0.f), vp(static_cast<size_t>(NH) * m * VP, 0.f);
+#pragma omp parallel for schedule(static)
+            for (int h = 0; h < NH; ++h)
+                for (int t = 0; t < m; ++t) {
+                    const float* kr = k.data() + (static_cast<size_t>(h) * n + a + t) * HD;
+                    float* kd = kt.data() + static_cast<size_t>(h) * m16 * HD + static_cast<size_t>(t / 16) * 16 * HD + t % 16;
+                    for (int d = 0; d < HD; ++d) kd[static_cast<size_t>(d) * 16] = kr[d];
+                    std::memcpy(vp.data() + (static_cast<size_t>(h) * m + t) * VP, v.data() + (static_cast<size_t>(h) * n + a + t) * HD,
+                                static_cast<size_t>(HD) * sizeof(float));
+                }
+            constexpr int QB5 = 16;
+            const int nqb = (m + QB5 - 1) / QB5;
+#pragma omp parallel
+            {
+                std::vector<float> sc(static_cast<size_t>(4) * m16);
+#pragma omp for schedule(dynamic, 1) collapse(2)
+                for (int h = 0; h < NH; ++h)
+                    for (int b = 0; b < nqb; ++b) {
+                        const int q0 = b * QB5, qc = std::min(QB5, m - q0);
+                        attn_rows_512(q.data() + (static_cast<size_t>(h) * n + a + q0) * HD, qc, HD,
+                                      kt.data() + static_cast<size_t>(h) * m16 * HD, vp.data() + static_cast<size_t>(h) * m * VP,
+                                      VP, m, scale, sc.data(), o + static_cast<size_t>(a + q0) * H + h * HD, H);
+                    }
+            }
+        }
+        return;
+    }
+#endif
     const int QB = 32;
     struct Work { int seg0, seg_len, q0, qc; };
     std::vector<Work> work;
@@ -1325,11 +1543,23 @@ std::vector<float> forward_qwen3vl(const VitConfig& cfg, const VitWeights& w, co
     std::vector<float> ff(static_cast<size_t>(n) * cfg.inter);
     const std::vector<int> whole = {0, n};
     if (deep) deep->clear();
+    double attn_ms = 0;   // OFLM_VIT_PROFILE=1: the attention's share of the forward on stderr
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Report {
+        const double& a; std::chrono::steady_clock::time_point t; int n;
+        ~Report() {
+            if (std::getenv("OFLM_VIT_PROFILE"))
+                std::fprintf(stderr, "vit: %d patches, forward %.0f ms, attention %.0f ms\n", n,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(), a);
+        }
+    } report{attn_ms, t0, n};
     for (size_t bi = 0; bi < w.blocks.size(); ++bi) {
         const VitBlock& B = w.blocks[bi];
         layer_norm(x.data(), n, H, B.ln1_w.data(), B.ln1_b.data(), cfg.eps, hn.data());
         linear(hn.data(), n, B.qkv, qkv.data());
+        const auto ta = std::chrono::steady_clock::now();
         attention(cfg, qkv.data(), n, cs, sn, whole, att.data());
+        attn_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
         linear(att.data(), n, B.proj, tmp.data());
         for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
         layer_norm(x.data(), n, H, B.ln2_w.data(), B.ln2_b.data(), cfg.eps, hn.data());

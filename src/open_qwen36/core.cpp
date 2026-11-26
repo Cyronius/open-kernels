@@ -1171,7 +1171,11 @@ xrt::bo Core::device_bo(size_t bytes) {
     // as "cannot allocate memory" at the 40th layer. Ordinary process memory
     // registered as a userptr BO is not on the shmem heap, and the NPU reads it
     // through the same HMM path; the pages are pinned, so nothing is copied.
-    if (n >= (1u << 20)) {
+    // Some amdxdna / XRT pairs refuse userptr BOs at every size (Strix Halo, kernel 7.2.15 + XRT 2.21.75:
+    // XRT's own mmap of the imported buffer fails with EINVAL, `amdxdna_insert_pages: Failed to mmap dma buf
+    // -22`); there the shmem BO is the only kind, so the first refusal switches to it for the process.
+    static bool userptr_ok = !std::getenv("OFLM_OPEN_NO_USERPTR");
+    if (userptr_ok && n >= (1u << 20)) {
         void* p = ::mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED)
             throw std::runtime_error("open_qwen36: cannot reserve " + std::to_string(n >> 20) +
@@ -1179,9 +1183,10 @@ xrt::bo Core::device_bo(size_t bytes) {
         host_arenas_.emplace_back(p, n);
         try {
             return xrt::ext::bo(*dev_, p, n);
-        } catch (...) {
+        } catch (const std::exception& e) {
             host_arenas_.pop_back();
-            throw;
+            userptr_ok = false;
+            log(std::string("userptr device buffers refused (") + e.what() + "); shmem buffers from here on");
         }
     }
 #endif
@@ -2731,6 +2736,13 @@ void Core::step_verify(const int* ids, int* argmax, bool want_logits) {
         embedding_row(static_cast<size_t>(ids[r]), vx.map<float*>() + r * hid);
     }
     vx.sync(XCL_BO_SYNC_BO_TO_DEVICE, R * hid * 4, 0);
+    // after an image every row turns by the M-RoPE counter (c + r on each axis), as step_impl writes a step's
+    // record; R + 1 rows, whichever placeholder offset the stream's rows read
+    for (size_t r = 0; mrope_on_ && r <= R && pos_ + r < cfg_.max_ctx; ++r) {
+        const double c = static_cast<double>(mrope_pos_ + static_cast<int64_t>(r));
+        const double p3[3] = {c, c, c};
+        write_record(static_cast<size_t>(pos_) + r, p3);
+    }
     for (auto& [name, k] : kerns_) {
         if (!k.verify || k.patch != "attnpos") continue;
         stream_patch::attn_apply(k.iw(), k.attn, static_cast<uint64_t>(pos_), k.geom);
@@ -2864,6 +2876,7 @@ void Core::verify_commit(size_t n) {
     }
     state_base_ = wrap ? 0 : nb;
     pos_ += static_cast<int>(n);
+    if (mrope_on_) mrope_pos_ += static_cast<int64_t>(n);
 }
 
 void Core::host_step(const Step& s, int layer) {
@@ -4285,6 +4298,9 @@ bool Core::gemm_block_pads_cache() const {
 void Core::step_gemm_block(const std::vector<int>& ids, size_t t_real, bool want_logits) {
     apply_thread_budget();
     if (!weights_loaded_) throw std::runtime_error("open_qwen36: step_gemm_block before load_weights");
+    if (mrope_on_)
+        throw std::runtime_error("open_qwen36: step_gemm_block writes no M-RoPE positions; after an image use "
+                                 "step_gemm_prompt or decode steps");
     const size_t T = ids.size();
     if (T == 0) return;
     if (gemm_block_t_ == 0 || T != gemm_block_t_)
@@ -4989,6 +5005,33 @@ void Core::dense_layer_staged(int l, std::vector<std::vector<double>>& x, size_t
     timing_.part0_ms += gemm_wait;
 }
 
+void Core::block_mrope(size_t pos0, host::AttnGeom& g) const {
+    if (!mpos_block_) return;
+    if (pos0 < mpos_base_) throw std::runtime_error("open_qwen36: a block before the M-RoPE prompt's start");
+    g.mpos = mpos_block_ + 3 * (pos0 - mpos_base_);
+    g.msec = mrope_section_.data();
+    g.mrope_il = mrope_interleaved_;
+}
+
+void Core::step_gemm_prompt_mrope(const std::vector<int>& ids, const std::vector<const float*>& embeds,
+                                  const std::vector<int64_t>& mpos, int64_t next_mpos, bool want_logits) {
+    if (!has_mrope()) throw std::runtime_error("open_qwen36: step_gemm_prompt_mrope on a model without M-RoPE");
+    if (gp_on_ || fa_route_ || dense_layer_major_ok() || !moe_layer_major_ok())
+        throw std::runtime_error("open_qwen36: M-RoPE block prefill runs on the MoE layer-major route only");
+    if (embeds.size() != ids.size() || mpos.size() != 3 * ids.size())
+        throw std::runtime_error("open_qwen36: step_gemm_prompt_mrope: embeds / mpos do not match the prompt");
+    mrope_begin();
+    mpos_block_ = mpos.data();
+    mpos_base_ = static_cast<size_t>(pos_);
+    embeds_ = &embeds;
+    struct Clear {
+        Core* c;
+        ~Clear() { c->mpos_block_ = nullptr; c->embeds_ = nullptr; }
+    } clear{this};
+    step_gemm_prompt(ids, want_logits);
+    mrope_pos_ = next_mpos;
+}
+
 void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
     if (gp_on_) return step_gptoss_prompt(ids, want_logits);
     apply_thread_budget();
@@ -5010,12 +5053,28 @@ void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
         throw std::runtime_error("open_qwen36: prompt of " + std::to_string(N) + " at position " + std::to_string(pos_) +
                                  " is past the context capacity of " + std::to_string(cfg_.max_ctx));
     const size_t pos0 = static_cast<size_t>(pos_);
+    // A text prompt after an image (OPEN-VISION-BLOCK): every row on the M-RoPE counter, (c + t) on each axis.
+    std::vector<int64_t> text_mpos;
+    if (mrope_on_ && !mpos_block_) {
+        text_mpos.resize(3 * N);
+        for (size_t t = 0; t < N; ++t)
+            for (int a = 0; a < 3; ++a) text_mpos[3 * t + a] = mrope_pos_ + static_cast<int64_t>(t);
+        mpos_block_ = text_mpos.data();
+        mpos_base_ = pos0;
+    }
+    struct ClearMpos {
+        Core* c; bool own;
+        ~ClearMpos() { if (own) { c->mpos_block_ = nullptr; } }
+    } clear_mpos{this, !text_mpos.empty()};
     // The padded rows carry the last real id, exactly as the block-major caller padded
     // the tail block; they never touch the state and never reach the position.
     auto tsetup = std::chrono::steady_clock::now();
     std::vector<float> xres(TOT * hid);
-    for (size_t t = 0; t < TOT; ++t)
-        file_->bf16_row(w_->embed_tensor, static_cast<size_t>(ids[std::min(t, N - 1)]), hid, xres.data() + t * hid);
+    for (size_t t = 0; t < TOT; ++t) {
+        const size_t r = std::min(t, N - 1);
+        if (embeds_ && (*embeds_)[r]) std::memcpy(xres.data() + t * hid, (*embeds_)[r], hid * 4);
+        else file_->bf16_row(w_->embed_tensor, static_cast<size_t>(ids[r]), hid, xres.data() + t * hid);
+    }
     moe_stage_resize(TOT);
     timing_.setup_ms += ms_since(tsetup);
     timing_.part1_ms += ms_since(tsetup);
@@ -5037,7 +5096,14 @@ void Core::step_gemm_prompt(const std::vector<int>& ids, bool want_logits) {
         block_layer_moe(l, TOT, N, xres.data());
     }
     profile_close();
+    if (mpos_block_) {
+        // the decode kernels never read a prefilled row's record, but the MTP draft reads the last one's
+        const int64_t* m = mpos_block_ + 3 * (pos0 + N - 1 - mpos_base_);
+        const double p3[3] = {static_cast<double>(m[0]), static_cast<double>(m[1]), static_cast<double>(m[2])};
+        write_record(pos0 + N - 1, p3);
+    }
     pos_ += static_cast<int>(N);
+    if (!text_mpos.empty()) mrope_pos_ += static_cast<int64_t>(N);
     block_logits_.clear();
     if (block_logits_all_)
         for (size_t t = 0; t < N; ++t) {
@@ -5995,6 +6061,7 @@ void Core::block_layer_full(int l, float* xres, size_t T, size_t t_real, size_t 
     g.T = T; g.t_real = t_real; g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
     g.pos0 = pos0; g.eps = gb.eps; g.rope_il = w_->rope_interleaved;
     g.kv_pair = w_->attn_kv_pair;
+    block_mrope(pos0, g);
     float* og = BlockScratch::fit(bs_.og, T * qw);
     auto t0 = std::chrono::steady_clock::now();
     if (fa256 || (attn_block_on_ && gb.attn_block.present())) {
@@ -6399,6 +6466,7 @@ void Core::layer_full_staged(int l, float* xres, size_t B, size_t T, size_t N, s
         host::AttnGeom g;
         g.T = T; g.t_real = std::min(T, N - b * T); g.nh = gb.nh; g.kvh = gb.kvh; g.hd = gb.hd; g.rot = gb.rot;
         g.pos0 = pos0 + b * T; g.eps = gb.eps; g.rope_il = w_->rope_interleaved;
+        block_mrope(g.pos0, g);
         return g;
     };
     // each block's attention window is explicit, so later blocks' K / V rows in the map change nothing
@@ -6647,6 +6715,7 @@ const float* Core::rows_logits(size_t j) {
 
 void Core::seek(int pos) {
     if (pos < 0 || static_cast<size_t>(pos) >= cfg_.max_ctx) throw std::runtime_error("open_qwen36: seek out of range");
+    if (mrope_on_) mrope_pos_ += static_cast<int64_t>(pos) - pos_;   // within the text after the last image
     pos_ = pos;
 }
 
