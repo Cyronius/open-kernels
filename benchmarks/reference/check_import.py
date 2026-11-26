@@ -34,9 +34,11 @@ def main():
     expected |= set(changed)
     failures = [f"file set differs: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"] if expected != actual else []
     for name in sorted(expected & actual):
-        have = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        data = (ROOT / name).read_bytes()
         want = changed.get(name) or hashlib.sha256(git("show", f"{args.commit}:{name}")).hexdigest()
-        if have != want:
+        # Recorded hashes come from Windows (CRLF) and Linux (LF) worktrees; accept either line ending.
+        crlf = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        if want not in (hashlib.sha256(data).hexdigest(), hashlib.sha256(crlf).hexdigest()):
             failures.append(f"sha256 mismatch: {name}" + (" (recorded change)" if name in changed else ""))
     if failures:
         raise SystemExit("\n".join(failures))

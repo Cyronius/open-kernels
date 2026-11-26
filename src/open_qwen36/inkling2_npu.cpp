@@ -2228,12 +2228,11 @@ private:
         bool expert = false, staged = false, done = false, fresh = false;
     };
 
-    static constexpr bool prefill_overlap_available() {
-#ifdef _WIN32
-        return true;
-#else
-        return false;
-#endif
+    // The late-readback overlap route and the fused verify groups run on every platform (Windows 2026-11-23,
+    // Linux 2026-11-26). Test-only: INKLING2_TEST_NO_OVERLAP selects the synchronous route for A/B runs.
+    static bool prefill_overlap_available() {
+        static const bool available = std::getenv("INKLING2_TEST_NO_OVERLAP") == nullptr;
+        return available;
     }
 
     static bool all_finite(const float* data, size_t count) {

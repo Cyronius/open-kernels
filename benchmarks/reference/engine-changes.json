@@ -559,6 +559,14 @@
         "src/open_qwen36/inkling2_host.cpp": "bcef49766d407cccfdf875f997e92fa386ee9cf54a3c3252848bb1ab3648dc87",
         "src/open_qwen36/inkling2_host.hpp": "10f9b6d220e39c17462faa1d6195f09a31cf17667722a0bdc9317b15f9281b1b"
       }
+    },
+    {
+      "id": "inkling2-overlap-on-linux",
+      "origin": "open-kernels: the late-readback overlap route and the fused verify groups run on Linux too (INKLING2_TEST_NO_OVERLAP for A/B); GCC builds of the Inkling sources disable FMA contraction so verify rows stay bit-equal to decode",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "bb49ab8168ab90ff7eab6e115264a1e3802db00626d960dac34942ff77f91427",
+        "src/open_qwen36/CMakeLists.txt": "d4cc1bb5874e4454f3d4f3355eae3b54ca0795e04922d68f9c09a1ce078e1472"
+      }
     }
   ]
 }

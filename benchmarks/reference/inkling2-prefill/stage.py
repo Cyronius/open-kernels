@@ -14,6 +14,12 @@ def change(text, before, after):
     return text.replace(before, after, 1)
 
 
+def change_all(text, before, after):
+    if before not in text:
+        raise ValueError(f"missing profiling anchor: {before!r}")
+    return text.replace(before, after)
+
+
 def insert(text, before, line):
     return change(text, before, before + '\n' + line)
 
@@ -64,7 +70,7 @@ def instrument_host(src):
     host = change(host, '            attention_output = host_projection(l.output, a);',
                   '            perf::Measure measure{perf::dense_host_output};\n'
                   '            attention_output = host_projection(l.output, a);')
-    host = insert(host, 'size_t layer, Inkling2ExpertProjector* projector) const {',
+    host = insert(host, 'size_t layer, Inkling2ExpertProjector* projector, bool verify = false) const {',
                   '        perf::Measure measure{perf::moe_total};\n        const auto route_start = perf::Clock::now();')
     host = change(host, '        Rows out(x.count(), hidden);\n        if (projector',
                   '        perf::add(perf::route, route_start);\n        Rows out(x.count(), hidden);\n        if (projector')
@@ -104,7 +110,7 @@ def instrument_host(src):
 
 def instrument_host_overlap(host):
     for name, stage in (('stage_up', 'gather'), ('finish_up', 'situ'), ('finish_down', 'reduce')):
-        start = host.index(f'            const auto {name} = [&](size_t g) {{')
+        start = host.index(f'            const auto {name} = [&](size_t g')
         end = host.index('\n            };', start)
         section = host[start:end]
         before = '                for (size_t slot'
@@ -213,7 +219,7 @@ def instrument_npu_overlap(npu):
     ):
         indent = line[:len(line) - len(line.lstrip())]
         prefix = '' if condition == 'true' else f'if ({condition}) '
-        npu = change(npu, line, f'{indent}const auto profile_start = perf::Clock::now();\n{line}\n'
+        npu = change_all(npu, line, f'{indent}const auto profile_start = perf::Clock::now();\n{line}\n'
                      f'{indent}{prefix}perf::add(perf::{stage}, profile_start);')
     npu = change(npu, '        xrt::run next(*lane.kernel);',
                  '        const auto configure_start = perf::Clock::now();\n        xrt::run next(*lane.kernel);')

@@ -11,7 +11,10 @@ import tempfile
 import time
 
 import numpy as np
-import psutil
+try:
+    import psutil
+except ImportError:  # Linux without psutil: read /proc instead
+    psutil = None
 
 repo = next(p for p in Path(__file__).resolve().parents if (p / 'AGENTS.md').is_file())
 sys.path.insert(0, str(repo / 'benchmarks/reference/inkling2-prefill'))
@@ -60,11 +63,24 @@ memory, walls = {}, []
 with device_lock(lock), (out / 'bridge.stderr.log').open('wb') as errors, subprocess.Popen(
         [bridge], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors) as process:
     try:
-        meter = psutil.Process(process.pid)
+        meter = psutil.Process(process.pid) if psutil else None
+
+        def proc_kib(path, key):
+            for line in Path(f'/proc/{process.pid}/{path}').read_text().splitlines():
+                if line.startswith(key + ':'):
+                    return int(line.split()[1])
+            return 0
 
         def sample(name):
+            if meter is None:
+                # Private_Clean + Private_Dirty matches the unique set size; VmRSS is the working set.
+                private = (proc_kib('smaps_rollup', 'Private_Clean') + proc_kib('smaps_rollup', 'Private_Dirty')) * 1024
+                memory[name] = dict(private_gib=private / 2**30, working_set_gib=proc_kib('status', 'VmRSS') * 1024 / 2**30)
+                return
             info = meter.memory_info()
-            memory[name] = dict(private_gib=info.private / 2**30, working_set_gib=info.rss / 2**30)
+            # Windows private bytes; on Linux the unique set size is the closest counterpart.
+            private = info.private if hasattr(info, 'private') else meter.memory_full_info().uss
+            memory[name] = dict(private_gib=private / 2**30, working_set_gib=info.rss / 2**30)
 
         assert reply(process)[0].get('protocol') == 2
         send(process, 'init', model_dir=str(args.model_dir.resolve()), kernel_dir=str(args.bundle.resolve()),

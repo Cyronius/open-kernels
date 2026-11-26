@@ -109,6 +109,14 @@ foreach(t open_qwen36_cli block_host_test attn_window_test inkling2_host_check i
     endif()
 endforeach()
 
+# GCC contracts a*b+c into FMA by default in C++ (MSVC does not), and the contraction can differ between the
+# one-row decode and multi-row verify loops. The Inkling sources keep verify bit-equal to decode only without it.
+if(NOT MSVC)
+    set_source_files_properties(inkling2_host.cpp inkling2_npu.cpp inkling2_dspark.cpp
+        vision/inkling2_vision.cpp vision/inkling2_vision_npu.cpp
+        PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+endif()
+
 foreach(t open_qwen36_cli manifest_test gguf_pack_test vit_test block_host_test attn_window_test
           kvslice_patch_test spec_lookup_test inkling2_host_check inkling2_verify_check inkling2_dspark_check
           inkling2_npu_check inkling2_vision_check inkling2_vision_npu_check)
