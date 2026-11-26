@@ -125,16 +125,20 @@ void q8_half_tile(const uint8_t* chunk, unsigned half, uint8_t* dst);
 void pack_inkling2_expert(const uint8_t* src, bool iq4_nl, size_t rows, size_t cols, size_t cols_pad, uint8_t* dst);
 namespace inkling2_block {
 inline constexpr size_t tile_m = 16, tile_n = 96, tile_k = 32, array_cols = 8;
-inline constexpr size_t decode_tile_m = 4;
+inline constexpr size_t decode_tile_m = 4, worker_rows = 4;
 inline size_t weight_bytes(bool iq4, size_t n, size_t k, bool split_scale = false) {
     return n * (k / tile_k) * ((iq4 ? 18 : 34) + (split_scale ? 2 : 0));
 }
 inline size_t input_bytes(size_t m, size_t k) { return m * (k / tile_k) * (tile_k + 8) * sizeof(int16_t); }
-void pack_weights(const uint8_t* src, bool iq4, size_t n, size_t k, uint8_t* dst, bool split_scale = false);
+/// Expert gate/up planes [gate | up] with paired = true put matching gate and up tiles on one core:
+/// core r's bands are gate 3r, up 3r, gate 3r+1, ... (recipes/inkling2_routed.py `paired-v1`).
+size_t paired_band(size_t group, size_t groups, size_t core_rows);
+void pack_weights(const uint8_t* src, bool iq4, size_t n, size_t k, uint8_t* dst, bool split_scale = false,
+                  bool paired = false);
 void pack_input(const float* src, size_t rows, size_t m, size_t k, uint8_t* dst, bool from_fp32 = false);
 void unpack_output(const float* src, size_t rows, size_t m, size_t n, float* dst);
 void unpack_grouped_output(const float* src, const size_t* counts, size_t slots, size_t slot_rows,
-                           size_t core_rows, size_t n, float* dst);
+                           size_t core_rows, size_t n, float* dst, bool paired = false);
 }  // namespace inkling2_block
 /// Q8_0 rows to 9,216-byte f32-scale logits tiles, with zero padding up to rows_pad.
 void pack_q8_head_tiles(const uint8_t* src, size_t rows, size_t cols, size_t rows_pad, uint8_t* dst);

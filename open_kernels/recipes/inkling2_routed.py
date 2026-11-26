@@ -19,6 +19,9 @@ NEAR_ATTENTION_FORMAT = "inkling2-near-v1"
 NEAR_ATTENTION_CHUNKS = 80
 LOOP_CONTROLLER_FORMAT = "inkling2-controller-v1"
 LOOP_CONTROLLER_STREAMS = ("qkv", "ffn")
+# Fused singleton experts: core r holds gate/up band pairs 3r..3r+2 (pools.cpp paired_band).
+FUSED_EXPERTS = ("iq4-moe", "q8-moe")
+GATE_UP_ORDER = "paired-v1"
 
 
 def image_parts(root, pattern):
@@ -152,6 +155,9 @@ def main():
                         help="parent of the controller-{qkv,ffn} builds: loop controllers of prefill blocks on the NPU")
     parser.add_argument("--split-prefill-q8", action="store_true",
                         help="the prefill-q8 streams read the split-scale experts that singleton decode packs")
+    parser.add_argument("--fused-experts", action="store_true",
+                        help="add the one-launch gate/up, SiTU and down singleton streams; every gate/up pool reader "
+                             "then uses the paired band order")
     args = parser.parse_args()
     if args.compact and not (args.blocks or args.grouped_blocks):
         parser.error("--compact requires --blocks or --grouped-blocks")
@@ -181,6 +187,8 @@ def main():
         parser.error("--singleton-decode requires a v11 bundle")
     if args.split_prefill_q8 and not (args.singleton_decode and args.grouped_blocks):
         parser.error("--split-prefill-q8 requires --singleton-decode and --grouped-blocks")
+    if args.fused_experts and not (args.singleton_decode and args.grouped_blocks):
+        parser.error("--fused-experts requires --singleton-decode and --grouped-blocks")
     prefix = "shared" if args.shared_attention else "compact" if args.compact else "routed"
     roots = {name: args.builds / f"{prefix}-{name}" for name in STREAMS}
     baseline = roots["iq4-up"]
@@ -234,7 +242,8 @@ def main():
             tiers = attention_tiers(args.singleton_decode, "singleton-attention-")
             if tiers.keys() != shared["iq4"].keys():
                 raise ValueError("singleton decode must provide the same attention tiers")
-            singleton = {name: args.singleton_decode / f"singleton-{name}" for name in (*STREAMS, "fused", "output")}
+            names = (*STREAMS, *(FUSED_EXPERTS if args.fused_experts else ()), "fused", "output")
+            singleton = {name: args.singleton_decode / f"singleton-{name}" for name in names}
             singleton.update({f"attention-{n}": root for n, root in tiers.items()})
             if check_image(singleton) != 32 or not aligned_attention_image(singleton["iq4-up"]):
                 raise ValueError("singleton decode requires one aligned 32-worker image")
@@ -358,10 +367,12 @@ def main():
             shutil.copyfile(root / "insts.bin", args.output / streams[name])
         manifest["singleton_decode"] = {
             "format": "inkling2-shared-split-q8", "image": image,
-            "experts": {name: streams[name] for name in STREAMS},
+            "experts": {name: streams[name] for name in (*STREAMS, *(FUSED_EXPERTS if args.fused_experts else ()))},
             "attention": {str(n): streams[f"attention-{n}"] for n in shared["iq4"]},
             "dense": {name: streams[name] for name in ("fused", "output")},
         }
+        if args.fused_experts:
+            manifest["singleton_decode"]["gate_up_order"] = GATE_UP_ORDER
         if args.split_prefill_q8:
             manifest["shared_prefill_q8"] = True
     if args.loop_controller:

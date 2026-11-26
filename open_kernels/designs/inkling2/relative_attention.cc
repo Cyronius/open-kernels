@@ -12,6 +12,13 @@ using vi16 = aie::vector<int32_t, tq>;
 
 alignas(64) const int32_t lanes[tq] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 
+// The singleton image runs the 16-lane exponentials on the 32-lane copy: same lanewise bits, one fewer function.
+#ifdef INKLING2_EXP32
+v16f exp16(const v16f& x) { return vexpN<32>(aie::concat(x, x)).extract<tq>(0); }
+#else
+v16f exp16(const v16f& x) { return vexpN<tq>(x); }
+#endif
+
 // 32-bit BF16 broadcast replicates pairs. Zip a vector with itself first.
 v32b duplicate(const v16b& a) {
     const auto v = a.grow_replicate<32>();
@@ -193,13 +200,13 @@ extern "C" void INKLING2_ATTENTION_STEP(const uint8_t* __restrict query, const u
         aie::store_v(scores + key * tq, s);
     }
 
-    const auto keep = vexpN<tq>(fsubN<tq>(old_peak, peak));
+    const auto keep = exp16(fsubN<tq>(old_peak, peak));
     const auto old_mass = aie::load_v<tq>(mass_ptr);
     auto mass = fmulN<tq>(old_mass, keep);
     const auto zero = aie::zeros<float, tq>();
     for (unsigned key = 0; key < tk; ++key) {
         const auto s = aie::load_v<tq>(scores + key * tq);
-        const auto p = aie::select(zero, vexpN<tq>(fsubN<tq>(s, peak)), aie::gt(s, invalid));
+        const auto p = aie::select(zero, exp16(fsubN<tq>(s, peak)), aie::gt(s, invalid));
         v16b hi, lo;
         split16(p, hi, lo);
         aie::store_v(probs + key * 64, duplicate(hi));

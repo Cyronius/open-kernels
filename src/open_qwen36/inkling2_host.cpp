@@ -417,17 +417,18 @@ struct Layer {
         Rows out(x.count(), hidden);
         if (projector && x.count() == 1) {
             Inkling2ExpertProjector::ExpertIds ids{};
-            Rows input(top, hidden), both(top, 2 * ff), values(top, hidden);
+            Rows values(top, hidden);
             size_t slot = 0;
             for (size_t e = 0; e < experts; ++e)
-                if (!by_expert[e].empty()) {
-                    ids[slot] = e;
-                    std::copy_n(x[0], hidden, input[slot]);
-                    ++slot;
-                }
-            projector->project(*gate_up.file, gate_up.name, layer, false, ids, input.data.data(), both.data.data());
-            const Rows inner = situ(both, gate_cap, up_cap);
-            projector->project(*down.file, down.name, layer, true, ids, inner.data.data(), values.data.data());
+                if (!by_expert[e].empty()) ids[slot++] = e;
+            if (!projector->project_routed(*gate_up.file, gate_up.name, *down.file, down.name, layer, ids, gate_cap,
+                                           up_cap, x[0], values.data.data())) {
+                Rows input(top, hidden), both(top, 2 * ff);
+                for (size_t i = 0; i < top; ++i) std::copy_n(x[0], hidden, input[i]);
+                projector->project(*gate_up.file, gate_up.name, layer, false, ids, input.data.data(), both.data.data());
+                const Rows inner = situ(both, gate_cap, up_cap);
+                projector->project(*down.file, down.name, layer, true, ids, inner.data.data(), values.data.data());
+            }
             for (size_t i = 0; i < top; ++i)
                 for (size_t j = 0; j < hidden; ++j)
                     out[0][j] += by_expert[ids[i]].front().weight * values[i][j];

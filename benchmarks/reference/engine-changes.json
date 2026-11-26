@@ -528,6 +528,28 @@
         "src/open_qwen36/inkling2_host.cpp": "f88250b5d821cfc4ea5f7ac148d5b8cddb0aeca0ddce87cfdaa699a1db48eec0",
         "src/open_qwen36/inkling2_npu.cpp": "261d65a63b3de09188a75ffc5b61aedcae3efaf2f51e6621b407be1ff1b29412"
       }
+    },
+    {
+      "id": "inkling2-fused-singleton-experts",
+      "origin": "open-kernels: one singleton launch per decode visit runs gate/up, SiTU on the cores and down (manifest singleton_decode.gate_up_order paired-v1, streams iq4-moe and q8-moe); gate/up pools use the paired band order",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "993e90bc07427d997b715d1e6d9b790c12cec1351d8dad5bfa91f56d323ff6be",
+        "src/open_qwen36/inkling2_host.cpp": "2e9e0f2c08c696f66979a3ff9ca3ccefc0edc6d66ad5427fe5645393ff310bdf",
+        "src/open_qwen36/inkling2_host.hpp": "6ee3094acfd841bfc211ee9e28235c499d33626d8d75a564dc8012052aab7765",
+        "src/open_qwen36/pools.cpp": "44f0ebf75769034466fde17294b9e87b3d5bd0c014480918786a175a2294802c",
+        "src/open_qwen36/pools.hpp": "a9e6bdf323d7cc4d2a2fff42cbb5def37cdc5b04c982a07232834e721c22be87"
+      }
+    },
+    {
+      "id": "inkling2-merge-controller-situ",
+      "origin": "open-kernels: merge of the used K/V chunks, the NPU loop controller and the fused singleton experts",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "b2a5d82ecae8e78f63274b7fc5e4517b0fe2472211f54fc1a94c819719c4c089",
+        "src/open_qwen36/inkling2_host.cpp": "db611b896449059f36e969bf2b1d36ce0de28712f275d8d9f2dd257076d63457",
+        "src/open_qwen36/inkling2_host.hpp": "27cb981d327c797851c58412dec3a59f6702ba4e34652cbc084b37353a51967f",
+        "src/open_qwen36/pools.cpp": "44f0ebf75769034466fde17294b9e87b3d5bd0c014480918786a175a2294802c",
+        "src/open_qwen36/pools.hpp": "a9e6bdf323d7cc4d2a2fff42cbb5def37cdc5b04c982a07232834e721c22be87"
+      }
     }
   ]
 }

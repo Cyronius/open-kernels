@@ -42,6 +42,10 @@ public:
     // and writes one 2,304-value output row, in the order of ids.
     virtual void project(const GgufFile& file, const std::string& tensor, size_t layer, bool down,
                          const ExpertIds& ids, const float* input, float* output) = 0;
+    // One row through gate/up, SiTU (gate and up caps) and down in one launch, writing one 2,304-value
+    // row per expert in the order of ids. False selects project() for each leg.
+    virtual bool project_routed(const GgufFile&, const std::string&, const GgufFile&, const std::string&, size_t,
+                                const ExpertIds&, float, float, const float*, float*) { return false; }
     // Rows assigned to one expert, in token order. An empty return selects the host matrix multiply.
     virtual std::vector<float> project_block(const GgufFile&, const std::string&, size_t, bool, size_t,
                                              const float*, size_t) { return {}; }
