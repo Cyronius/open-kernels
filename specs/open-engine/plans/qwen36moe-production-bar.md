@@ -639,3 +639,7 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   0.0066, 93.4 %. `kl/base_vk_c512.kld` now points at the Vulkan base, as on Strix Point.
 - 2026-11-26, phlegm bridge: a request line may now be 16 MB (was 1 MB: a 262,000-token prompt's ids are 1.6 MB).
   `phlegm run --image` PASS; 32,768-token needle through `phlegm serve` PASS (189 s).
+- 2026-11-26 12:27-13:03, 262,000-token needle (depth 0.5) through `phlegm serve` (`needle_serve.sh 262000 263168`, MTP
+  on, the chat template around it: 262,005 prompt tokens): answer 58213, PASS, 2,163 s wall (prefill and 5 tokens),
+  Default power mode, shared box. Against the CLI's 2,457 s on Strix Point (performance mode, before OPEN-MOE-PIPE /
+  OPEN-DN-FUSED). This closes handoff item 4 (262k through `phlegm serve`).
