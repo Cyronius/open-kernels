@@ -647,3 +647,9 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   reasoning; thinking on "391" with 1,042 characters of reasoning, `stop`; streamed "Red, Orange, Yellow" in 7
   chunks; `get_weather` `{"city":"Paris"}` with `finish_reason` tool_calls, and after the tool message "The weather in
   Paris right now is light rain with a temperature of 14°C." (292 of 325 prompt tokens reused). FEATURES PASS.
+- 2026-11-26 14:30, speculative modes through `phlegm serve` on Strix Halo (`spec_serve.sh`, OPEN-DECODE-STREAM-LX set,
+  greedy, thinking off; outputs byte-identical to `off`): off 10.43 / 10.42 tokens/s (rewrite / explain), MTP 12.29 /
+  11.07 (1.18x / 1.06x; rewrite 57 of 58 passes took both rows, explain 112 of 142), lookup 12.12 / 10.18 (1.16x /
+  0.98x). The MTP cycle: verify pass 144.7 ms (1.51 plain steps here against 1.35 on Strix Point), draft 12.2, commit
+  3.9. MTP stays the shipped drafter; its gain here is bounded by the verify pass's cost, which has the same context
+  switches as decode (`vlx` / `vax`).
