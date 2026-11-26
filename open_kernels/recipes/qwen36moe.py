@@ -40,9 +40,13 @@ def one_context() -> bool:
 
 def merged_image(spec: ModelSpec) -> bool:
     """Whether this spec's layer kernels are the merged image. It needs both layer types, and
-    no q8 projection role: ux.py's main-core program has room for ONE GEMV entry (the main
-    cores sit at 16256 of 16384 bytes), so a q8 model of the family keeps lx/ax."""
-    return one_context() and spec.has_linear and spec.has_full and not spec.q8_roles
+    ONE projection GEMV entry on the main core: ux.py's main-core program has room for one (the
+    main cores sit at 16256 of 16384 bytes). No q8 role, or every projection role at q8
+    (OPEN-DECODE-ONE-CONTEXT-Q8: the q8 entry serves both stages; `OPEN_LAYER_MERGED_Q8=0` keeps lx/ax);
+    a mix keeps lx/ax."""
+    q8 = set(spec.q8_roles) if spec.q8_roles else set()
+    one_entry = not q8 or ({"attn", "linear", "linear_out"} <= q8 and os.environ.get("OPEN_LAYER_MERGED_Q8", "1") != "0")
+    return one_context() and spec.has_linear and spec.has_full and one_entry
 
 
 # OPEN-DECODE-STREAM-UX: the kernel geometries the merged image's stream changes below were
@@ -50,6 +54,9 @@ def merged_image(spec: ModelSpec) -> bool:
 # reference Qwen3.6-35B-A3B spec and every GGUF of it (KAT Coder, Ornith, Nex, Clover) share it.
 STREAM_MEASURED_KERNELS: tuple[str, ...] = (
     "sha256:2a3631c0cf5f0265bd639a08350990a24d86f92e9fda2f6c7cd748c3acbe61ad",
+    # Unsloth's Qwen3.6-35B-A3B UD-Q4_K_S at q8 projections on the merged q8 image (OPEN-DECODE-ONE-CONTEXT-Q8):
+    # 79.0 -> 73.5 ms a step with all four knobs, logits byte-identical (2026-11-26)
+    "sha256:9a635603a58ef7634a48b0645aefd7d38ab23bb3aa0a7827e497746f6dbd3404",
 )
 WRING_DEPTH = 16
 
@@ -87,7 +94,7 @@ def router_split(spec: ModelSpec | None = None) -> bool:
 
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
 # is unchanged. In the build key so a probe set never shares a key with a real one.
-_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN")
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX", "QWEN36MOE_MB_NT")
 
 
 def probe_env() -> dict[str, str]:
@@ -98,6 +105,10 @@ def probe_env() -> dict[str, str]:
     e = dict(_attn_probe_env())
     if one_context():
         e["OPEN_LAYER_ONE_CTX"] = "1"
+    if os.environ.get("OPEN_LAYER_MERGED_Q8"):
+        e["OPEN_LAYER_MERGED_Q8"] = os.environ["OPEN_LAYER_MERGED_Q8"]
+    if os.environ.get("OPEN_VERIFY_ONE_CTX"):
+        e["OPEN_VERIFY_ONE_CTX"] = os.environ["OPEN_VERIFY_ONE_CTX"]
     for k in _LAYER_PROBE_VARS:
         if os.environ.get(k):
             e[k] = os.environ[k]
@@ -583,10 +594,6 @@ def _check(spec: ModelSpec) -> None:
     if spec.quant_of("experts") == "q8":
         raise OpRangeError("qwen36moe: a q8 routed expert -- the expert stripe and down laws are q4_1 "
                            "only, and no published model ships one")
-    if spec.quant_of("shared") == "q8":
-        raise OpRangeError("qwen36moe: a q8 shared expert -- it rides the routed experts' call sites "
-                           "(one nine-slot loop, for program memory), so it runs at the routed format; "
-                           "the packer re-quantizes it, as it did before OPEN-QUANT-Q8")
     if spec.num_experts == 0 or spec.shared_expert_intermediate == 0:
         raise OpRangeError("qwen36moe: a dense model or one without a shared expert is not this recipe")
     n = LIMITS["n_cols"]
@@ -1312,7 +1319,18 @@ GEMM_T = 256          # gemm_q4_prefill.py's GQP_T: a multiple of tile_n * 8 col
 # bought 4 % of the expert stage and nothing of the prefill, in exchange for doubling
 # mb_x / mb_h / mb_y and spending the core's last 4 KB of L1. Raise it once the core rate is
 # up (the plan's B(3)); the design and the driver are ready for it.
-MB_NT = 8
+MB_NT = 8   # tokens a visit (16 measured no faster: the kernel is core-bound at 8; production-bar plan, step 2)
+# OPEN-MOE-DQBUF: with the dequantised k-tile kept in L1 for every 8-token sub-tile, a 16-token visit costs the core
+# 4.6 us a token against 6.3 at 8 tokens (32 slots: 2.34 ms against 1.62 for half the tokens; the weight stream alone
+# 1.53), the same bits. Measured geometries take 16 tokens a visit and the buffer; `QWEN36MOE_MB_NT` overrides.
+MB16_MEASURED: tuple[str, ...] = (
+    "sha256:9a635603a58ef7634a48b0645aefd7d38ab23bb3aa0a7827e497746f6dbd3404",   # Unsloth Qwen3.6-35B-A3B q8 projections
+)
+
+
+def mb_nt(spec: ModelSpec | None) -> int:
+    default = 16 if spec is not None and spec.kernel_hash() in MB16_MEASURED else MB_NT
+    return int(os.environ.get("QWEN36MOE_MB_NT", default))
 ATTN_LMAX = 4096      # the widest attention GEMM stream (rows of window); a longer window is chunked on the host
 # The q4_1 GEMM reads the band law; an all-q8 MoE route runs every GEMM on bf16 instead (bf16_route), and
 # a q8 projection elsewhere runs as its exact q4_1 split (gemm_weight): every q8 code is 16 hi + lo, so two q4_1 halves sum
@@ -1393,7 +1411,8 @@ def _op_index(ops: list[dict], suffix: str, chunk0: int | None = None) -> int:
     return hits[0]
 
 
-def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_split: bool = False) -> dict | None:
+def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_split: bool = False,
+               max_ctx: int = 4096) -> dict | None:
     """Per layer type the `gemm_block` the driver reads, plus the contexts / kernels / globals /
     builds the route adds. None when a projection is streamed at q8: the GEMM dequantises the
     q4_1 band law only, and the sequential path is then exactly what it was.
@@ -1409,8 +1428,6 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         # block-prefill GEMM reads the bf16 chunk law by a hardcoded constant,
         # so a f32-scale set must not advertise the route -- the engine then
         # prefills through step() (decode-as-prefill), which is exact.
-        return None
-    if not dense and spec.quant_of("shared") == "q8":
         return None
     L, T = layout(spec, ffn=ffn), GEMM_T
     hid, ff = spec.hidden, spec.intermediate if dense else spec.moe_intermediate
@@ -1460,7 +1477,7 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
     mb_args = ["pool", "mb_x", "mb_h", "mb_y"]
     if not dense:
         check_buffer_args("moe_batch", mb_args)
-    moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": MB_NT}
+    moe_batch = {"kernels": {str(s): f"mb_s{s}" for s in mb_slots}, "args": mb_args, "nt": mb_nt(spec)}
 
     # Block attention as two bf16 GEMMs per kv head (OPEN-PREFILL-ATTN, designs/attn_block): the
     # group's 8 query heads x T tokens against the window, scores then values, the row softmax on
@@ -1475,6 +1492,18 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         attn_block = {"m": ag_m, "hd": spec.head_dim, "l_max": ATTN_LMAX, "args": ag_args,
                       "kernels_s": {str(L): f"ag_s{L}" for L in ag_tiers},
                       "kernels_pv": {str(L): f"ag_pv{L}" for L in ag_tiers}}
+    # The fused block attention (designs/attn_fa256): scores, causal mask, softmax and both products in one dispatch
+    # a block, K and V read in place from the cache; one xclbin, a stream a window tier (every 256 rows to ATTN_LMAX,
+    # then every ATTN_LMAX rows: a block streams at most ATTN_LMAX - 1 masked rows). attn_block stays the fallback.
+    fa_tiers: list[int] = []
+    attn_fa = None
+    if (not dense and spec.has_full and spec.head_dim == 256 and spec.num_kv_heads == 2 and spec.num_heads % 2 == 0
+            and T == 256 and max_ctx % 256 == 0):
+        fa_tiers = list(range(256, min(ATTN_LMAX, max_ctx) + 1, 256)) + list(range(2 * ATTN_LMAX, max_ctx + 1, ATTN_LMAX))
+        if max_ctx > ATTN_LMAX and max_ctx % ATTN_LMAX:
+            fa_tiers.append(max_ctx)
+        attn_fa = {"hd": 256, "l_max": fa_tiers[-1], "q_head": (64 + T) * 256, "qsplit": False,
+                   "kernels": {str(Lw): f"fa{Lw}" for Lw in fa_tiers}}
 
     def ffn_of(lt: str) -> dict:
         # up and gate are the pool's first two ops, contiguous and both std_perm, so one GEMM
@@ -1497,9 +1526,12 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
 
     def shared_of(lt: str) -> dict:
         pool = plan[lt]["pool"]
-        sw = {"gshare_w": weight(pool, [_op_index(pool, "share_up_exps_proj.weight"),
-                                        _op_index(pool, "share_gate_exps_proj.weight")]),
-              "gsdown_w": weight(pool, [_op_index(pool, "share_down_exps_proj.weight")])}
+        idx = [_op_index(pool, s) for s in ("share_up_exps_proj.weight", "share_gate_exps_proj.weight",
+                                             "share_down_exps_proj.weight")]
+        if shared_host(spec):
+            # the pool keeps a q4_1 copy for its layout; the GEMMs read the source's q8 codes
+            pool = [dict(o, op="q8_perm", nch=2 * o["nch"]) if i in idx else o for i, o in enumerate(pool)]
+        sw = {"gshare_w": weight(pool, idx[:2]), "gsdown_w": weight(pool, idx[2:])}
         return {"shared_program": [run(2 * sff, hid, "gshare_w", sw), run(hid, sff, "gsdown_w", sw)],
                 "shared_ff": sff, "shared_weights": sw}
 
@@ -1559,6 +1591,8 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         }
         if attn_block:
             types[FULL]["attn_block"] = attn_block
+        if attn_fa:
+            types[FULL]["attn_fa"] = attn_fa
     if is_t2(spec):
         for g in types.values():
             g["y_tn"] = True            # OPEN-GEMM-T2: the GEMM writes y [T, N] ...
@@ -1590,13 +1624,14 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         name = f"mb_s{s}"
         out["kernels"][name] = {"context": "mb", "insts": f"{name}/insts.bin", "patch": "moebatch", "build": name}
         out["builds"][name] = {"design": "moe_batch/moe_batch.py", "build_dir": f"moe_batch/build_s{s}{sfx}",
-                               "env": {"MB_SLOTS": str(s), "MB_NT": str(MB_NT), "MB_HID": str(hid), "MB_FF": str(ff),
+                               "env": {"MB_SLOTS": str(s), "MB_NT": str(mb_nt(spec)), "MB_HID": str(hid), "MB_FF": str(ff),
                                        "MB_EXPERTS": str(E), "MB_POOL_DOWN": str(L.POOL_DOWN),
-                                       "MB_POOL_BYTES": str(L.POOL_BYTES)}}
+                                       "MB_POOL_BYTES": str(L.POOL_BYTES),
+                                       **({"MB_DQBUF": "1"} if mb_nt(spec) > 8 else {})}}
     if not dense:
-        out["globals"]["mb_x"] = mb_slots[0] * hid * MB_NT * 2
-        out["globals"]["mb_h"] = mb_slots[0] * ff * MB_NT * 2
-        out["globals"]["mb_y"] = mb_slots[0] * hid * MB_NT * 4
+        out["globals"]["mb_x"] = mb_slots[0] * hid * mb_nt(spec) * 2
+        out["globals"]["mb_h"] = mb_slots[0] * ff * mb_nt(spec) * 2
+        out["globals"]["mb_y"] = mb_slots[0] * hid * mb_nt(spec) * 4
     if attn_block:
         hd = spec.head_dim
         # AG_M is baked into the build; the 35B's directories keep the names they have always had
@@ -1612,6 +1647,18 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
         out["globals"]["ag_a"] = ag_m * ATTN_LMAX * 2
         out["globals"]["ag_b"] = ATTN_LMAX * hd * 2
         out["globals"]["ag_c"] = ag_m * ATTN_LMAX * 4
+    if attn_fa:
+        out["contexts"]["fa"] = f"fa{fa_tiers[0]}/final.xclbin"
+        for Lw in fa_tiers:
+            name = f"fa{Lw}"
+            out["kernels"][name] = {"context": "fa", "insts": f"{name}/insts.bin", "build": name}
+            out["builds"][name] = {"design": "attn_fa256/attn_fa256.py", "build_dir": f"attn_fa256/build_l{Lw}_r{max_ctx}",
+                                   "env": {"AF_L": str(Lw), "AF_HEADS": str(spec.num_heads),
+                                           "AF_KV_HEADS": str(spec.num_kv_heads), "AF_KV_LD": str(L.KV_ROW // 2),
+                                           "AF_MAX_ROWS": str(max_ctx)}}
+        # Q: per head 64 record rows and the block's 256 rows, bf16; O: fp32 token rows
+        out["globals"]["fa_q"] = spec.num_heads * attn_fa["q_head"] * 2
+        out["globals"]["fa_o"] = T * spec.num_heads * spec.head_dim * 4
     # OPEN-GEMM-T2: a ternary (t2) model's GEMM runs the bf16 matmul on aie2p's bfp16 datapath,
     # ~2.6x the native bf16 form on this array. Its weights are exact there (three values per
     # 128-k scale block, so every 8-k block shares one exponent), and the activations take a
@@ -1653,6 +1700,42 @@ def gemm_route(spec: ModelSpec, ffn: str = "moe", plan: dict | None = None, q8_s
 
 
 # ---- the step program (what the driver runs per layer type), and the kernel sets that serve it
+def shared_host(spec: ModelSpec) -> bool:
+    """A q8 shared expert (OPEN-SHARED-HOST-Q8): no q8 GEMV fits the decode cores beside the routed
+    experts' (lx's main core has 80 B free), so decode runs it on the host from the source's codes,
+    the decode streams carry the routed slots only, and the block route's GEMMs read the q8 codes."""
+    return spec.num_experts > 0 and spec.quant_of("shared") == "q8"
+
+
+def shared_steps(spec: ModelSpec, kernel: str, a_xm: int, a_res: int) -> list[dict]:
+    """The decode program's host step for a q8 shared expert: between the router patch and the MoE
+    dispatch, res += sigmoid(xm . gate_inp) * down(silu(gate xm) * up xm), in place in act."""
+    if not shared_host(spec):
+        return []
+    pre = "model.layer.{l}."
+    return [{"op": "shared_q8", "kernel": kernel, "a_xm": a_xm, "a_res": a_res,
+             "up": pre + "mlp.share_up_exps_proj.weight", "gate": pre + "mlp.share_gate_exps_proj.weight",
+             "down": pre + "mlp.share_down_exps_proj.weight", "gate_inp": pre + "shared_expert_gate.weight"}]
+
+
+VERIFY_ROWS = 2
+
+
+def merged_verify(spec: ModelSpec) -> bool:
+    """The verify pass on one image too (designs/layer_x/vux.py, OPEN-VERIFY-ONE-CONTEXT) when decode is merged;
+    `OPEN_VERIFY_ONE_CTX=0` keeps vlx / vax on two contexts."""
+    return bool(verify_rows(spec)) and merged_image(spec) and os.environ.get("OPEN_VERIFY_ONE_CTX", "1") != "0"
+
+
+def verify_rows(spec: ModelSpec) -> int:
+    """Rows of the MoE verify pass (designs/layer_x/vlx.py, vax.py): the q8-projection MoE spec with both layer
+    types, two contexts and the shared expert on the host; 0 for every other spec, whose export does not change."""
+    q8 = set(spec.q8_roles) if spec.q8_roles else set()
+    ok = (spec.num_experts and spec.has_linear and spec.has_full and shared_host(spec)
+          and {"attn", "linear", "linear_out"} <= q8 and os.environ.get("OFLM_EXPORT_VERIFY", "1") != "0")
+    return VERIFY_ROWS if ok else 0
+
+
 def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
     L = layout(spec)
     out: dict = {
@@ -1683,6 +1766,7 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             "buffers": {"consts": L.C_BYTES, "act": L.A_BYTES, "state": {"kind": "linear", "bytes": L.STATE_BYTES}},
             "program": [{"op": "run", "kernel": "lx0", "args": args},
                         {"op": "moeroute2", "kernel": "lx1", "act_off": L.A_ROUT},
+                        *shared_steps(spec, "lx1", L.A_XM, L.A_RES),
                         {"op": "run", "kernel": "lx1", "args": args}],
         }
     if spec.has_full:
@@ -1706,9 +1790,47 @@ def programs(spec: ModelSpec, max_ctx: int = 4096) -> dict:
             "buffers": {"consts": L.CA_BYTES, "act": L.AA_BYTES, "state": {"kind": "kv", "row": L.KV_ROW}},
             "program": [{"op": "run", "kernel": "ax0", "args": args},
                         {"op": "moeroute2", "kernel": "ax1", "act_off": L.AA_ROUT},
+                        *shared_steps(spec, "ax1", L.AA_XM, L.AA_RES),
                         {"op": "run", "kernel": "ax1", "args": args}],
         }
-    r = gemm_route(spec)
+    nr = verify_rows(spec)
+    if nr:
+        # OPEN-VERIFY-ROWS-QWEN36MOE: row r's routed slot j is placeholder expert r * topk + j (moe_sequence slot0),
+        # its state is slot r -> r + 1 of a (nr + 1)-slot linear state, its cache row and record are row r + 1
+        out["globals"]["vxres"] = nr * spec.hidden * 4
+        out["globals"]["vhn"] = nr * spec.hidden * 2
+        out["globals"]["vlogits"] = nr * spec.vocab * 4
+        out["contexts"]["lmv"] = "lmv/final.xclbin"
+        out["kernels"]["lmv"] = {"context": "lmv", "insts": "lmv/insts.bin", "build": "lmv"}
+        # each row's final norm, then one head pass for every row (lm_head_q8 LMHEAD_ROWS); `name@r` is row r of a global
+        out["verify_tail"] = ([{"op": "run", "kernel": "ln", "args": [f"vxres@{r}", "zero", "normw", "xresf", f"vhn@{r}"]}
+                               for r in range(nr)]
+                              + [{"op": "run", "kernel": "lmv", "args": ["lmpool", "vhn", "vlogits"]}])
+        vmerged = merged_verify(spec)
+        vl_ctx, va_ctx = ("vlayer", "vlayer") if vmerged else ("vlx", "vax")
+        out["contexts"][vl_ctx] = "vlx0/final.xclbin"
+        out["contexts"].setdefault(va_ctx, "vax0/final.xclbin")
+        out["kernels"]["vlx0"] = {"context": vl_ctx, "insts": "vlx0/insts.bin", "build": "vlx0"}
+        out["kernels"]["vlx1"] = {"context": vl_ctx, "insts": "vlx1/insts.bin", "patch": "moeroute2", "rows": nr,
+                                  "build": "vlx1"}
+        vax0 = {"context": va_ctx, "insts": "vax0/insts.bin", "patch": "attnpos", "build": "vax0"}
+        if out["kernels"]["ax0"].get("rb"):
+            vax0["rb"] = out["kernels"]["ax0"]["rb"]
+        out["kernels"]["vax0"] = vax0
+        out["kernels"]["vax1"] = {"context": va_ctx, "insts": "vax1/insts.bin", "patch": "moeroute2", "rows": nr,
+                                  "build": "vax1"}
+        for lt, k0, k1, ab, rout, xm, res, st in (
+                (LINEAR, "vlx0", "vlx1", L.A_BYTES, L.A_ROUT, L.A_XM, L.A_RES, "state"),
+                (FULL, "vax0", "vax1", L.AA_BYTES, L.AA_ROUT, L.AA_XM, L.AA_RES, "state")):
+            args = ["pool", "vxres", "consts", st, "vact"] + (["ptab"] if lt == FULL or vmerged else [])
+            shared = [s for r in range(nr) for s in shared_steps(spec, k1, r * ab + xm, r * ab + res)]
+            out["layer_types"][lt]["verify"] = {
+                "rows": nr, "act": nr * ab, "state_slots": nr + 1 if lt == LINEAR else 0,
+                "program": [{"op": "run", "kernel": k0, "args": args},
+                            {"op": "moeroute2", "kernel": k1, "act_offs": [r * ab + rout for r in range(nr)]},
+                            *shared,
+                            {"op": "run", "kernel": k1, "args": args}]}
+    r = gemm_route(spec, max_ctx=max_ctx)
     if r:
         for k in ("contexts", "kernels", "globals"):
             out[k].update(r[k])
@@ -1765,18 +1887,23 @@ def _gguf_op(spec: ModelSpec, op: dict) -> dict:
     o = op["op"]
     hd, kd, vd, kh = spec.head_dim, spec.lin_key_dim, spec.lin_value_dim, spec.lin_key_heads
     if o == "expert_stripes":
-        return {"op": "expert_stripes_gguf", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
+        # q35_stripes / q35_down keep Q4_0 / Q4_1 / Q4_K codes (the *_gguf ops requantize Q4_K)
+        return {"op": "q35_stripes", "up": _G + "ffn_up_exps.weight", "gate": _G + "ffn_gate_exps.weight",
                 "dst": op["dst"], "experts": op["experts"], "stripes": op["stripes"],
                 "stripe_bytes": op["stripe_bytes"], "in_dim": op["in_dim"]}
     if o == "expert_down":
-        return {"op": "expert_down_gguf", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
+        return {"op": "q35_down", "tensor": _G + "ffn_down_exps.weight", "dst": op["dst"],
                 "experts": op["experts"], "expert_bytes": op["expert_bytes"]}
     if o == "lmhead_q8":
         return {"op": "q35_lmhead", "tensor": GGUF_GLOBALS[t], "dst": op["dst"], "in_dim": op["in_dim"]}
-    if o == "std_perm":
+    if o in ("std_perm", "q8_perm", "bf16_gemm"):
         if stem not in GGUF_MAT:
             raise OpRangeError(f"gguf view: no GGUF form for the projection {t}")
-        g = {"op": "q35_mat", "tensor": _G + GGUF_MAT[stem], "dst": op["dst"], "nch": op["nch"], "in_dim": op["in_dim"]}
+        g = {"op": {"std_perm": "q35_mat", "q8_perm": "q35_q8", "bf16_gemm": "q35_bf16"}[o],
+             "tensor": _G + GGUF_MAT[stem], "dst": op["dst"], "nch": op["nch"], "in_dim": op["in_dim"]}
+        for k in ("split", "via"):
+            if op.get(k):
+                g[k] = op[k]
         if stem == "self_attn.q_proj.weight":
             # [q | gate] per head in the GGUF; the container's chunk0 picked the half
             g.update(period=2 * hd, take=hd, offset=hd if op.get("chunk0", 0) else 0)
@@ -1816,23 +1943,61 @@ def _gguf_op(spec: ModelSpec, op: dict) -> dict:
 
 
 def gguf_view(spec: ModelSpec, base: dict) -> dict | None:
-    """The manifest's `gguf` section: the q4_1 manifest itself -- its kernels, programs,
-    block prefill route and layouts -- with every pack op translated by `_gguf_op`, in the
-    same order (the block route's weights name pool / consts ops by index) at the same
-    offsets. None where a projection is not q4_1 (no q35 op writes a q8 or t2 pool)."""
-    if not GGUF_EXPERT_OPS_READY or spec.quant != "q4_1" or any(q != "q4_1" for q in spec.quant_map.values()) \
-            or spec.hadamard:
+    """The manifest's `gguf` section: the manifest itself -- its kernels, programs, block
+    prefill route and layouts -- with every pack op translated by `_gguf_op`, in the same
+    order (the block route's weights name pool / consts ops by index) at the same offsets,
+    and the route's own `pack` weights likewise. Q8 roles (OPEN-GGUF-Q8-ROLES) stream as
+    q35_q8 and their route weights read the GGUF's q8 codes. None for t2 or a rotated spec."""
+    if not GGUF_EXPERT_OPS_READY or spec.hadamard:
+        return None
+    if any(q not in ("q4_1", "q8") or (q == "q8" and r not in Q8_ROLES | {"shared"}) for r, q in spec.quant_map.items()):
         return None
     import copy
     g = copy.deepcopy({k: v for k, v in base.items() if k != "gguf"})
     for lt in g["layer_types"].values():
         for key in ("pool", "consts"):
             lt["pack"][key] = [_gguf_op(spec, op) for op in lt["pack"][key]]
+        for st in lt["program"] + (lt.get("verify") or {}).get("program", []):
+            if st["op"] == "shared_q8":
+                st.update({k: _G + (GGUF_MAT | GGUF_PUT)[st[k].replace("model.layer.{l}.", "")]
+                           for k in ("up", "gate", "down", "gate_inp")})
+        for gb in [lt.get("gemm_block") or {}, *(lt.get("gemm_block_variants") or {}).values()]:
+            for key in ("weights", "shared_weights", "ffn_weights"):
+                for w in (gb.get(key) or {}).values():
+                    if w.get("from") == "pack":
+                        w["pack"] = [_gguf_op(spec, op) for op in w["pack"]]
     pk = g["pack"]
     pk["lm_head"]["ops"] = [_gguf_op(spec, op) for op in pk["lm_head"]["ops"]]
     pk["embed"]["tensor"] = GGUF_GLOBALS[pk["embed"]["tensor"]]
     pk["norm"]["tensor"] = GGUF_GLOBALS[pk["norm"]["tensor"]]
     return g
+
+
+# GGUF projection types the q4_1 law holds with their codes kept (q35_put)
+Q4_EXACT_GGUF = frozenset({"Q4_0", "Q4_1", "Q4_K"})
+
+
+def quant_for_gguf(spec: ModelSpec, path) -> dict | None:
+    """recipes/load.py's hook for a GGUF-only model directory: each role in Q8_ROLES whose tensors
+    the q4_1 law cannot hold (Unsloth's Q8_0 attention and DeltaNet) streams at q8; None when all fit."""
+    import re
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gguf_pool"))
+    from gguf_pool import read_gguf
+    from .spec import _GGUF_ROLE
+    _, tensors, _ = read_gguf(str(path))
+    m: dict[str, str] = {}
+    for name, t in tensors.items():
+        hit = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
+        if not hit or int(hit.group(1)) >= spec.num_layers:
+            continue
+        role = _GGUF_ROLE.get(hit.group(2))
+        if role in Q8_ROLES and t["type"] not in Q4_EXACT_GGUF:
+            m[role] = "q8"
+        elif role == "shared" and t["type"] == "Q8_0":
+            m[role] = "q8"
+    return m or None
 
 
 def finalize_gguf_manifest(spec: ModelSpec, manifest: dict) -> None:
@@ -1870,7 +2035,7 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     }
 
 
-def builds(spec: ModelSpec) -> dict[str, dict]:
+def builds(spec: ModelSpec, max_ctx: int = 4096) -> dict[str, dict]:
     """name -> {design, build_dir, env}: the kernel sets export_qwen36_kernels.py builds (paths
     relative to open_kernels/designs)."""
     b: dict[str, dict] = {}
@@ -1892,6 +2057,19 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         if spec.has_full:
             b["ax0"] = {"design": "layer_x/ax.py", "build_dir": f"layer_x/build_ax0{sfx}", "env": {"AX_PART": "0"}}
             b["ax1"] = {"design": "layer_x/ax.py", "build_dir": f"layer_x/build_ax1{sfx}", "env": {"AX_PART": "1"}}
+    if verify_rows(spec):
+        b["lmv"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_rows2",
+                    "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),
+                            "LMHEAD_CORES": str(LIMITS["n_cols"]), "LMHEAD_ROWS": str(verify_rows(spec))}}
+        if merged_verify(spec):
+            for name, part in (("vlx0", 0), ("vlx1", 1), ("vax0", 2), ("vax1", 3)):
+                b[name] = {"design": "layer_x/vux.py", "build_dir": f"layer_x/build_vux{part}{sfx}",
+                           "env": {"VUX_PART": str(part)}}
+        else:
+            for d in ("vlx", "vax"):
+                for part in (0, 1):
+                    b[f"{d}{part}"] = {"design": f"layer_x/{d}.py", "build_dir": f"layer_x/build_{d}{part}{sfx}",
+                                       "env": {f"{d.upper()}_PART": str(part)}}
     b["ln"] = {"design": "ln/ln.py", "build_dir": "ln/build", "env": {}}
     b["lm_head_q8"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_full",
                        "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),
@@ -1903,7 +2081,7 @@ def builds(spec: ModelSpec) -> dict[str, dict]:
         # untouched, so a shipped model keeps the kernels it has.
         if GGUF_F32_TWIN:
             b.update(GGUF.twin_builds(b, skip=("ln", "lm_head_q8")))
-    r = gemm_route(spec)
+    r = gemm_route(spec, max_ctx=max_ctx)
     if r:
         b.update(r["builds"])
     return b
@@ -1921,7 +2099,7 @@ KERNEL_SOURCES = [
     "designs/lm_head_q8/*.py", "designs/lm_head_q8/*.cc", "designs/lm_head_q8/*.h",
     "designs/gemm_q4_prefill/*.py", "designs/gemm_q4_prefill/*.cc", "designs/gemm_q4_prefill/*.h",
     "designs/moe_batch/moe_batch.py", "designs/moe_batch/*.cc", "designs/moe_batch/*.h",
-    "designs/attn_block/attn_gemm.py", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
+    "designs/attn_block/attn_gemm.py", "designs/attn_fa256/attn_fa256.py", "designs/attn_fa256/attn_fa256.cc", "../npu_offload/gemm_rtp/gemm_pretiled.py", "../npu_offload/gemm_rtp/npue.py",
     "include/vecmath.h", "include/scalar_fp.h", "ironutil.py", "build_design.py",
 ]
 # compiled only when a role is q8, so listing it here does not move a shipped build key

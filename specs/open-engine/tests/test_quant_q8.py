@@ -286,13 +286,15 @@ def test_a_q8_routed_expert_is_refused_by_name():
         Q.recipe(spec)
 
 
-def test_a_q8_shared_expert_is_refused_by_the_moe_recipe():
-    """The shared expert rides the routed experts' call sites (`gemv_q4_gup` / `_gdown`,
-    one nine-slot loop, for program memory). `spec_from_model_dir` downgrades the role
-    rather than refusing the model; a hand-written spec that asks for it is refused."""
+def test_a_q8_shared_expert_runs_on_the_host_in_decode():
+    """The decode cores have no program memory for a q8 GEMV beside the routed experts' (their shared expert rides
+    the routed slots' call sites), so a q8 shared expert is not refused any more: decode runs it on the host from the
+    source's codes (OPEN-SHARED-HOST-Q8), and every decode layer program carries the host step."""
     spec = dataclasses.replace(default_spec(), quant={"shared": "q8"})
-    with pytest.raises(OpRangeError, match="shared expert"):
-        Q.recipe(spec)
+    assert Q.shared_host(spec)
+    Q.recipe(spec)                      # accepted, not refused
+    for lt in Q.programs(spec)["layer_types"].values():
+        assert "shared_q8" in [st["op"] for st in lt["program"]]
 
 
 def test_a_quant_the_gemv_cannot_read_is_still_refused():

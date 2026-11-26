@@ -33,6 +33,8 @@
 /// run once without --gemm-block, once with, then diff `_p<position>.bin`
 /// pairs (correlation / argmax / top-5).
 #include <algorithm>
+#include <cctype>
+#include <stdexcept>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -50,6 +52,7 @@
 #include "open_qwen36/core.hpp"
 #include "open_qwen36/omp_policy.hpp"
 #include "open_qwen36/spec_lookup.hpp"
+#include "open_qwen36/vision/prompt.hpp"
 
 using open_qwen36::Core;
 using open_qwen36::CoreConfig;
@@ -114,6 +117,7 @@ void dump(const std::string& prefix, int t, const std::vector<float>& v) {
     std::string p = prefix + "_t" + std::to_string(t) + ".bin";
     std::ofstream f(p, std::ios::binary);
     f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size() * 4));
+    if (!f) throw std::runtime_error("cannot write " + p);
     std::fprintf(stderr, "wrote %s\n", p.c_str());
 }
 
@@ -124,12 +128,15 @@ void dump_pos(const std::string& prefix, int pos, const std::vector<float>& v) {
     std::string p = prefix + "_p" + std::to_string(pos) + ".bin";
     std::ofstream f(p, std::ios::binary);
     f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size() * 4));
+    if (!f) throw std::runtime_error("cannot write " + p);
     std::fprintf(stderr, "wrote %s\n", p.c_str());
 }
 
 struct Args {
     CoreConfig cfg;
     std::vector<int> ids;
+    std::vector<std::string> images;  // --image <file.ppm>: binary PPM, both sides multiples of patch * merge (OPEN-VISION-BLOCK)
+    bool image_seq = false;           // --image-seq: the image prompt one step a row, not on the block route
     std::string ids_list, list_out;  // --ids-list: one prompt a line; its logits at every position and greedy ids go to --list-out
     std::vector<int> ids2;          // a second prompt prefilled after ids at the position they ended (a chat turn)
     int max_tokens = 16;
@@ -150,6 +157,9 @@ struct Args {
     bool det_full = false;          // --det-full: compare every buffer a step writes, not only the logits
     int bench_step = 0;             // --bench-step N: the REAL step, min of N, at --at-position
     std::string bench_kernel;       // --bench-kernel NAME:REPS[:LAYER]: one kernel, over and over
+    int verify_check = 0;           // --verify-check N: N verify passes against plain steps (OPEN-VERIFY-ROWS-QWEN36MOE)
+    int mtp_accept = 0;             // --mtp-accept N: N greedy plain steps, each scored against the MTP layer's draft
+    int spec_mtp = 0;               // --spec-mtp N: N greedy tokens plain, then by MTP draft + verify pass; compared and timed
     std::string pmode = "performance";   // --pmode: the NPU power mode to set first ("none" leaves it)
     std::string decode_route;        // Stage 2.7: --decode-route {npu,host,auto} (default: the env's initial route)
     std::string decode_schedule;    // Stage 2.7: --decode-schedule "6n,6h,6n" -- per-step routes in the decode loop
@@ -256,6 +266,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--dump-kv") a.dump_kv = val();
         else if (k == "--quiet") a.cfg.verbose = false;
         else if (k == "--gemm-block") a.gemm_block = true;
+        else if (k == "--image") a.images.push_back(val());
+        else if (k == "--image-seq") a.image_seq = true;
         else if (k == "--block-major") a.block_major = true;
         else if (k == "--prefill-logits") a.prefill_logits = true;
         else if (k == "--bench") {
@@ -269,6 +281,9 @@ Args parse(int argc, char** argv) {
         else if (k == "--det-full") a.det_full = true;
         else if (k == "--bench-step") a.bench_step = std::atoi(val().c_str());
         else if (k == "--bench-kernel") a.bench_kernel = val();
+        else if (k == "--verify-check") a.verify_check = std::atoi(val().c_str());
+        else if (k == "--mtp-accept") a.mtp_accept = std::atoi(val().c_str());
+        else if (k == "--spec-mtp") a.spec_mtp = std::atoi(val().c_str());
         else if (k == "--pmode") a.pmode = val();
         // The server has a host gap right here that the CLI does not: between the last
         // prefill dispatch and the first decode one it samples, detokenises and writes
@@ -801,6 +816,74 @@ std::vector<int> request(Core& core, const Args& a) {
 
 }  // namespace
 
+// A binary PPM (P6, maxval 255) as the vision prompt's RGB image.
+open_qwen36::vision::RgbImage read_ppm(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    auto word = [&]() {
+        std::string w;
+        char c;
+        while (f.get(c)) {
+            if (c == '#') { std::string skip; std::getline(f, skip); continue; }
+            if (std::isspace(static_cast<unsigned char>(c))) { if (!w.empty()) break; continue; }
+            w += c;
+        }
+        return w;
+    };
+    if (word() != "P6") throw std::runtime_error(path + " is not a binary PPM (P6)");
+    open_qwen36::vision::RgbImage im;
+    im.width = std::stoi(word());
+    im.height = std::stoi(word());
+    if (std::stoi(word()) != 255) throw std::runtime_error(path + ": maxval must be 255");
+    im.rgb.resize(static_cast<size_t>(im.width) * im.height * 3);
+    f.read(reinterpret_cast<char*>(im.rgb.data()), static_cast<std::streamsize>(im.rgb.size()));
+    if (!f) throw std::runtime_error(path + " is short");
+    return im;
+}
+
+// --image: the prompt's image placeholders (one image_token_id each, as the tokenizer gives them) become each
+// image's tokens; the vision tower runs on the host, the prompt on the block route (or one step a row with
+// --image-seq), then greedy decode. --dump-logits writes the prompt's last-position logits.
+int run_images(Core& core, const Args& a) {
+    namespace vis = open_qwen36::vision;
+    using Ms = std::chrono::duration<double, std::milli>;
+    auto t0 = std::chrono::steady_clock::now();
+    const vis::VitConfig vcfg = vis::VitConfig::for_model_dir(a.cfg.model_dir);
+    const vis::VitWeights vw = vis::load_vit(a.cfg.model_dir + "/" + vis::vision_weights_path(a.cfg.model_dir), vcfg);
+    std::fprintf(stderr, "vision tower: %d blocks, resident in %.1f s\n", vcfg.depth,
+                 Ms(std::chrono::steady_clock::now() - t0).count() / 1000);
+    const float mean[3] = {0.5f, 0.5f, 0.5f}, stdv[3] = {0.5f, 0.5f, 0.5f};
+    std::vector<vis::PromptImage> imgs;
+    for (const auto& p : a.images) imgs.push_back(vis::patchify(vcfg, read_ppm(p), mean, stdv));
+    std::vector<int> ids;
+    size_t k = 0;
+    for (int t : a.ids) {
+        if (t != core.image_token_id()) { ids.push_back(t); continue; }
+        if (k >= imgs.size()) throw std::runtime_error("more image placeholders in the prompt than --image files");
+        ids.insert(ids.end(), imgs[k++].tokens(vcfg.merge), t);
+    }
+    if (k != imgs.size()) throw std::runtime_error("fewer image placeholders in the prompt than --image files");
+    const bool block = !a.image_seq && core.layer_major_ok();
+    const auto st = vis::prefill_images(core, vcfg, vw, ids, imgs, block, true);
+    std::fprintf(stderr, "image prompt %zu tokens (%zu image tokens, %zu images): vision tower %.0f ms, prefill %.0f ms (%s)\n",
+                 ids.size(), st.image_tokens, imgs.size(), st.vit_ms, st.prefill_ms, block ? "block" : "sequential");
+    if (!a.dump_prefix.empty()) dump_pos(a.dump_prefix, static_cast<int>(ids.size() - 1), core.logits());
+    const size_t V = core.real_vocab();
+    int tok = argmax(core.logits(), V);
+    auto td = std::chrono::steady_clock::now();
+    for (int n = 0; n < a.max_tokens; ++n) {
+        std::printf("token %d\n", tok);
+        std::fflush(stdout);
+        if (n + 1 == a.max_tokens) break;
+        core.step(tok, true);
+        tok = argmax(core.logits(), V);
+    }
+    if (a.max_tokens > 1)
+        std::fprintf(stderr, "decode %d tokens: %.0f ms/token\n", a.max_tokens - 1,
+                     Ms(std::chrono::steady_clock::now() - td).count() / (a.max_tokens - 1));
+    return 0;
+}
+
 int run_list(Core& core, const Args& a) {
     std::ifstream f(a.ids_list);
     std::string line;
@@ -861,6 +944,179 @@ int main(int argc, char** argv) {
             core.bench_dispatch(a.bench_layer, a.bench);
             std::printf("DONE\n");
             return 0;
+        }
+        if (!a.images.empty()) return run_images(core, a);
+        if (a.spec_mtp) {
+            if (!core.mtp_ready() || core.verify_rows() != 2) {
+                std::fprintf(stderr, "--spec-mtp: needs OFLM_OPEN_MTP=1, OFLM_OPEN_VERIFY=1 and a 2-row verify pass\n");
+                return 2;
+            }
+            using Ms = std::chrono::duration<double, std::milli>;
+            const size_t P = a.ids.size(), nv = core.logits().size(), N = static_cast<size_t>(a.spec_mtp);
+            // the prompt by plain steps, the MTP cache row i written from (token i + 1, h_i) as it goes
+            std::vector<float> h;
+            for (size_t i = 0; i < P; ++i) {
+                core.step(a.ids[i], i + 1 == P);
+                h = core.hidden_row(false, 0);
+                if (i + 1 < P && !std::getenv("OFLM_MTP_NOWARM")) core.mtp_step(a.ids[i + 1], h.data(), static_cast<int>(i), false);
+            }
+            const int seed0 = argmax_bf16(core.logits(), nv);
+            const auto h0 = h;
+            const auto snap = core.checkpoint();
+            std::vector<int> plain{seed0};
+            auto tp = std::chrono::steady_clock::now();
+            while (plain.size() < N) {
+                core.step(plain.back(), true);
+                plain.push_back(argmax_bf16(core.logits(), nv));
+            }
+            const double plain_ms = Ms(std::chrono::steady_clock::now() - tp).count() / (N - 1);
+            core.restore(snap);
+            std::vector<int> spec{seed0};
+            int p = static_cast<int>(P), s = seed0, cycles = 0, two = 0;
+            std::vector<float> hp = h0;
+            double draft_ms = 0, verify_ms = 0, commit_ms = 0;
+            auto ts = std::chrono::steady_clock::now();
+            while (spec.size() < N) {
+                auto t1 = std::chrono::steady_clock::now();
+                const int d = core.mtp_step(s, hp.data(), p - 1, true);
+                auto t2 = std::chrono::steady_clock::now();
+                const int rows[2] = {s, d};
+                int am[2];
+                core.step_verify(rows, am, false);
+                auto t3 = std::chrono::steady_clock::now();
+                const auto h_p = core.hidden_row(true, 0), h_p1 = core.hidden_row(true, 1);
+                ++cycles;
+                if (am[0] == d) {
+                    ++two;
+                    core.verify_commit(2);
+                    spec.push_back(d);
+                    spec.push_back(am[1]);
+                    core.mtp_step(d, h_p.data(), p, false);
+                    s = am[1];
+                    hp = h_p1;
+                    p += 2;
+                } else {
+                    core.verify_commit(1);
+                    spec.push_back(am[0]);
+                    s = am[0];
+                    hp = h_p;
+                    p += 1;
+                }
+                auto t4 = std::chrono::steady_clock::now();
+                draft_ms += Ms(t2 - t1).count();
+                verify_ms += Ms(t3 - t2).count();
+                commit_ms += Ms(t4 - t3).count();
+            }
+            const double spec_ms = Ms(std::chrono::steady_clock::now() - ts).count() / (spec.size() - 1);
+            spec.resize(N);
+            std::printf("plain %.1f ms/token; MTP+verify %.1f ms/token (%.2fx), %d cycles, %d took both rows (%.1f %%)\n",
+                        plain_ms, spec_ms, plain_ms / spec_ms, cycles, two, 100.0 * two / cycles);
+            std::printf("  per cycle: draft %.1f, verify %.1f, commit + catch-up %.1f ms\n", draft_ms / cycles,
+                        verify_ms / cycles, commit_ms / cycles);
+            std::printf("%s\n", spec == plain ? "SPEC IDENTICAL" : "SPEC DIFFERS");
+            return spec == plain ? 0 : 1;
+        }
+        if (a.mtp_accept) {
+            // Every position, prompt included, runs the MTP layer once (its cache stays current); a draft made at
+            // position i guesses the token at i + 2 and is scored when that token is a generated one.
+            if (!core.mtp_ready()) { std::fprintf(stderr, "--mtp-accept: needs OFLM_OPEN_MTP=1 and a GGUF with an MTP layer\n"); return 2; }
+            const size_t P = a.ids.size(), nv = core.logits().size(), N = static_cast<size_t>(a.mtp_accept);
+            std::vector<int> seq(a.ids.begin(), a.ids.end()), draft(P + N + 2, -1);
+            size_t drafted = 0, hit = 0;
+            double mtp_ms = 0;
+            for (size_t i = 0; i < P + N; ++i) {
+                if (i >= P && draft[i] >= 0) { ++drafted; hit += draft[i] == seq[i]; }
+                core.step(seq[i], true);
+                const auto h = core.hidden_row(false, 0);
+                if (i + 1 >= seq.size()) seq.push_back(argmax_bf16(core.logits(), nv));
+                const auto tm = std::chrono::steady_clock::now();
+                draft[i + 2] = core.mtp_step(seq[i + 1], h.data(), static_cast<int>(i), i + 1 >= P);
+                mtp_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tm).count();
+            }
+            std::printf("MTP acceptance %zu of %zu (%.1f %%), MTP step %.1f ms mean\n", hit, drafted,
+                        drafted ? 100.0 * hit / drafted : 0.0, mtp_ms / (P + N));
+            std::string out;
+            for (size_t i = P; i < seq.size(); ++i) out += std::to_string(seq[i]) + " ";
+            std::printf("tokens: %s\n", out.c_str());
+            return 0;
+        }
+        if (a.verify_check) {
+            // Each cycle: plain steps from a checkpoint, then the verify pass from the same checkpoint over the same
+            // two tokens; every row's logits must be bit-identical, and the step after the commit too.
+            const size_t V = core.verify_rows();
+            if (V != 2) { std::fprintf(stderr, "--verify-check: needs OFLM_OPEN_VERIFY=1 and a 2-row verify pass\n"); return 2; }
+            const size_t P = a.ids.size(), nv = core.logits().size();
+            for (size_t i = 0; i < P; ++i) core.step(a.ids[i], i + 1 == P);
+            int t0 = argmax_bf16(core.logits(), nv);
+            int fails = 0;
+            auto cmp = [&](const char* what, const std::vector<float>& ref, const float* got) {
+                size_t nd = 0;
+                double mx = 0;
+                for (size_t i = 0; i < nv; ++i)
+                    if (std::memcmp(&ref[i], &got[i], 4)) { ++nd; mx = std::max(mx, std::fabs(double(ref[i]) - got[i])); }
+                std::printf("  %-22s %s (%zu of %zu differ, max |d| %.3g)\n", what, nd ? "DIFFER" : "identical", nd, nv, mx);
+                fails += nd != 0;
+            };
+            for (int c = 0; c < a.verify_check; ++c) {
+                const int p = core.position();
+                const size_t keep = 1 + (c % 2 == 0);       // alternate: commit both rows, then only row 0
+                const auto snap = core.checkpoint();
+                std::vector<std::vector<float>> ref(3);
+                int am[2], tok[3] = {t0, 0, 0};
+                for (int j = 0; j < 3; ++j) {
+                    core.step(tok[j], true);
+                    ref[j] = core.logits();
+                    if (j < 2) tok[j + 1] = argmax_bf16(ref[j], nv);
+                }
+                core.restore(snap);
+                core.step(tok[0], true);                        // control: a plain step again from the checkpoint
+                cmp("step again vs step", ref[0], core.logits().data());
+                core.restore(snap);
+                const int rows[2] = {tok[0], keep == 2 ? tok[1] : (tok[1] + 1) % static_cast<int>(nv)};
+                std::vector<std::vector<float>> dd, dv;
+                // OFLM_VERIFY_BISECT=1: the serial decode path adds the shared expert inside the block, so set
+                // OFLM_OPEN_SHARED_OVERLAP=0 too for a like-for-like layer table
+                const bool bisect = c == 0 && std::getenv("OFLM_VERIFY_BISECT");
+                if (bisect) {
+                    // bisect: each layer's rows, two serial plain steps and then the verify pass
+                    core.layer_dump_ = &dd;
+                    core.step(rows[0], false);
+                    core.step(rows[1], false);
+                    core.restore(snap);
+                    core.layer_dump_ = &dv;
+                }
+                core.step_verify(rows, am, true);
+                core.layer_dump_ = nullptr;
+                if (bisect) {
+                    const size_t H = dd.size() / 2, hid = dd[0].size();
+                    for (size_t l = 0; l < H && l < dv.size(); ++l) {
+                        size_t n0 = 0, n1 = 0;
+                        double m0 = 0, m1 = 0;
+                        for (size_t i = 0; i < hid; ++i) {
+                            const float a0 = dd[l][i], b0 = dv[l][i], a1 = dd[H + l][i], b1 = dv[l][hid + i];
+                            if (std::memcmp(&a0, &b0, 4)) { ++n0; m0 = std::max(m0, std::fabs(double(a0) - b0)); }
+                            if (std::memcmp(&a1, &b1, 4)) { ++n1; m1 = std::max(m1, std::fabs(double(a1) - b1)); }
+                        }
+                        std::printf("  layer %2zu: row 0 %5zu differ (max %.3g), row 1 %5zu differ (max %.3g)\n", l, n0, m0, n1, m1);
+                    }
+                }
+                std::printf("cycle %d at %d: rows %d %d, verify %.1f ms, keep %zu\n", c, p, rows[0], rows[1],
+                            core.verify_ms(), keep);
+                const auto& vt = core.last_timing();
+                std::printf("  verify: part0 %.1f, part1 %.1f, route %.1f, shared %.1f, heads %.1f ms\n", vt.part0_ms,
+                            vt.part1_ms, vt.route_ms, vt.shared_ms, vt.lmhead_ms);
+                cmp("row 0 vs step", ref[0], core.verify_logits(0));
+                if (keep == 2) cmp("row 1 vs step", ref[1], core.verify_logits(1));
+                const auto tc = std::chrono::steady_clock::now();
+                core.verify_commit(keep);
+                std::printf("  commit %.2f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count());
+                core.step(tok[keep], true);
+                cmp("step after commit", ref[keep], core.logits().data());
+                if (core.position() != p + static_cast<int>(keep) + 1) { std::printf("  position %d\n", core.position()); ++fails; }
+                t0 = argmax_bf16(core.logits(), nv);
+            }
+            std::printf("%s\n", fails ? "VERIFY CHECK FAIL" : "VERIFY CHECK PASS");
+            return fails ? 1 : 0;
         }
         if (!a.bench_kernel.empty()) {
             const size_t c1 = a.bench_kernel.find(':');

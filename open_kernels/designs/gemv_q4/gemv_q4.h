@@ -199,6 +199,7 @@ __attribute__((noinline)) inline void gemv_q4_tile(const uint8_t *__restrict til
       aie::concat(aie::broadcast<int16_t, 16>((int16_t)0x3F80),
                   aie::broadcast<int16_t, 16>((int16_t)0x3D80)).template cast_to<bfloat16>();
 
+
 #pragma clang loop unroll(disable)
   for (unsigned kb = 0; kb < kKBlocks; ++kb) {
     aie::vector<int32_t, 8> ve[2], vo[2];

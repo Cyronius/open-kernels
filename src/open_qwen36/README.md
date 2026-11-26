@@ -584,8 +584,10 @@ on a memory-starved box, not the kernels.
   `gemm_block` program: the dense families, Qwen3.5 and the 35B.
   `OFLM_OPEN_GEMM_BLOCK=0` turns it off (read through `utils::getenv_oflm`, so
   the pre-rename `FLM_OPEN_GEMM_BLOCK` still works). A kernel set without the
-  program prefills one token at a time. The route writes no M-RoPE position
-  records, so a prompt that has had an image stays on the sequential path.
+  program prefills one token at a time. An image prompt runs on the MoE
+  layer-major route too, each row at its M-RoPE position (OPEN-VISION-BLOCK);
+  the block-major route writes no M-RoPE positions and refuses a prompt after
+  an image.
 - **Long-context attention cost -- closed on the dense families and Qwen3.5,
   the 35B in progress** (2026-09-08, spec OPEN-ATTN-CONTEXT). The attention
   kernel now batches its softmax exponentials on the vector unit, splits the
@@ -593,7 +595,8 @@ on a memory-starved box, not the kernels.
   position 2048 costs about what a step at position 0 does (Qwen3-4B: 5050 ->
   258 ms). A family joins by measurement (`recipes/attnknobs.py`); the 35B's
   kernels at the default knobs are byte-identical to what shipped.
-- **Vision -- coded, not yet run end to end.** The vision tower runs on the host
+- **Vision -- runs end to end on the 35B through the CLI (`--image`) and phlegm's
+  bridge (OPEN-VISION-BLOCK, 2026-11-26).** The vision tower runs on the host
   (`vision/vit.cpp`, checked against transformers with the shipped weights to
   4e-6) and its rows enter the model as embedding vectors at their M-RoPE
   positions (`Core::step_embed`). The app's Qwen3.6 and Qwen3.5 model classes no

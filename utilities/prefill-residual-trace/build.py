@@ -22,7 +22,7 @@ def patch(cpp, cli):
     cli = once(cli, include, include + '\n#include "open_qwen36/trace.hpp"')
     # A queued next layer could overwrite global xres before the host reads it.
     # Keep the existing serial dispatch body and wait for every layer.
-    cpp = once(cpp, 'const bool pipe = submit_ahead_ > 0 && !layer_nan_ && !deepstack;',
+    cpp = once(cpp, 'const bool pipe = submit_ahead_ > 0 && !layer_nan_ && !deepstack && !layer_dump_;',
                'const bool pipe = false; // private residual trace: finish each layer before readback')
     anchor = '''            continue;
         }

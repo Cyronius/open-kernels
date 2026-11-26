@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -29,6 +31,43 @@ float bf16r(float x) { return bf16_to_f32(f32_to_bf16(x)); }
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 float softplus(float x) { return x > 0 ? x + std::log1p(std::exp(-x)) : std::log1p(std::exp(x)); }
+
+// silu over n floats in place (OPEN-DN-FUSED). AVX-512: exp(-x) by a Cephes-style range reduction and a degree-6
+// polynomial (about 1 ulp from expf), so the results move by rounding, not by model-visible amounts; elsewhere
+// the scalar silu. OFLM_OPEN_DN_UNFUSED=1 keeps the scalar one everywhere.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512f")))
+#endif
+void silu_rows_avx512(float* x, size_t n) {
+    const __m512 one = _mm512_set1_ps(1.f), log2e = _mm512_set1_ps(1.44269504088896341f);
+    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
+    const __m512 lo = _mm512_set1_ps(-87.3f), hi = _mm512_set1_ps(88.3f);
+    size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m512 v = _mm512_loadu_ps(x + j);
+        __m512 a = _mm512_min_ps(_mm512_max_ps(_mm512_sub_ps(_mm512_setzero_ps(), v), lo), hi);   // -x, clamped
+        const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(a, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        a = _mm512_sub_ps(_mm512_sub_ps(a, _mm512_mul_ps(fx, c1)), _mm512_mul_ps(fx, c2));
+        __m512 y = _mm512_set1_ps(1.9875691500e-4f);
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(1.3981999507e-3f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(8.3334519073e-3f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(4.1665795894e-2f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(1.6666665459e-1f));
+        y = _mm512_fmadd_ps(y, a, _mm512_set1_ps(5.0000001201e-1f));
+        y = _mm512_fmadd_ps(y, _mm512_mul_ps(a, a), _mm512_add_ps(a, one));
+        const __m512 e = _mm512_scalef_ps(y, fx);                                // exp(-x)
+        _mm512_storeu_ps(x + j, _mm512_div_ps(v, _mm512_add_ps(one, e)));
+    }
+    for (; j < n; ++j) x[j] = silu(x[j]);
+}
+
+void silu_rows(float* x, size_t n) {
+#if defined(__GNUC__) || defined(__clang__)
+    static const bool fast = __builtin_cpu_supports("avx512f") && !std::getenv("OFLM_OPEN_DN_UNFUSED");
+    if (fast) { silu_rows_avx512(x, n); return; }
+#endif
+    for (size_t j = 0; j < n; ++j) x[j] = silu(x[j]);
+}
 
 // bf16r over eight floats: f32_to_bf16's integer rounding, so the same bits
 inline __m256 bf16r8(const float* p) {
@@ -52,6 +91,16 @@ void rms_vec(const float* x, size_t d, const float* w, double eps, float* out) {
 void rope_angles(size_t pairs, const double* inv_freq, double pos, float* c, float* s) {
     for (size_t i = 0; i < pairs; ++i) {
         const double a = pos * inv_freq[i];
+        c[i] = static_cast<float>(std::cos(a));
+        s[i] = static_cast<float>(std::sin(a));
+    }
+}
+
+// M-RoPE: pair i turns by the position on its own axis (t, h, w); with every axis equal this is rope_angles
+void mrope_angles(size_t pairs, const double* inv_freq, const int64_t pos3[3], const int* section, bool il,
+                  float* c, float* s) {
+    for (size_t i = 0; i < pairs; ++i) {
+        const double a = static_cast<double>(pos3[mrope_axis(i, section, il)]) * inv_freq[i];
         c[i] = static_cast<float>(std::cos(a));
         s[i] = static_cast<float>(std::sin(a));
     }
@@ -150,6 +199,72 @@ void delta_token(size_t dim, float* Sh, const float* kk, const float* qq, const 
             }
         }
     }
+}
+
+// The delta rule over one head's R tokens with S read and written once a token (OPEN-DN-FUSED): token t + 1's
+// S^T k pass is folded into token t's update pass. Every element takes the same operations in the same order as
+// R calls of delta_token (tv[j] += k_i * (S_ij * dc), S_ij = S_ij * dc + k_i * delta_j, o_j += S_ij * q_i, i
+// ascending), and none of them is contracted into an FMA, so the results are bit-identical. AVX-512, 16 lanes;
+// dim a multiple of 16. post(t, o) takes token t's output row before the next token runs.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+__attribute__((target("avx512f")))
+#endif
+void delta_head_avx512(size_t dim, size_t R, float* Sh, const float* K, size_t kstride, const float* Q, size_t qstride,
+                       const float* V, size_t vstride, const float* dcs, const float* bts, size_t gstride, float* tv,
+                       float* tvn, float* delta, float* o, const std::function<void(size_t, float*)>& post) {
+    std::fill(tv, tv + dim, 0.f);
+    {
+        const __m512 dc = _mm512_set1_ps(dcs[0]);
+        for (size_t i = 0; i < dim; ++i) {
+            const float* Si = Sh + i * dim;
+            const __m512 ki = _mm512_set1_ps(K[i]);
+            for (size_t j = 0; j < dim; j += 16)
+                _mm512_storeu_ps(tv + j, _mm512_add_ps(_mm512_loadu_ps(tv + j),
+                                                       _mm512_mul_ps(ki, _mm512_mul_ps(_mm512_loadu_ps(Si + j), dc))));
+        }
+    }
+    for (size_t t = 0; t < R; ++t) {
+        const float* k = K + t * kstride;
+        const float* q = Q + t * qstride;
+        const float* v = V + t * vstride;
+        const float bt = bts[t * gstride];
+        for (size_t j = 0; j < dim; ++j) delta[j] = bt * (v[j] - tv[j]);
+        std::fill(o, o + dim, 0.f);
+        const bool next = t + 1 < R;
+        const float* kn = next ? K + (t + 1) * kstride : nullptr;
+        if (next) std::fill(tvn, tvn + dim, 0.f);
+        const __m512 dc = _mm512_set1_ps(dcs[t * gstride]);
+        const __m512 dcn = _mm512_set1_ps(next ? dcs[(t + 1) * gstride] : 0.f);
+        for (size_t i = 0; i < dim; ++i) {
+            float* Si = Sh + i * dim;
+            const __m512 ki = _mm512_set1_ps(k[i]), qi = _mm512_set1_ps(q[i]);
+            const __m512 kni = _mm512_set1_ps(next ? kn[i] : 0.f);
+            for (size_t j = 0; j < dim; j += 16) {
+                const __m512 sv = _mm512_add_ps(_mm512_mul_ps(_mm512_loadu_ps(Si + j), dc),
+                                                _mm512_mul_ps(ki, _mm512_loadu_ps(delta + j)));
+                _mm512_storeu_ps(Si + j, sv);
+                _mm512_storeu_ps(o + j, _mm512_add_ps(_mm512_loadu_ps(o + j), _mm512_mul_ps(sv, qi)));
+                if (next)
+                    _mm512_storeu_ps(tvn + j, _mm512_add_ps(_mm512_loadu_ps(tvn + j), _mm512_mul_ps(kni, _mm512_mul_ps(sv, dcn))));
+            }
+        }
+        post(t, o);
+        if (next) std::copy(tvn, tvn + dim, tv);
+    }
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#endif
+
+bool have_avx512f() {
+#if defined(__GNUC__) || defined(__clang__)
+    static const bool ok = __builtin_cpu_supports("avx512f") && !std::getenv("OFLM_OPEN_DN_UNFUSED");
+    return ok;
+#else
+    return false;
+#endif
 }
 
 }  // namespace
@@ -531,7 +646,7 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
                     for (; j < nch; ++j) c[j] += cw[j] * (g.conv_f32 ? v[j] : bf16r(v[j]));
                 }
             }
-            for (size_t j = 0; j < nch; ++j) c[j] = silu(c[j]);
+            silu_rows(c.data(), nch);
             for (size_t hh = 0; hh < g.key_heads; ++hh)
                 for (int which = 0; which < 2; ++which) {
                     const float* src = c.data() + which * key_w + hh * dim;
@@ -592,6 +707,19 @@ void deltanet_block(const DeltaGeom& g, const float* qkv, const float* z, const 
         std::vector<float> tv(dim), delta(dim), o(dim), on(dim);
         float* Sh = S + h * g.s_rows * dim;
         const size_t kh = g.key_head_tiled ? h % g.key_heads : h / (g.value_heads / g.key_heads);
+        if (have_avx512f() && dim % 16 == 0 && R > 0) {
+            std::vector<float> tvn(dim);
+            delta_head_avx512(dim, R, Sh, Kk.data() + kh * dim, key_w, Q.data() + kh * dim, key_w, V.data() + h * dim, vw,
+                              decay.data() + h, beta.data() + h, g.value_heads, tv.data(), tvn.data(), delta.data(),
+                              o.data(), [&](size_t t, float* ot) {
+                                  for (size_t j = 0; j < dim; ++j) ot[j] *= inv_sqrt;
+                                  rms_vec(ot, dim, nw, g.eps, on.data());
+                                  float* out = og + t * vw + h * dim;
+                                  const float* zz = z + t * vw + h * dim;
+                                  for (size_t j = 0; j < dim; ++j) out[j] = on[j] * silu(zz[j]);
+                              });
+            continue;
+        }
         for (size_t t = 0; t < R; ++t) {
             delta_token(dim, Sh, Kk.data() + t * key_w + kh * dim, Q.data() + t * key_w + kh * dim,
                         V.data() + t * vw + h * dim, decay[t * g.value_heads + h], beta[t * g.value_heads + h],
@@ -766,6 +894,7 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, rows = g.pos0 + g.t_real;
     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < (g.kv_pair ? 4 : 2) * kvw)
         throw std::runtime_error("open_qwen36: attention_block: inconsistent geometry");
+    if (g.mpos) throw std::runtime_error("open_qwen36: attention_block (host route) has no M-RoPE positions");
     const size_t v_off = (g.kv_pair ? 2 : 1) * kvw;
     const size_t grp = g.nh / g.kvh, R = g.t_real;
     const float scale = 1.0f / std::sqrt(static_cast<float>(g.hd));
@@ -854,6 +983,8 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
     const size_t dist = g.pair ? g.pair : half;
     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw || dist < half || dist + half > g.hd)
         throw std::runtime_error("open_qwen36: attention_prep: inconsistent geometry");
+    if (g.mpos && g.rope_il)
+        throw std::runtime_error("open_qwen36: attention_prep: M-RoPE positions with interleaved rope pairs");
     const float scale = g.scale > 0 ? static_cast<float>(g.scale) : 1.0f / std::sqrt(static_cast<float>(g.hd));
     std::fill(Q, Q + g.T * qw, 0.f);
 #pragma omp parallel
@@ -862,7 +993,8 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
 #pragma omp for
     for (long long tt = 0; tt < static_cast<long long>(R); ++tt) {
         const size_t t = static_cast<size_t>(tt), p = g.pos0 + t;
-        rope_angles(half, inv_freq, static_cast<double>(p), cs.data(), cs.data() + half);
+        if (g.mpos) mrope_angles(half, inv_freq, g.mpos + 3 * t, g.msec, g.mrope_il, cs.data(), cs.data() + half);
+        else rope_angles(half, inv_freq, static_cast<double>(p), cs.data(), cs.data() + half);
         for (size_t h = 0; h < g.nh; ++h) {
             float* dst = Q + t * qw + h * g.hd;
             const float* src = q + t * qw + h * g.hd;
@@ -1028,6 +1160,57 @@ size_t block_prefill_tokens(size_t pos, size_t n, size_t gt, size_t max_ctx, boo
     const size_t tail = n % gt;
     if (pads_cache && tail && pos + (n - tail) + gt > max_ctx) return n - tail;
     return n;
+}
+
+Q8Rows q8_rows(const float* w, size_t rows, size_t cols) {
+    if (cols % 32) throw std::runtime_error("q8_rows: cols must be a multiple of 32");
+    Q8Rows m{rows, cols, std::vector<int8_t>(rows * cols), std::vector<float>(rows * cols / 32)};
+    for (size_t b = 0; b < rows * cols / 32; ++b) {
+        float amax = 0.f;
+        for (size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(w[b * 32 + i]));
+        const float d = amax / 127.f, inv = d > 0.f ? 1.f / d : 0.f;
+        m.d[b] = d;
+        for (size_t i = 0; i < 32; ++i) m.q[b * 32 + i] = static_cast<int8_t>(std::lround(w[b * 32 + i] * inv));
+    }
+    return m;
+}
+
+void q8_gemv(const Q8Rows& m, const float* x, float* y) {
+    const long long R = static_cast<long long>(m.rows);
+    const size_t nb = m.cols / 32;
+#pragma omp parallel for schedule(static)
+    for (long long r = 0; r < R; ++r) {
+        const int8_t* q = m.q.data() + static_cast<size_t>(r) * m.cols;
+        const float* d = m.d.data() + static_cast<size_t>(r) * nb;
+        __m256 acc = _mm256_setzero_ps();
+        for (size_t b = 0; b < nb; ++b) {
+            __m256 s = _mm256_setzero_ps();
+            for (size_t k = 0; k < 32; k += 8) {
+                const __m256 w = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + b * 32 + k))));
+                s = _mm256_fmadd_ps(w, _mm256_loadu_ps(x + b * 32 + k), s);
+            }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d[b]), s, acc);
+        }
+        __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        h = _mm_hadd_ps(h, h);
+        h = _mm_hadd_ps(h, h);
+        y[r] = _mm_cvtss_f32(h);
+    }
+}
+
+void shared_expert_q8(const Q8Rows& ug, const Q8Rows& down, const float* gw, const float* xm, float* res) {
+    const size_t hid = ug.cols, ff = ug.rows / 2;
+    if (ug.rows % 2 || down.rows != hid || down.cols != ff)
+        throw std::runtime_error("shared_expert_q8: [u | g] is [2ff, hid] and down [hid, ff]");
+    std::vector<float> u(2 * ff), h(ff), y(hid);
+    q8_gemv(ug, xm, u.data());
+    for (size_t j = 0; j < ff; ++j) h[j] = u[ff + j] / (1.f + std::exp(-u[ff + j])) * u[j];
+    q8_gemv(down, h.data(), y.data());
+    double dot = 0;
+    for (size_t i = 0; i < hid; ++i) dot += static_cast<double>(xm[i]) * gw[i];
+    const float gate = 1.f / (1.f + std::exp(-static_cast<float>(dot)));
+    for (size_t i = 0; i < hid; ++i) res[i] += gate * y[i];
 }
 
 }  // namespace host

@@ -82,7 +82,7 @@ struct PackOp {
 
 /// One verb of a layer type's (or the tail's) program.
 struct Step {
-    std::string op;                          ///< run | moeroute2 | gptoss_route
+    std::string op;                          ///< run | moeroute2 | gptoss_route | shared_q8
     std::string kernel;
     /// gptoss_route (GPT-OSS): the router on the host between the attention and MoE dispatches.
     /// It reads xm (bf16 [hidden_real] at act a_xm), takes the top experts of `router` (F32
@@ -91,8 +91,12 @@ struct Step {
     /// routed fills (moeroute2's table) at the chosen experts.
     uint64_t a_xm = 0, a_w = 0, a_bsum = 0, hidden_real = 0;
     std::string router, router_bias, down_bias;
+    /// shared_q8 (OPEN-SHARED-HOST-Q8): xm bf16 at a_xm, res f32 at a_res; tensor names carry {l}
+    uint64_t a_res = 0;
+    std::string up, gate, down, gate_inp;
     std::vector<std::string> args;           ///< run: buffer names (per-layer: pool consts act state; else globals)
     uint64_t act_off = 0;                    ///< moeroute2: the router record's offset in `act`
+    std::vector<uint64_t> act_offs;          ///< moeroute2 of a verify pass: each row's router record, row order
     std::string fmt;                         ///< run, dense block route: "" = the q4_1 GEMMs, "bfp16" = gemm_bfp16
                                              ///< (x packed bfp16, y c-tiled with `n_pad` rows; OPEN-PREFILL-BFP16)
     uint64_t n_pad = 0;                      ///< fmt bfp16: the weight's rows padded to a whole number of tile groups
@@ -263,6 +267,12 @@ struct LayerType {
     GemmBlockProgram gemm_block;
     std::map<std::string, GemmBlockProgram> gemm_block_variants;   ///< OPEN-PREFILL-MODE: routes loadable in its place
     std::vector<PackOp> pool, consts;
+    /// OPEN-VERIFY-ROWS-QWEN36MOE: `rows` tokens per weight pass over `vact`, the global `vxres` and a
+    /// `state_slots`-slot linear state (row r reads slot r, writes r + 1); rows == 0 means none
+    struct Verify {
+        uint64_t rows = 0, act_bytes = 0, state_slots = 0;
+        std::vector<Step> program;
+    } verify;
 };
 
 struct KernelDesc {
@@ -281,6 +291,7 @@ struct KernelDesc {
     /// attnpos / attnrows: rows of one per-core window element (OPEN-ATTN-KVSLICE: each attention core reads its own
     /// kv heads of the window on a fill of its own); 0 = the one window fill of every other kernel.
     uint64_t kvslice = 0;
+    uint64_t rows = 1;                       ///< moeroute2: token rows the stream routes (topk placeholders each)
 };
 
 // OPEN-DECODE-ROWS: `kernel` reuses each layer's pool / consts / state / ptab; l == 0 means no rows pass.
@@ -387,6 +398,7 @@ struct Manifest {
     std::map<std::string, KernelDesc> kernels;
     std::map<std::string, LayerType> layer_types;
     std::vector<Step> tail;
+    std::vector<Step> verify_tail;           ///< OPEN-VERIFY-ROWS-QWEN36MOE: the rows' norms and one head pass (`name@r`: row r)
     RowsDesc rows;
     GptossPrefill gptoss;                             ///< OPEN-PREFILL-GPTOSS, when the set carries it
     std::map<std::string, uint64_t> globals;          ///< fixed-size global buffers (bytes)

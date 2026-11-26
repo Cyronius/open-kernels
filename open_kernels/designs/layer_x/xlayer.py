@@ -29,12 +29,14 @@ merged values describe the same transfers.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 from ml_dtypes import bfloat16
 
 from aie.iron import Buffer, ObjectFifo, TaskGroup, Worker
+from aie.iron.dataflow.objectfifo import ObjectFifoLink
 from aie.iron.controlflow import range_
 from aie.iron.device import Tile
 from aie.iron.kernel import ExternalFunction
@@ -63,6 +65,35 @@ YB = X.BAND_ROWS * 4                          # one band's y bytes
 
 
 # ---- the main cores' streams and the norm helper (every layer type)
+# OPEN-DECODE-STREAM-LX: the split q8 images (lx.py / ax.py) stream the way the merged image does (ux.py
+# OPEN-DECODE-STREAM-UX, measured 7-12 % faster there): each main core's weight fifo through a WRING-deep ring of
+# 10 KB elements in its column's memtile (channels 0 in, 1 out), and the MoE parts' down fills issued ahead of the
+# hidden's round trip. Same bytes to every core in the same order, main-core code untouched: every logit unchanged.
+# X_WRING=0 / X_WORDER=0 at export build the images as before (both in the build key, recipe probe_env).
+X_WRING = int(os.environ.get("X_WRING", "16"))
+X_WORDER = os.environ.get("X_WORDER", "1") == "1"
+X_SEQ = os.environ.get("X_SEQ", "1") == "1"   # a routed slot's up | gate halves as one transfer (moe_sequence ug_bd)
+# ax part 0 in full_sequence_seq's order: measured slower on the q8 attention front (ax0 1.81 -> 2.18 ms), so off
+X_SEQ_FULL = os.environ.get("X_SEQ_FULL", "0") == "1"
+assert 0 <= X_WRING <= 24, "a memtile ring deeper than 24 does not fit one BD pool"
+
+
+# the attention image without the ring: ax0, entered from the lx context every time, was 0.36 ms slower with it
+X_WRING_AX = int(os.environ.get("X_WRING_AX", "0"))
+
+
+def weight_ring(of_w, t, depth=None):
+    """The producers the host sequence fills: the memtile rings when the depth (X_WRING) is set, else the main
+    fifos themselves."""
+    depth = X_WRING if depth is None else depth
+    if not depth:
+        return of_w
+    of_wm = [ObjectFifo(t["elem"], name=f"wm{c}", depth=depth) for c in range(N_CORES)]
+    for c in range(N_CORES):
+        ObjectFifoLink(of_wm[c].cons(channel=0), [of_w[c].prod(channel=1)], Tile(c, 1), [], [0])
+    return of_wm
+
+
 def main_fifos(t):
     of_w = [ObjectFifo(t["elem"], name=f"w{c}", depth=2) for c in range(N_CORES)]
     of_y = [ObjectFifo(t["y"], name=f"y{c}", depth=2) for c in range(N_CORES)]

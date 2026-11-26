@@ -97,6 +97,8 @@ void bfp16_gemm_pack(const uint8_t* src, size_t rows, size_t cols, size_t row0, 
 void bfp16_dit_pack(const uint8_t* src, size_t rows, size_t cols, uint8_t* dst);
 
 uint64_t op_bytes(const PackOp& op, size_t chunk_bytes);
+/// A put / q35 const's values in the container's layout, the q35 row maps applied.
+std::vector<float> const_values(const PackOp& op, const WeightFile& m, int layer);
 /// `nch` Q4_K chunks (4736 B each) -> `nch` q4_1 chunks (5120 B each), in the SAME chunk
 /// order. Both formats hold a 32-row x 256-column tile with one (scale, min) pair per
 /// (row, 32-column group) at the SAME meta index `g*32 + r`, so nothing is re-quantized:
