@@ -184,7 +184,7 @@
         "src/open_qwen36/core.hpp": "c59c3e06bbdc2e85fe0cc15a053d0d3eef8768b18659c3a43bad92b88972a10b",
         "src/open_qwen36/manifest_test.cpp": "57cbd1156e9ca1468d788e187c0fc618351a9585c7e82f42e29743b17524f947",
         "src/open_qwen36/README.md": "46f527674827a506184dcf017d2447bd940dfa9eee472f99a258efd180661632",
-        "src/open_qwen36/vision/vit.cpp": "ce5f9619f97adf2a79c6aa420af86feaa38678596a044cb779a206542885db7d",
+        "src/open_qwen36/vision/vit.cpp": "6afa6ba30bd932cc6a37deab3229555eae6dbac20004dfc183df9bed67fb9f4c",
         "src/open_qwen36/vision/vit.hpp": "65d4649a82d601751c22197e7d910543a4b6ade5b54497b0b1d2fa456ebab142",
         "src/open_qwen36/vision/prompt.cpp": "9fe9f28401d686d5c094deae9b1c1239ac6d9adbdf3fb11ee2ed858ff2c602c5",
         "src/open_qwen36/vision/prompt.hpp": "08b056863b941d2d8a2299f9f97e159ae85d3ba42922082a9a33013cda238934"

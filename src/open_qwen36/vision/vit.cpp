@@ -551,6 +551,7 @@ void rope_tables(const VitConfig& cfg, const std::vector<int>& ph, const std::ve
 /// AVX-512 attention over one segment for one head (OPEN-VISION-GEMM): kt is K re-laid [m16 / 16][HD][16] (keys
 /// as lanes, zero past m), vp is V [m][VP] with VP = HD rounded up to 16 (zero padded). Four query rows a tile:
 /// scores as a broadcast GEMM, exp on the vector unit, P.V as a broadcast GEMM.
+template <int NV>
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx512f")))
 #endif
@@ -587,22 +588,27 @@ void attn_rows_512(const float* q, int nq, int HD, const float* kt, const float*
             const float inv = 1.0f / sum;
             for (int t = 0; t < m; ++t) sr[t] *= inv;
         }
-        // P.V: R rows x VP columns
-        const int nv = VP / 16;   // at most 8 vectors (HD <= 128)
-        __m512 acc[4][8];
+        // P.V: 4 rows x NV vectors (the padded rows of a short tile multiply zero scores into lanes never stored)
+        if (R < 4)
+            for (int r = R; r < 4; ++r) std::fill(sc + static_cast<size_t>(r) * m16, sc + static_cast<size_t>(r + 1) * m16, 0.f);
+        __m512 acc[4][NV];
         for (int r = 0; r < 4; ++r)
-            for (int j = 0; j < 8; ++j) acc[r][j] = _mm512_setzero_ps();
+            for (int j = 0; j < NV; ++j) acc[r][j] = _mm512_setzero_ps();
         for (int t = 0; t < m; ++t) {
             const float* vr = vp + static_cast<size_t>(t) * VP;
-            for (int j = 0; j < nv; ++j) {
+            const __m512 p0 = _mm512_set1_ps(sc[t]), p1 = _mm512_set1_ps(sc[m16 + t]);
+            const __m512 p2 = _mm512_set1_ps(sc[2 * m16 + t]), p3 = _mm512_set1_ps(sc[3 * m16 + t]);
+            for (int j = 0; j < NV; ++j) {
                 const __m512 vv = _mm512_loadu_ps(vr + 16 * j);
-                for (int r = 0; r < R; ++r)
-                    acc[r][j] = _mm512_fmadd_ps(_mm512_set1_ps(sc[static_cast<size_t>(r) * m16 + t]), vv, acc[r][j]);
+                acc[0][j] = _mm512_fmadd_ps(p0, vv, acc[0][j]);
+                acc[1][j] = _mm512_fmadd_ps(p1, vv, acc[1][j]);
+                acc[2][j] = _mm512_fmadd_ps(p2, vv, acc[2][j]);
+                acc[3][j] = _mm512_fmadd_ps(p3, vv, acc[3][j]);
             }
         }
         for (int r = 0; r < R; ++r) {
-            float tmp[128];
-            for (int j = 0; j < nv; ++j) _mm512_storeu_ps(tmp + 16 * j, acc[r][j]);
+            float tmp[16 * NV];
+            for (int j = 0; j < NV; ++j) _mm512_storeu_ps(tmp + 16 * j, acc[r][j]);
             std::memcpy(out + static_cast<size_t>(i0 + r) * ldo, tmp, static_cast<size_t>(HD) * sizeof(float));
         }
     }
@@ -666,7 +672,10 @@ void attention(const VitConfig& cfg, const float* qkv, int n, const std::vector<
                 for (int h = 0; h < NH; ++h)
                     for (int b = 0; b < nqb; ++b) {
                         const int q0 = b * QB5, qc = std::min(QB5, m - q0);
-                        attn_rows_512(q.data() + (static_cast<size_t>(h) * n + a + q0) * HD, qc, HD,
+                        auto* fn = VP == 80 ? &attn_rows_512<5> : VP == 64 ? &attn_rows_512<4> : VP == 128 ? &attn_rows_512<8>
+                                 : VP == 96 ? &attn_rows_512<6> : VP == 112 ? &attn_rows_512<7> : VP == 48 ? &attn_rows_512<3>
+                                 : VP == 32 ? &attn_rows_512<2> : &attn_rows_512<1>;
+                        fn(q.data() + (static_cast<size_t>(h) * n + a + q0) * HD, qc, HD,
                                       kt.data() + static_cast<size_t>(h) * m16 * HD, vp.data() + static_cast<size_t>(h) * m * VP,
                                       VP, m, scale, sc.data(), o + static_cast<size_t>(a + q0) * H + h * HD, H);
                     }

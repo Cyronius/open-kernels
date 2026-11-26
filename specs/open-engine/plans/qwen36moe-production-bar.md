@@ -622,3 +622,14 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
     `sgoel9/paul_graham_essays` @ `0c7155a5`, sha256 `ce2f77f5...`): mean 0.0275, median 0.0080, p95 0.108, same top
     93.4 %, PPL 6.301 against 6.291. The CPU-vs-Vulkan control on this text is not run yet.
   - Vision end to end (OPEN-VISION-BLOCK, SERVER-IMAGE-INPUT): see the spec.
+- 2026-11-26, Strix Halo speed context (development, NPU Default power mode by the user's choice; the box is shared:
+  another session trains on the iGPU at 93-99 % busy and the CPU load average ran 16-40). The same 4,096-token
+  block prefill took 45 s at load 30-40 and 23-24 s at load 16-28, and decode at position 1 read 150-250 ms a step
+  (serial 211 ms, submit-ahead 149-198 ms; Strix Point in performance mode: 101-110). Ratios from alternating
+  runs are the only numbers used to accept a change here (R-0006).
+  - OPEN-MOE-PIPE: 4k prefill 1.19-1.29x, logits byte-identical.
+  - OPEN-DN-FUSED: DeltaNet host 1.05-1.21 -> 0.77-0.86 ms a token at 4k; KL gate 0.0278 (0.0275 before).
+  - OMP threads 8 / 16 / 32 make no difference to 4k prefill on the busy box (40.2-45.3 s, alternating).
+  - 4k profile after both (ms a token, `dn_new2`): linear layers 4.18 (MoE waited 1.60, DeltaNet host 0.77,
+    tail 0.30, GEMM 0.22, MoE gather + scatter 0.53 now under the NPU's passes), full layers 1.42 (MoE waited 0.53,
+    GEMM 0.27, attention 0.11); whole 5.62.
