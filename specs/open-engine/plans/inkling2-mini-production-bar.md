@@ -5350,6 +5350,40 @@ host SiTU, gate/up readback or down-input pack between them.
 - Open: the verify-row cost of the fused group against two launches per group was not measured as a pair. One clean
   fused arm at 1,024 tokens: verify 2 / 4 / 8 rows took 675 / 914 / 1,355 ms.
 
+## Linux on Strix Halo (2026-11-26)
+
+Second machine: Ryzen AI MAX+ 395 (Strix Halo NPU, 8 columns), 123 GiB, Linux 7.2 (Omarchy), XRT 2.27 user space
+from `phlegm/target/npu-dev/xrt`, NPU power mode `default` (left unchanged; the machine is shared). Toolchain
+`phlegm/target/npu-dev/env.sh`: mlir-aie 1.4.2, llvm-aie `21.0.0.2026080301+c9c5ecb7` (the first machine's Peano
+commit), conda GCC 15.3. The v11 bundle exported unchanged (64 kernels). Bridge: Phlegm `benchmarks/reference/build.py`
+(the handoff's `build_bridge.py` is MSVC-only). NPU processes need unlimited memlock (`npu-run.sh`). The machine was
+shared with other agent sessions (load average 25-60) for the whole sitting, so every timing below is NOISY.
+
+Two Linux-only defects, both fixed (`d085750`):
+
+- The late-readback overlap route was compiled for Windows only. Without it verify rows took the two-launch grouped
+  experts with host SiTU, so partial accept failed 16 of 20 (the accepted rows and the following decode rows differed;
+  `--reference trial` showed rollback itself was exact). Overlap now runs on every platform
+  (`INKLING2_TEST_NO_OVERLAP=1` restores the synchronous route). Overlap and synchronous routes gave bit-equal prefill
+  logits and 256 of 256 bit-equal decode rows after 512 tokens.
+- GCC contracts the intrinsic `_mm_add_ps(sum, _mm_mul_ps(a, v))` of the 4-row Q8/F32 host dot tiles into FMA in C++
+  (MSVC does not). A 4-row verify pass then rounded differently from the 1-row tail: widths 1-3 matched decode bit for
+  bit, width 4 did not, even with four equal tokens. A standalone check gave 4 of 8 mismatching dots with default
+  flags and 0 with `-ffp-contract=off`. The Inkling sources now build with `-ffp-contract=off` under GCC (CMake and
+  Phlegm's `build.py`).
+
+| Gate (Linux, bridge from `d085750`) | Result |
+| --- | --- |
+| Partial accept, prefixes 5 and 1,021 | 20 of 20 |
+| Short greedy parity, 5-token prompt, 64 tokens (`inkling2_npu_check`) | 64 of 64 native IDs |
+| Overlap against synchronous route, 512 + 256 | prefill logits and 256 of 256 decode rows bit-equal |
+| `phlegm run`, reasoning none | correct one-sentence answer with a reasoning block |
+
+Decode after a 1,024-token prefix (profiled bridge, NOISY, load average ~30): 355 ms a token (Strix Point Windows:
+168 ms clean). Device wait is 191 ms over 193 dispatches (48 each of dense input, attention, dense output and fused
+experts, plus the head). Host stages: K/V pack 58 ms and sync 12 ms, controller 40 ms, route 9 ms. The host stages
+use OpenMP teams and are inflated by the shared CPUs; compare them only within a sitting.
+
 ## Rebuild the v11 kernel bundle
 
 From the repository root, use the IRON Python environment with Peano and the XRT packaging tools

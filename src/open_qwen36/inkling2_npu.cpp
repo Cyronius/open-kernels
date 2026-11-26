@@ -498,12 +498,38 @@ void pack_kv(const Inkling2AttentionView& view, const std::vector<uint16_t>& tab
 // The kernel returns before it reads a chunk that starts at or after the key end.
 constexpr size_t used_chunks(size_t first, size_t end) { return (end - first + key_rows - 1) / key_rows; }
 
+// FP32 relative bias [row][head in group][key] of one decode/verify chunk, with masked keys at -1e30.
+inline void pack_row_bias(const Inkling2AttentionView& view, size_t query, size_t rows, size_t at, size_t end,
+                          size_t head, float* bias) {
+    constexpr float hidden = -1.0e30f;
+    const size_t row0 = query - view.position;
+    for (size_t r = 0; r < rows; ++r) {
+        const size_t q = query + r;
+        for (size_t g = 0; g < group; ++g) {
+            const size_t h = head * group + g;
+            const float* rel = view.relative + ((row0 + r) * heads + h) * relative_dim;
+            float* out = bias + (r * group + g) * key_rows;
+            for (size_t j = 0; j < key_rows; ++j) {
+                const size_t key = at + j;
+                const bool visible = key < end && key <= q && (!view.window || key + view.window > q);
+                float value = hidden;
+                if (visible) {
+                    value = 0.0f;
+                    if (q - key < extent) {
+                        const float* t = view.table + (q - key) * relative_dim;
+                        for (size_t d = 0; d < relative_dim; ++d) value += rel[d] * t[d];
+                    }
+                }
+                out[j] = value;
+            }
+        }
+    }
+}
+
 // Decode and verify records (at most 8 rows): K transposed, V, then FP32 bias [row][head in group][key]
 // with masked keys at -1e30. The kernel needs no relative strip in this mode.
 void pack_kv_rows(const Inkling2AttentionView& view, size_t query, size_t rows, size_t first, size_t end,
                   size_t chunks, uint16_t* dst) {
-    constexpr float hidden = -1.0e30f;
-    const size_t row0 = query - view.position;
     const size_t used = used_chunks(first, end);
 #pragma omp parallel for schedule(static)
     for (long long item = 0; item < static_cast<long long>(used * kv_heads); ++item) {
@@ -563,28 +589,87 @@ void pack_kv_rows(const Inkling2AttentionView& view, size_t query, size_t rows, 
         for (size_t d = 0; d < dim; ++d)
             for (size_t j = 0; j < key_rows; ++j) keys_t[d * key_rows + j] = key_rows_src[j][d];
 #endif
-        for (size_t r = 0; r < rows; ++r) {
-            const size_t q = query + r;
-            for (size_t g = 0; g < group; ++g) {
-                const size_t h = head * group + g;
-                const float* rel = view.relative + ((row0 + r) * heads + h) * relative_dim;
-                float* out = bias + (r * group + g) * key_rows;
-                for (size_t j = 0; j < key_rows; ++j) {
-                    const size_t key = at + j;
-                    const bool visible = key < end && key <= q && (!view.window || key + view.window > q);
-                    float value = hidden;
-                    if (visible) {
-                        value = 0.0f;
-                        if (q - key < extent) {
-                            const float* t = view.table + (q - key) * relative_dim;
-                            for (size_t d = 0; d < relative_dim; ++d) value += rel[d] * t[d];
-                        }
-                    }
-                    out[j] = value;
-                }
-            }
-        }
+        pack_row_bias(view, query, rows, at, end, head, bias);
     }
+}
+
+// One decode/verify key slot: K into column j of the transposed block and V into row j. Keys at or past
+// end are zero, as pack_kv_rows writes them.
+inline void pack_kv_slot(const Inkling2AttentionView& view, size_t key, size_t end, size_t head, size_t j,
+                         uint16_t* block) {
+    auto* keys_t = block;
+    auto* values = block + matrix_words;
+    if (key >= end) {
+        std::fill_n(values + j * dim, dim, uint16_t{0});
+        for (size_t d = 0; d < dim; ++d) keys_t[d * key_rows + j] = 0;
+        return;
+    }
+    const uint16_t* k = view.pending_key;
+    const uint16_t* v = view.pending_value;
+    size_t index;
+    if (key < view.position) {
+        k = view.cached_key;
+        v = view.cached_value;
+        index = view.ring ? key % view.ring : key;
+    } else {
+        index = key - view.position;
+    }
+    index = index * kv_width + head * dim;
+    std::copy_n(v + index, dim, values + j * dim);
+    for (size_t d = 0; d < dim; ++d) keys_t[d * key_rows + j] = k[index + d];
+}
+
+// Decode and verify kept in a resident K/V buffer: committed keys are packed once, and only keys at or past
+// the committed end, the pending rows and the bias of non-static chunks are rewritten. A static chunk lies more
+// than the relative extent before every query of a full-attention visit, so its bias is 0 for every row and
+// stays 0. Returns the first chunk this call changed (used when nothing changed). Every byte the kernel reads
+// equals what pack_kv_rows writes for the same call.
+size_t pack_kv_rows_resident(const Inkling2AttentionView& view, size_t query, size_t rows, size_t first, size_t end,
+                             size_t chunks, uint16_t* dst, size_t& packed, size_t& static_chunks, size_t max_rows) {
+    const size_t used = used_chunks(first, end);
+    const size_t committed = std::min(std::max(view.position, first), end) - first;
+    const size_t start = std::min(packed, committed);
+    const auto settle = [&](size_t from) {
+        size_t fixed = from;
+        if (!view.window)
+            while (fixed < used && first + (fixed + 1) * key_rows <= std::min(end, view.position) &&
+                   first + (fixed + 1) * key_rows - 1 + extent <= query)
+                ++fixed;
+        return fixed;
+    };
+    if (!start) {
+        // A new tile: the vectorized full pack, then zero every row of the static chunks' bias.
+        pack_kv_rows(view, query, rows, first, end, chunks, dst);
+        packed = committed;
+        static_chunks = settle(0);
+        for (size_t chunk = 0; chunk < static_chunks; ++chunk)
+            for (size_t head = 0; head < kv_heads; ++head)
+                std::fill_n(reinterpret_cast<float*>(dst + (head * chunks + chunk) * key_words + 2 * matrix_words),
+                            max_rows * group * key_rows, 0.0f);
+        return 0;
+    }
+    size_t lowest = std::min(static_chunks, start / key_rows);
+    // Keys from the old committed end to the last used slot: committed keys, pending rows, then zeros.
+#pragma omp parallel for schedule(static) if ((used * key_rows - start) * kv_heads >= 4096)
+    for (long long item = 0; item < static_cast<long long>((used * key_rows - start) * kv_heads); ++item) {
+        const size_t slot = start + static_cast<size_t>(item) / kv_heads, head = static_cast<size_t>(item) % kv_heads;
+        pack_kv_slot(view, first + slot, end, head, slot % key_rows,
+                     dst + (head * chunks + slot / key_rows) * key_words);
+    }
+    packed = committed;
+    const size_t fixed = settle(static_chunks);
+    const size_t live = used - static_chunks;
+#pragma omp parallel for schedule(static) if (live * kv_heads >= 8)
+    for (long long item = 0; item < static_cast<long long>(live * kv_heads); ++item) {
+        const size_t chunk = static_chunks + static_cast<size_t>(item) / kv_heads;
+        const size_t head = static_cast<size_t>(item) % kv_heads;
+        auto* bias = reinterpret_cast<float*>(dst + (head * chunks + chunk) * key_words + 2 * matrix_words);
+        if (chunk < fixed) std::fill_n(bias, max_rows * group * key_rows, 0.0f);
+        else pack_row_bias(view, query, rows, first + chunk * key_rows, end, head, bias);
+    }
+    if (live) lowest = std::min(lowest, static_chunks);
+    static_chunks = fixed;
+    return lowest;
 }
 
 struct Tier {
@@ -1605,16 +1690,30 @@ public:
         // Single-tile decode and verify use the keys-as-lanes kernel mode.
         const bool row_mode = decode_attention_ && aligned_chunks_ && attn.shared && view.rows <= decode_rows &&
                               !(wide_old_ && wide_old_->packed_keys.has_retired());
-        const auto upload_keys = [&](size_t position, size_t first, size_t last, const Tier& tier) {
+        const auto upload_keys = [&](size_t position, size_t first, size_t last, const Tier& tier) -> xrt::bo& {
+            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);
+            if (auto* tile = row_mode ? resident_tile(view, first, tier_keys, tier) : nullptr) {
+                const size_t lowest = pack_kv_rows_resident(view, position, view.rows, first, last, tier.chunks,
+                                                            tile->bo.map<uint16_t*>(), tile->packed, tile->fixed,
+                                                            decode_rows);
+                if (lowest < used) {
+                    if (!lowest && used == tier.chunks) tile->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, kv_heads * used * bytes, 0);
+                    else for (size_t head = 0; head < kv_heads; ++head)
+                        tile->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, (used - lowest) * bytes,
+                                      (head * tier.chunks + lowest) * bytes);
+                }
+                return tile->bo;
+            }
             const auto* archive = wide_old_ && wide_old_->packed_keys.has_retired() ? &wide_old_->packed_keys : nullptr;
             if (row_mode) pack_kv_rows(view, position, view.rows, first, last, tier.chunks, attn.kv.map<uint16_t*>());
             else pack_kv(view, table, position, first, last, tier.chunks, attn.kv.map<uint16_t*>(), archive);
-            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);
             if (used == tier.chunks) attn.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE, kv_heads * used * bytes, 0);
             else for (size_t head = 0; head < kv_heads; ++head)
                 attn.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE, used * bytes, head * tier.chunks * bytes);
+            return attn.kv;
         };
-        const auto attend_tile = [&](size_t token, size_t rows, size_t first, size_t last, bool sink, const Tier& tier) {
+        const auto attend_tile = [&](size_t token, size_t rows, size_t first, size_t last, bool sink, const Tier& tier,
+                                     const xrt::bo& kv) {
             const QueryHeader header{static_cast<int32_t>(view.position + token), static_cast<int32_t>(first),
                                      static_cast<int32_t>(last), static_cast<int32_t>(view.window), sink,
                                      0, row_mode ? static_cast<int32_t>(rows) : 0, aligned_chunks_};
@@ -1632,7 +1731,7 @@ public:
                     reinterpret_cast<int32_t*>(query_record(query, head, mode.stride, mode.rows_per_column))[5] =
                         static_cast<int32_t>(head % group);
             attn.query.sync(XCL_BO_SYNC_BO_TO_DEVICE, query_size, 0);
-            const auto* partial = dispatch(mode.kernel, tier.insts, tier.count, attn.query, attn.kv, attn.result,
+            const auto* partial = dispatch(mode.kernel, tier.insts, tier.count, attn.query, kv, attn.result,
                                            kv_heads * mode.output_column, "relative attention");
             if (attn.shared) merge_attention_tile<true>(partial, token, rows, out.data(), peaks.data(), masses.data());
             else merge_attention_tile<false>(partial, token, rows, out.data(), peaks.data(), masses.data());
@@ -1644,9 +1743,9 @@ public:
         for (size_t first = wide_end; first < shared_end; first += tier_keys) {
             const size_t last = first + tier_keys;
             const auto& tier = mode.tiers.back();
-            upload_keys(view.position, first, last, tier);
+            const auto& kv = upload_keys(view.position, first, last, tier);
             for (size_t token = 0; token < view.rows; token += query_rows)
-                attend_tile(token, std::min(query_rows, view.rows - token), first, last, first == 0, tier);
+                attend_tile(token, std::min(query_rows, view.rows - token), first, last, first == 0, tier, kv);
         }
         for (size_t token = 0; token < view.rows; token += query_rows) {
             const size_t rows = std::min(query_rows, view.rows - token);
@@ -1658,8 +1757,8 @@ public:
                 const size_t chunks = (last - first + key_rows - 1) / key_rows;
                 const auto& tier = *std::lower_bound(mode.tiers.begin(), mode.tiers.end(), chunks,
                     [](const Tier& t, size_t n) { return t.chunks < n; });
-                upload_keys(position, first, last, tier);
-                attend_tile(token, rows, first, last, first == first_key, tier);
+                const auto& kv = upload_keys(position, first, last, tier);
+                attend_tile(token, rows, first, last, first == first_key, tier, kv);
                 first = last;
             }
         }
@@ -2095,6 +2194,48 @@ private:
         return out;
     }
 
+    // Resident decode/verify K/V: one buffer per visit and key tile, kept across tokens of a sequence.
+    struct ResidentTile {
+        size_t first = SIZE_MAX, chunks = 0, packed = 0, fixed = 0, bytes = 0;
+        xrt::bo bo;
+    };
+    struct ResidentVisit {
+        uint64_t sequence = UINT64_MAX;
+        std::vector<ResidentTile> tiles;
+    };
+
+    // The resident K/V buffer for this visit's key tile, or null to pack into the shared buffer. Sliding visits
+    // keep one tile whose first key moves every 32 tokens (a full repack then); full visits keep one tile per
+    // tier_keys keys, so tiles older than the relative extent are packed and synced once.
+    ResidentTile* resident_tile(const Inkling2AttentionView& view, size_t first, size_t tier_keys, const attention_layout::Tier& tier) {
+        using namespace attention_layout;
+        if (resident_kv_off_) return nullptr;
+        if (resident_kv_.size() <= view.visit) resident_kv_.resize(view.visit + 1);
+        auto& visit = resident_kv_[view.visit];
+        if (visit.sequence != view.sequence) {
+            visit.sequence = view.sequence;
+            for (auto& tile : visit.tiles) tile.first = SIZE_MAX;
+        }
+        const size_t index = view.window ? 0 : first / tier_keys;
+        if (!view.window && first % tier_keys) return nullptr;
+        if (visit.tiles.size() <= index) visit.tiles.resize(index + 1);
+        auto& tile = visit.tiles[index];
+        const size_t bytes = padded_bo(kv_heads * tier.chunks * key_words * sizeof(uint16_t));
+        if (tile.bytes < bytes) {
+            if (resident_kv_bytes_ - tile.bytes + bytes > resident_kv_budget_) return nullptr;
+            tile.bo = xrt::ext::bo(device_, bytes);
+            resident_kv_bytes_ += bytes - tile.bytes;
+            tile.bytes = bytes;
+            tile.first = SIZE_MAX;
+        }
+        if (tile.first != first || tile.chunks != tier.chunks) {
+            tile.first = first;
+            tile.chunks = tier.chunks;
+            tile.packed = tile.fixed = 0;
+        }
+        return &tile;
+    }
+
     size_t project_wide_old(const Inkling2AttentionView& view, size_t end, float* out, float* peaks, float* masses) {
         using namespace attention_layout;
         using Wide = WideOldAttention;
@@ -2211,6 +2352,14 @@ private:
     bool aligned_chunks_ = false;
     bool wide_old_enabled_ = false;
     bool wide_old_cache_exhausted_ = false;
+    std::vector<ResidentVisit> resident_kv_;
+    size_t resident_kv_bytes_ = 0;
+    // Test-only: INKLING2_TEST_NO_RESIDENT_KV repacks every call. INKLING2_RESIDENT_KV_MIB caps the memory.
+    const bool resident_kv_off_ = std::getenv("INKLING2_TEST_NO_RESIDENT_KV") != nullptr;
+    const size_t resident_kv_budget_ = [] {
+        const char* value = std::getenv("INKLING2_RESIDENT_KV_MIB");
+        return (value ? std::strtoull(value, nullptr, 10) : 8192ull) << 20;
+    }();
     bool retire_wide_keys_ = false;
 
     struct OverlapLane {

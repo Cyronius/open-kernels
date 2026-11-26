@@ -153,12 +153,13 @@ def instrument_npu(src):
         npu = insert(npu, '            Near::merge(state, out.data(), peaks.data(), masses.data(), view.rows);',
                      '            perf::add(perf::attention_near_merge, near_stage);\n'
                      '            near_stage = perf::Clock::now();')
-    npu = insert(npu, 'const auto upload_keys = [&](size_t position, size_t first, size_t last, const Tier& tier) {',
+    npu = insert(npu, 'const auto upload_keys = [&](size_t position, size_t first, size_t last, const Tier& tier) -> xrt::bo& {',
                  '            perf::Measure kv{perf::attention_kv};')
-    npu = change(npu, '            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);\n',
-                 '            const size_t used = used_chunks(first, last), bytes = key_words * sizeof(uint16_t);\n'
-                 '            perf::Measure kv_sync{perf::attention_kv_sync};\n')
-    npu = insert(npu, 'const auto attend_tile = [&](size_t token, size_t rows, size_t first, size_t last, bool sink, const Tier& tier) {',
+    for anchor in ('                if (lowest < used) {\n',
+                   '            if (used == tier.chunks) attn.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE, kv_heads * used * bytes, 0);\n'):
+        indent = anchor[:len(anchor) - len(anchor.lstrip())]
+        npu = change(npu, anchor, f'{indent}perf::Measure kv_sync{{perf::attention_kv_sync}};\n' + anchor)
+    npu = insert(npu, 'const auto attend_tile = [&](size_t token, size_t rows, size_t first, size_t last, bool sink, const Tier& tier,\n                                     const xrt::bo& kv) {',
                  '            const auto query_start = perf::Clock::now();')
     npu = insert(npu, '            attn.query.sync(XCL_BO_SYNC_BO_TO_DEVICE, query_size, 0);',
                  '            perf::add(perf::attention_query, query_start);\n'

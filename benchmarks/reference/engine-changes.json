@@ -567,6 +567,13 @@
         "src/open_qwen36/inkling2_npu.cpp": "bb49ab8168ab90ff7eab6e115264a1e3802db00626d960dac34942ff77f91427",
         "src/open_qwen36/CMakeLists.txt": "d4cc1bb5874e4454f3d4f3355eae3b54ca0795e04922d68f9c09a1ce078e1472"
       }
+    },
+    {
+      "id": "inkling2-resident-decode-kv",
+      "origin": "open-kernels: decode and verify keep one resident K/V buffer per visit and key tile; committed keys are packed once and full-attention chunks older than the relative extent keep a zero bias and are not resynced (INKLING2_TEST_NO_RESIDENT_KV, INKLING2_RESIDENT_KV_MIB)",
+      "files": {
+        "src/open_qwen36/inkling2_npu.cpp": "ec9fe0efe1bfa4f28188ef98d5d8bde2e6b9af7514c3308b3567830cf21a1f83"
+      }
     }
   ]
 }
