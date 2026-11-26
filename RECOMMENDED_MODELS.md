@@ -23,7 +23,7 @@ Update this file in the same commit as the evidence. Each model's full audit is 
 | whisper-v3:turbo | ? | ? | ? | open (decoder on host) | ? | ? | not started |
 | qwen3.6-moe:35b-a3b | ? | ? | open (32k test) | ? | open (DFlash planned) | ? | not started |
 | gpt-oss:20b | done (`attn_fa_gx` to 131k) | done, rest named (decode 82-84 ms short; 409 ms a step at 131k, compute-bound over a 170 ms stream floor) | done (needle at 130,500) | done (host stages named) | done (measured rejection: prompt lookup, DFlash) | done (ggml-org MXFP4 GGUF) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GPTOSS); bench is a development run |
-| Inkling 2 Mini | 256-token Phlegm blocks exercised; near-range block attention on the NPU | open (8K Phlegm prefill 23.9–28.4 to 40.1–41.6 tok/s in both orders; 4K decode 423 to 271 ms/token) | open (clean 131K recall in 89 min of profiled prefill, 1,048,576 target) | open | open (DSpark opt-in, lookup slower) | open (IQ4_NL candidate, 8K perplexity, local prompts and ARC samples compared) | [in development](specs/open-engine/plans/inkling2-mini-production-bar.md), outside #240 |
+| Inkling 2 Mini | done (256-token blocks; 131K recall on Linux) | open (decode at the NPU's DMA rate in power mode `default`; host stages named; Linux dev sweep 36-52 / 3.5-4.7 tok/s) | open (32K and 131K exact on Linux; 1,048,576 not run) | done (host stages named) | done (DSpark opt-in: bit-equal, -8% to +17%; lookup slower; measured reason) | done (ggml-org IQ4_NL + Q8_0; Unsloth needs NVFP4 kernels) | [in development](specs/open-engine/plans/inkling2-mini-production-bar.md), outside #240; release bench needs a Phlegm tag |
 | qwen3.5:4b (or :9b) | ? | open (prefill numbers) | open | ? | open | open | not started |
 | Ternary Bonsai 2 27B | ? | ? | open (8k of 262k) | ? | done (DFlash 2 + lookup) | open (reads PQ2_0 via q4nx-build) | not started; work not on main |
 
@@ -89,6 +89,11 @@ Audit: `spec.md` OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b" (2026-11-21).
 
 ### Inkling 2 Mini
 
+- Linux on Strix Halo (2026-11-26): the overlap route and a GCC contraction fix made verify bit-equal to decode
+  (partial accept 30 of 30, short greedy parity 64 of 64). Resident decode K/V and singleton-row verify cut the K/V
+  stage from ~30 to ~13 ms and a 4-row verify from ~1,050 to ~520 ms. `phlegm serve` passed tools, images, streamed
+  reasoning and 32K / 131K recall. Decode is at the NPU's weight-DMA rate (21 GB/s in power mode `default`).
+  [Linux section](specs/open-engine/plans/inkling2-mini-production-bar.md#linux-on-strix-halo-2026-11-26).
 - IQ4_NL and Q8_0 experts run on the NPU during block prefill and decode, alongside the Q8 logits head.
   The version-4 five-token block followed by NPU decode matched 64 llama.cpp greedy IDs on the Ryzen AI 9 HX PRO 370.
   Sharing the expert layout cut measured bridge NPU memory from 32.70 to 15.54 GiB at short context.
