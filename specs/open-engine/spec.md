@@ -1790,7 +1790,11 @@ Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.
 arithmetic compiled out and every DMA kept (`LX_NULL_GEMV=1 LX_NULL_DN=1`, timing only, 2026-11-26, two alternating
 rounds) steps in 73.1 / 73.4 ms against 74.5 / 74.3 (`lx0` 1.11 against 1.13 ms): the arithmetic is hidden, and what
 is left above the floor is the data movement -- the streams' issue order and waits, the hidden's round trips, the
-tail's two context changes -- not the cores. Before today the step
+tail's two context changes -- not the cores. The tail's switches, measured: `lm` in place (`--bench-kernel lm`) 9.62 ms against
+10.12-10.21 in the step, `ln` 0.074 against 0.18-0.20, and `lx0` after `lm` 2.73 against 1.13: about 2.2 ms a step.
+The head cannot join the layer image: every shim tile's two input channels already carry the layer image's streams
+(eight weight fifos plus x, the norm helper, the glue, post, attention and the router's second channel), and the
+main cores have 128 B of program memory left. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
