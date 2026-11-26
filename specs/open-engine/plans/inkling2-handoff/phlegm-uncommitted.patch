@@ -1,0 +1,1917 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index be13572..b528ac4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2822,6 +2822,7 @@ dependencies = [
+  "base64 0.13.1",
+  "minijinja",
+  "minijinja-contrib",
++ "png 0.17.16",
+  "serde",
+  "serde_json",
+  "sha2",
+diff --git a/benchmarks/reference/bridge.cpp b/benchmarks/reference/bridge.cpp
+index 7923bae..040053a 100644
+--- a/benchmarks/reference/bridge.cpp
++++ b/benchmarks/reference/bridge.cpp
+@@ -1,11 +1,24 @@
+ // Temporary process adapter over the externally supplied OpenFlowLM C++ Core.
+ // No copy of that engine is vendored here. See README.md for build provenance.
+ #include "open_qwen36/core.hpp"
++#if __has_include("open_qwen36/inkling2_npu.hpp")
++#include "open_qwen36/inkling2_npu.hpp"
++#define PHLEGM_INKLING2 1
++#if __has_include("open_qwen36/inkling2_dspark.hpp")
++#include "open_qwen36/inkling2_dspark.hpp"
++#define PHLEGM_INKLING2_DSPARK 1
++#endif
++#if __has_include("open_qwen36/vision/inkling2_vision_npu.hpp")
++#include "open_qwen36/vision/inkling2_vision_npu.hpp"
++#define PHLEGM_INKLING2_VISION 1
++#endif
++#endif
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdlib>
+ #include <filesystem>
++#include <fstream>
+ #include <iostream>
+ #include <memory>
+ #include <stdexcept>
+@@ -28,9 +41,7 @@ static void reply(json value) {
+     value["ok"] = true;
+     std::cout << value.dump() << '\n' << std::flush;
+ }
+-static int greedy(const Core& core) {
+-    const auto& logits = core.logits();
+-    const size_t n = core.real_vocab();
++static int greedy(const std::vector<float>& logits, size_t n) {
+     if (!n || logits.size() < n) throw std::runtime_error("incomplete logits");
+     size_t best = 0;
+     for (size_t i = 0; i < n; ++i) {
+@@ -39,6 +50,7 @@ static int greedy(const Core& core) {
+     }
+     return static_cast<int>(best);
+ }
++static int greedy(const Core& core) { return greedy(core.logits(), core.real_vocab()); }
+ static std::vector<int> prompt_ids(const json& request, const Core& core) {
+     const auto ids = request.at("prompt").get<std::vector<int>>();
+     if (ids.empty() || ids.size() > core.max_ctx()) throw std::runtime_error("prompt must fit the context capacity");
+@@ -110,9 +122,7 @@ static int prefill(Core& core, const std::vector<int>& ids, const std::string& r
+ }
+ // Logits follow their reply line as raw binary32 bytes ("logits_f32_le_bytes" of them, little
+ // endian: the bridge builds only for x86-64), not as 1.3 MB of text inside the JSON.
+-static void reply_logits(json value, const Core& core) {
+-    const auto& logits = core.logits();
+-    const size_t n = core.real_vocab();
++static void reply_logits(json value, const std::vector<float>& logits, size_t n) {
+     if (!n || logits.size() < n) throw std::runtime_error("incomplete logits");
+     for (size_t i = 0; i < n; ++i)
+         if (!std::isfinite(logits[i])) throw std::runtime_error("nonfinite logits");
+@@ -125,6 +135,267 @@ static void reply_logits(json value, const Core& core) {
+     std::cout.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(n * sizeof(float)));
+     std::cout.flush();
+ }
++static void reply_logits(json value, const Core& core) {
++    reply_logits(std::move(value), core.logits(), core.real_vocab());
++}
++
++template <typename Prefill, typename Decode>
++static void trial(const json& request, const std::vector<int>& ids, bool survey, size_t capacity,
++                  size_t vocab, Prefill prefill, Decode decode) {
++    const auto forced = survey ? request.at("decode_tokens").get<std::vector<int>>() : std::vector<int>{};
++    for (int token : forced)
++        if (token < 0 || static_cast<size_t>(token) >= vocab)
++            throw std::runtime_error("survey decode token outside the model vocabulary");
++    const size_t outputs = survey ? forced.size() + 1 : request.at("output_tokens").get<size_t>();
++    if (outputs < 2 || outputs > 4096 || ids.size() + outputs - 1 > capacity)
++        throw std::runtime_error("invalid output length or insufficient context capacity");
++    std::vector<double> latencies;
++    latencies.reserve(outputs - 1);
++    std::vector<int> greedy_tokens;
++    if (survey) greedy_tokens.reserve(outputs);
++    const auto start = Clock::now();
++    int previous = prefill();
++    const double prefill_ms = elapsed(start);
++    if (survey) greedy_tokens.push_back(previous);
++    const auto decode_start = Clock::now();
++    for (size_t step = 1; step < outputs; ++step) {
++        const auto token_start = Clock::now();
++        previous = decode(survey ? forced[step - 1] : previous);
++        latencies.push_back(elapsed(token_start));
++        if (survey) greedy_tokens.push_back(previous);
++    }
++    const double decode_ms = elapsed(decode_start);
++    json result = {{"prompt_tokens", ids.size()}, {"output_tokens", outputs}, {"decode_steps", latencies.size()},
++        {"sample", {{"prefill_ms", prefill_ms}, {"decode_ms", decode_ms}, {"decode_token_ms", latencies}}}};
++    if (survey) {
++        result["survey_protocol"] = "phlegm-engine-survey-v1";
++        result["greedy_tokens"] = greedy_tokens;
++    }
++    reply(std::move(result));
++}
++
++#ifdef PHLEGM_INKLING2
++class Inkling2Session {
++public:
++    Inkling2Session(const CoreConfig& config, const std::string& route, const json& manifest)
++        : capacity_(config.max_ctx), chunk_(block_size(route, config.prefill_mode)),
++          model_((std::filesystem::path(config.model_dir) / "model.gguf").string(), capacity_,
++                 open_qwen36::make_inkling2_npu_experts(config.kernel_dir, config.timeout_ms)) {
++#ifdef PHLEGM_INKLING2_VISION
++        const auto mmproj = std::filesystem::path(config.model_dir) / "mmproj.gguf";
++        const auto abi = manifest.value("abi", std::string{});
++        if ((abi == "inkling2-routed-v9" || abi == "inkling2-routed-v10" || abi == "inkling2-routed-v11") &&
++            std::filesystem::is_regular_file(mmproj)) {
++            mmproj_ = mmproj.string();
++            kernel_dir_ = config.kernel_dir;
++            timeout_ms_ = config.timeout_ms;
++        }
++#endif
++#ifdef PHLEGM_INKLING2_DSPARK
++        const auto draft = std::filesystem::path(config.model_dir) / "dspark.gguf";
++        if (can_verify() && std::filesystem::is_regular_file(draft)) draft_path_ = draft.string();
++#endif
++    }
++
++    void ready(const std::string& device) const {
++        json info = {{"device", device}, {"context_capacity", capacity_}, {"real_vocab", vocab},
++                     {"layers", open_qwen36::Inkling2Host::layer_count}, {"weights_file", "model.gguf"},
++                     {"prefill_chunk", chunk_}, {"prefill_route", chunk_ == 1 ? "sequential" : "layer-major"},
++                     {"prefill_device", chunk_ == 1 || model_.block_experts_available() ? "mixed" : "host"}};
++#ifdef PHLEGM_INKLING2_VISION
++        if (!mmproj_.empty()) info["image_placeholder"] = 200054;
++#endif
++        if (can_verify()) info["verify_width"] = draft_path_.empty() ? lookup_width : draft_width;
++        if (!draft_path_.empty()) info["draft"] = {{"method", "dspark"}, {"max", draft_width - 1}};
++        // Below 16 rows a block-route pass costs more than the decode tokens it can save.
++        if (can_verify() && draft_path_.empty()) info["long_verify"] = {{"max_rows", wide_width}, {"min_rows", 16}};
++        reply(std::move(info));
++    }
++
++    void request(const std::string& command, const json& req) {
++        if (command == "reset") {
++            reset(req.value("dspark", false));
++            reply({});
++#ifdef PHLEGM_INKLING2_VISION
++        } else if (command == "encode_image") {
++            encode_image(req);
++        } else if (command == "prefill_image_chunk") {
++            prefill_image(req);
++#endif
++        } else if (command == "verify_logits") {
++            if (!can_verify() || req.value("accept", 0) != 0)
++                throw std::runtime_error("unsupported Inkling 2 verify request");
++            auto tokens = req.at("tokens").get<std::vector<int>>();
++            const auto draft_count = req.value("draft", size_t{0});
++            if (tokens.empty() || tokens.size() > (capture() ? draft_width : wide_width))
++                throw std::runtime_error("invalid verify width");
++            if (draft_count) {
++#ifdef PHLEGM_INKLING2_DSPARK
++                if (!draft_ || tokens.size() != 1 || draft_->position() != model_.position())
++                    throw std::runtime_error("DSpark requires an aligned prefix and one anchor");
++                const auto proposals = draft_->propose(tokens.front(), draft_count);
++                tokens.insert(tokens.end(), proposals.begin(), proposals.end());
++#else
++                throw std::runtime_error("this bridge was built without DSpark");
++#endif
++            }
++            const auto logits = model_.verify(tokens, capture());
++            reply_logits({{"position", model_.position()}, {"rows", tokens.size()}, {"tokens", tokens}},
++                         logits, tokens.size() * vocab);
++        } else if (command == "accept") {
++            const auto accepted = req.at("n").get<size_t>();
++            model_.accept(accepted);
++            append_draft(accepted);
++            reply({{"position", model_.position()}});
++        } else if (command == "prefill_chunk") {
++            const auto ids = req.at("prompt").get<std::vector<int>>();
++            if (ids.empty() || ids.size() > chunk_) throw std::runtime_error("invalid Inkling 2 prefill chunk");
++            append(ids, false);
++            reply({{"position", model_.position()}});
++        } else if (command == "prefill" || command == "prefill_logits") {
++            respond(prefill(req.at("prompt").get<std::vector<int>>()), command == "prefill_logits");
++        } else if (command == "decode" || command == "decode_logits") {
++            respond(append({req.at("token").get<int>()}, true), command == "decode_logits");
++        } else if (command == "trial" || command == "survey_trial") {
++            const auto ids = req.at("prompt").get<std::vector<int>>();
++            reset(false);
++            trial(req, ids, command == "survey_trial", capacity_, vocab,
++                  [&] { return greedy(prefill(ids), vocab); },
++                  [&](int token) { return greedy(model_.append({token}), vocab); });
++        } else {
++            throw std::runtime_error("unsupported Inkling 2 command");
++        }
++    }
++
++private:
++    static constexpr size_t vocab = open_qwen36::Inkling2Host::vocabulary_size;
++    static constexpr size_t lookup_width = 4;
++    static constexpr size_t draft_width = open_qwen36::Inkling2Host::verify_limit;
++    static constexpr size_t wide_width = open_qwen36::Inkling2Host::wide_verify_limit;
++    static_assert(lookup_width <= draft_width);
++    size_t capacity_, chunk_;
++    open_qwen36::Inkling2Host model_;
++    std::string draft_path_;
++#ifdef PHLEGM_INKLING2_DSPARK
++    std::unique_ptr<open_qwen36::Inkling2Dspark> draft_;
++    std::vector<float> draft_features_;
++#endif
++#ifdef PHLEGM_INKLING2_VISION
++    std::string mmproj_, kernel_dir_;
++    unsigned timeout_ms_ = 0;
++    std::unique_ptr<open_qwen36::vision::Inkling2Vision> vision_;
++    std::vector<float> image_;
++    size_t image_at_ = 0;
++    static constexpr size_t image_width = open_qwen36::Inkling2Host::embedding_width;
++
++    void encode_image(const json& req) {
++        if (mmproj_.empty()) throw std::runtime_error("vision requires an Inkling 2 vision bundle and mmproj.gguf");
++        if (!image_.empty()) throw std::runtime_error("previous image prefill is incomplete");
++        const int width = req.at("width").get<int>(), height = req.at("height").get<int>();
++        if (width < 40 || width > 4096 || height < 40 || height > 4096)
++            throw std::runtime_error("image sides must be 40–4096 pixels");
++        const size_t rows = static_cast<size_t>((width + 39) / 40) * ((height + 39) / 40);
++        if (rows > capacity_ - model_.position()) throw std::runtime_error("image exceeds context capacity");
++        std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
++        if (!std::cin.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size())))
++            throw std::runtime_error("incomplete RGB input");
++        if (!vision_) {
++            auto backend = open_qwen36::vision::make_inkling2_vision_npu(kernel_dir_, timeout_ms_);
++            if (!backend) throw std::runtime_error("missing Inkling 2 vision backend");
++            vision_ = std::make_unique<open_qwen36::vision::Inkling2Vision>(mmproj_, std::move(backend));
++        }
++        image_ = vision_->encode(rgb, width, height);
++        if (image_.size() != rows * image_width) throw std::runtime_error("image encoder returned unexpected rows");
++        image_at_ = 0;
++        reply({{"image_rows", rows}});
++    }
++
++    void prefill_image(const json& req) {
++        const auto rows = req.at("rows").get<size_t>();
++        const size_t remain = (image_.size() - image_at_) / image_width;
++        if (!rows || rows > chunk_ || rows > remain) throw std::runtime_error("invalid image prefill block");
++        const bool want = req.value("want_logits", false);
++        const size_t end = image_at_ + rows * image_width;
++        std::vector<float> block(image_.begin() + image_at_, image_.begin() + end);
++        const auto logits = model_.append_embeddings(std::move(block), want, {}, capture());
++        append_draft(rows);
++        image_at_ = end;
++        if (image_at_ == image_.size()) {
++            image_.clear();
++            image_at_ = 0;
++        }
++        json ack = {{"position", model_.position()}};
++        if (want) reply_logits(std::move(ack), logits, vocab);
++        else reply(std::move(ack));
++    }
++#endif
++
++    bool can_verify() const { return chunk_ >= lookup_width && model_.block_experts_available(); }
++
++    void reset(bool prepare_draft) {
++        if (prepare_draft && draft_path_.empty()) throw std::runtime_error("DSpark requires dspark.gguf and block verify");
++#ifdef PHLEGM_INKLING2_DSPARK
++        if (!prepare_draft) draft_.reset();
++        else if (draft_) draft_->reset();
++        else draft_ = std::make_unique<open_qwen36::Inkling2Dspark>(draft_path_, model_.weights(), capacity_);
++        draft_features_.clear();
++#endif
++        model_.reset();
++#ifdef PHLEGM_INKLING2_VISION
++        image_.clear();
++        image_at_ = 0;
++#endif
++    }
++
++    std::vector<float>* capture() {
++#ifdef PHLEGM_INKLING2_DSPARK
++        if (draft_) return &draft_features_;
++#endif
++        return nullptr;
++    }
++
++    void append_draft(size_t count) {
++#ifdef PHLEGM_INKLING2_DSPARK
++        if (draft_) {
++            draft_->append(draft_features_, count);
++            draft_features_.clear();
++        }
++#else
++        (void)count;
++#endif
++    }
++
++    std::vector<float> append(const std::vector<int>& ids, bool want_logits) {
++        auto logits = model_.append(ids, want_logits, {}, capture());
++        append_draft(ids.size());
++        return logits;
++    }
++
++    static size_t block_size(const std::string& route, const std::string& mode) {
++        if (mode != "lean" && mode != "fast") throw std::runtime_error("unsupported Inkling 2 prefill mode");
++        if (route == "sequential") return 1;
++        if (route != "auto" && route != "block") throw std::runtime_error("unsupported Inkling 2 prefill route");
++        return mode == "lean" ? 64 : 256;
++    }
++
++    std::vector<float> prefill(const std::vector<int>& ids) {
++        if (ids.empty() || ids.size() > capacity_ - model_.position())
++            throw std::runtime_error("prompt must fit the context capacity");
++        std::vector<float> logits;
++        for (size_t at = 0; at < ids.size();) {
++            const size_t end = std::min(at + chunk_, ids.size());
++            logits = append(std::vector<int>(ids.begin() + at, ids.begin() + end), end == ids.size());
++            at = end;
++        }
++        return logits;
++    }
++
++    static void respond(const std::vector<float>& logits, bool want_logits) {
++        if (want_logits) reply_logits({}, logits, vocab);
++        else reply({{"token", greedy(logits, vocab)}});
++    }
++};
++#endif
+ 
+ int main() {
+     // Rust owns this process and its device lock. Exit without XRT destruction:
+@@ -132,21 +403,35 @@ int main() {
+     // The OS releases all process-owned device resources on exit.
+     std::unique_ptr<xrt::device> device;
+     std::unique_ptr<Core> core;
++#ifdef PHLEGM_INKLING2
++    std::unique_ptr<Inkling2Session> inkling2;
++    constexpr size_t inkling_request_limit = 8'000'000;
++#endif
+     std::string route;
+     Mark mark;
+ #ifdef _WIN32
++    _setmode(_fileno(stdin), _O_BINARY);    // image requests can carry RGB bytes
+     _setmode(_fileno(stdout), _O_BINARY);  // the logits are raw bytes
+ #endif
+-    reply({{"protocol", 1}, {"engine", "openflowlm-cpp-reference"}});
++#ifdef PHLEGM_INKLING2
++    constexpr int protocol = 2;
++#else
++    constexpr int protocol = 1;
++#endif
++    reply({{"protocol", protocol}, {"engine", "openflowlm-cpp-reference"}});
+     try {
+         std::string line;
+         while (std::getline(std::cin, line)) {
+-            if (line.size() > 1'000'000) throw std::runtime_error("request exceeds 1 MB");
++            size_t request_limit = 1'000'000;
++#ifdef PHLEGM_INKLING2
++            if (inkling2) request_limit = inkling_request_limit;
++#endif
++            if (line.size() > request_limit) throw std::runtime_error("request exceeds the bridge limit");
+             const json request = json::parse(line);
+             const std::string command = request.at("command").get<std::string>();
+             if (command == "quit") { reply({}); std::_Exit(0); }
+             if (command == "init") {
+-                if (core) throw std::runtime_error("engine already loaded");
++                if (device) throw std::runtime_error("engine already loaded");
+                 CoreConfig config;
+                 config.model_dir = request.at("model_dir").get<std::string>();
+                 config.kernel_dir = request.at("kernel_dir").get<std::string>();
+@@ -154,6 +439,20 @@ int main() {
+                 config.timeout_ms = request.at("dispatch_timeout_ms").get<unsigned>();
+                 config.prefill_mode = request.at("prefill_mode").get<std::string>();
+                 config.verbose = false;
++                const auto wanted = request.at("prefill_route").get<std::string>();
++#ifdef PHLEGM_INKLING2
++                std::ifstream kernel_manifest(std::filesystem::path(config.kernel_dir) / "manifest.json");
++                if (!kernel_manifest) throw std::runtime_error("missing kernel manifest.json");
++                const auto manifest = json::parse(kernel_manifest);
++                if (manifest.value("family", std::string{}) == "inkling2") {
++                    if (config.max_ctx < 2 || config.max_ctx > open_qwen36::Inkling2Host::max_context || !config.timeout_ms)
++                        throw std::runtime_error("invalid Inkling 2 context capacity or dispatch timeout");
++                    device = std::make_unique<xrt::device>(0u);
++                    inkling2 = std::make_unique<Inkling2Session>(config, wanted, manifest);
++                    inkling2->ready(device->get_info<xrt::info::device::name>());
++                    continue;
++                }
++#endif
+                 if (config.max_ctx < 2 || config.max_ctx > 131072 || !config.timeout_ms)
+                     throw std::runtime_error("invalid context capacity or dispatch timeout");
+                 if (!std::filesystem::is_regular_file(std::filesystem::path(config.kernel_dir) / "manifest.json"))
+@@ -165,7 +464,6 @@ int main() {
+                 core = std::make_unique<Core>(config, device.get());
+                 core->set_decode_route("npu");
+                 core->load_weights();
+-                const auto wanted = request.at("prefill_route").get<std::string>();
+                 if (wanted == "sequential") route = "sequential";
+                 else if (wanted == "auto") route = core->layer_major_ok() ? "layer-major" : (core->gemm_block_t() ? "gemm-block" : "sequential");
+                 else if (wanted == "block" && core->gemm_block_t()) route = "gemm-block";
+@@ -177,6 +475,9 @@ int main() {
+                     {"recurrent_layers", recurrent_layers(*core)}});
+                 continue;
+             }
++#ifdef PHLEGM_INKLING2
++            if (inkling2) { inkling2->request(command, request); continue; }
++#endif
+             if (!core) throw std::runtime_error("init is required before inference");
+             if (command == "reset") { core->reset(); mark.valid = false; reply({}); }
+             else if (command == "rewind") {
+@@ -218,40 +519,11 @@ int main() {
+                 reply_logits(json::object(), *core);
+             } else if (command == "trial" || command == "survey_trial") {
+                 const auto ids = prompt_ids(request, *core);
+-                const bool survey = command == "survey_trial";
+-                const auto forced = survey ? request.at("decode_tokens").get<std::vector<int>>() : std::vector<int>{};
+-                for (int token : forced)
+-                    if (token < 0 || static_cast<size_t>(token) >= core->real_vocab())
+-                        throw std::runtime_error("survey decode token outside the model vocabulary");
+-                const size_t outputs = survey ? forced.size() + 1 : request.at("output_tokens").get<size_t>();
+-                if (outputs < 2 || outputs > 4096 || ids.size() + outputs - 1 > core->max_ctx())
+-                    throw std::runtime_error("invalid output length or insufficient context capacity");
+-                std::vector<double> latencies;
+-                latencies.reserve(outputs - 1);
+-                std::vector<int> greedy_tokens;
+-                if (survey) greedy_tokens.reserve(outputs);
+                 core->reset();                 // excluded; a trial never reuses a prompt
+                 mark.valid = false;
+-                const auto start = Clock::now();
+-                int previous = prefill(*core, ids, route);
+-                const double prefill_ms = elapsed(start);
+-                if (survey) greedy_tokens.push_back(previous);
+-                const auto decode_start = Clock::now();
+-                for (size_t step = 1; step < outputs; ++step) {
+-                    const auto token_start = Clock::now();
+-                    core->step(survey ? forced[step - 1] : previous, true); // synchronous dispatch + logit readback
+-                    previous = greedy(*core);  // EOS never stops a benchmark
+-                    latencies.push_back(elapsed(token_start));
+-                    if (survey) greedy_tokens.push_back(previous);
+-                }
+-                const double decode_ms = elapsed(decode_start);
+-                json result = {{"prompt_tokens", ids.size()}, {"output_tokens", outputs}, {"decode_steps", latencies.size()},
+-                    {"sample", {{"prefill_ms", prefill_ms}, {"decode_ms", decode_ms}, {"decode_token_ms", latencies}}}};
+-                if (survey) {
+-                    result["survey_protocol"] = "phlegm-engine-survey-v1";
+-                    result["greedy_tokens"] = greedy_tokens;
+-                }
+-                reply(std::move(result));
++                trial(request, ids, command == "survey_trial", core->max_ctx(), core->real_vocab(),
++                      [&] { return prefill(*core, ids, route); },
++                      [&](int token) { core->step(token, true); return greedy(*core); });
+             } else throw std::runtime_error("unknown command");
+         }
+         std::_Exit(0);
+diff --git a/benchmarks/reference/build.ps1 b/benchmarks/reference/build.ps1
+index 698bfba..283022e 100644
+--- a/benchmarks/reference/build.ps1
++++ b/benchmarks/reference/build.ps1
+@@ -70,8 +70,13 @@ if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') { throw 'Cannot
+ $status = & git -c "safe.directory=$($ReferenceRoot.Replace('\', '/'))" -C $ReferenceRoot status --porcelain --untracked-files=no
+ if ($LASTEXITCODE -ne 0) { throw 'Cannot read reference engine Git status' }
+ $dirty = -not [string]::IsNullOrWhiteSpace(($status -join "`n"))
+-$sources = @('core.cpp', 'block_host.cpp', 'pools.cpp', 'manifest.cpp', 'q4nx_file.cpp', 'gguf_file.cpp') |
+-    ForEach-Object { '"' + (Join-Path $engine $_) + '"' }
++$sourceNames = @('core.cpp', 'block_host.cpp', 'pools.cpp', 'manifest.cpp', 'q4nx_file.cpp', 'gguf_file.cpp')
++if (Test-Path -LiteralPath "$engine/inkling2_npu.hpp") { $sourceNames += @('inkling2_host.cpp', 'inkling2_npu.cpp') }
++if (Test-Path -LiteralPath "$engine/inkling2_dspark.hpp") { $sourceNames += 'inkling2_dspark.cpp' }
++if (Test-Path -LiteralPath "$engine/vision/inkling2_vision_npu.hpp") {
++    $sourceNames += @('vision/inkling2_vision.cpp', 'vision/inkling2_vision_npu.cpp', 'vision/vit.cpp')
++}
++$sources = $sourceNames | ForEach-Object { '"' + (Join-Path $engine $_) + '"' }
+ $compile = @"
+ @echo off
+ set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
+@@ -89,7 +94,7 @@ try {
+ } finally { Pop-Location }
+ if ((ManifestHash (SourceFiles)) -ne $sourceHash) { throw 'Build inputs changed during compilation; rebuild required' }
+ $build = [ordered]@{
+-    protocol = 1
++    protocol = $(if (Test-Path -LiteralPath "$engine/inkling2_npu.hpp") { 2 } else { 1 })
+     engine = 'openflowlm-cpp-reference'
+     source_commit = $commit.Trim()
+     source_dirty = $dirty
+diff --git a/benchmarks/reference/build.py b/benchmarks/reference/build.py
+index 7be306e..890fd0b 100644
+--- a/benchmarks/reference/build.py
++++ b/benchmarks/reference/build.py
+@@ -130,6 +130,12 @@ def main():
+     sources = [engine / name for name in (
+         "core.cpp", "block_host.cpp", "pools.cpp", "manifest.cpp",
+         "q4nx_file.cpp", "gguf_file.cpp")]
++    if (engine / "inkling2_npu.hpp").is_file():
++        sources.extend(engine / name for name in ("inkling2_host.cpp", "inkling2_npu.cpp"))
++    if (engine / "inkling2_dspark.hpp").is_file():
++        sources.append(engine / "inkling2_dspark.cpp")
++        if (engine / "vision/inkling2_vision_npu.hpp").is_file():
++            sources.extend(engine / "vision" / name for name in ("inkling2_vision.cpp", "inkling2_vision_npu.cpp", "vit.cpp"))
+     helper = kernels / "open_kernels/harness/stream_patch.hpp"
+     for path in [adapter, *sources, helper, xrt_lib,
+                  xrt_include / "xrt/xrt_device.h",
+@@ -190,7 +196,7 @@ def main():
+     commands.append(command)
+     if inputs() != before or git_state(root) != state:
+         raise RuntimeError("Build inputs changed during compilation; rebuild required")
+-    build = dict(protocol=1, engine="openflowlm-cpp-reference",
++    build = dict(protocol=2 if (engine / "inkling2_npu.hpp").is_file() else 1, engine="openflowlm-cpp-reference",
+                  source_commit=state[0], source_dirty=state[1],
+                  engine_tree_sha256=tree, release_tag=release_tag,
+                  xrt_rpath=rpath,
+diff --git a/open-kernels b/open-kernels
+index 39a7c71..874eb89 160000
+--- a/open-kernels
++++ b/open-kernels
+@@ -1 +1 @@
+-Subproject commit 39a7c71cda83fa00678046900bf5dbf344a8aa01
++Subproject commit 874eb89860c11d4e9d236f6cf47f14b90e7be95d
+diff --git a/phlegm-core/Cargo.toml b/phlegm-core/Cargo.toml
+index 2391e87..d60bd54 100644
+--- a/phlegm-core/Cargo.toml
++++ b/phlegm-core/Cargo.toml
+@@ -10,6 +10,7 @@ npu = []
+ 
+ [dependencies]
+ base64 = "0.13.1"
++png = "0.17.16"
+ minijinja = { version = "2.24.0", features = ["json"] }
+ minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
+ serde = { version = "1", features = ["derive"] }
+diff --git a/phlegm-core/src/backend.rs b/phlegm-core/src/backend.rs
+index c7d76c2..bea59b8 100644
+--- a/phlegm-core/src/backend.rs
++++ b/phlegm-core/src/backend.rs
+@@ -25,6 +25,20 @@ pub struct TokenEvent<'a> {
+     pub logits: Option<&'a [f32]>,
+ }
+ 
++/// Raw image at a span of positions in the expanded prompt.
++pub struct PromptImage {
++    pub position: usize,
++    pub width: usize,
++    pub height: usize,
++    pub rgb: Vec<u8>,
++}
++
++impl PromptImage {
++    pub fn rows(&self) -> usize {
++        self.width.div_ceil(40) * self.height.div_ceil(40)
++    }
++}
++
+ pub trait Backend {
+     /// Generate up to `params.max_tokens` tokens from `prompt_ids`, calling
+     /// `on_token` for each one (in order) as it's produced. Stops early on a
+@@ -50,6 +64,21 @@ pub trait Backend {
+         on_token: &mut dyn FnMut(TokenEvent<'_>) -> std::ops::ControlFlow<()>,
+     ) -> Result<(), String>;
+ 
++    fn image_placeholder(&self) -> Option<u32> {
++        None
++    }
++
++    fn generate_with_images(
++        &mut self,
++        prompt_ids: &[u32],
++        images: &[PromptImage],
++        params: &mut GenParams,
++        on_token: &mut dyn FnMut(TokenEvent<'_>) -> std::ops::ControlFlow<()>,
++    ) -> Result<(), String> {
++        if !images.is_empty() { return Err("this backend does not accept images".into()); }
++        self.generate(prompt_ids, params, on_token)
++    }
++
+     /// Tokens the backend can hold (prompt plus output), when it has a fixed context. The
+     /// server bounds an open-ended request by it, as llama.cpp's server does.
+     fn context_capacity(&self) -> Option<usize> {
+diff --git a/phlegm-core/src/bench/reference.rs b/phlegm-core/src/bench/reference.rs
+index 754a355..202df95 100644
+--- a/phlegm-core/src/bench/reference.rs
++++ b/phlegm-core/src/bench/reference.rs
+@@ -325,8 +325,8 @@ impl Process {
+                         .map_err(|e| format!("invalid reference reply: {e}"))
+                         .and_then(|value| {
+                             let n = value.get("logits_f32_le_bytes").and_then(Value::as_u64).unwrap_or(0);
+-                            if n > 8_000_000 {
+-                                return Err("reference logits exceed 8 MB".to_string());
++                            if n > MAX_LOGITS_BYTES {
++                                return Err("reference logits exceed 64 MB".to_string());
+                             }
+                             let mut payload = vec![0u8; n as usize];
+                             reader
+@@ -383,9 +383,14 @@ impl Process {
+     }
+ 
+     fn request_with_payload(&mut self, value: Value) -> Result<(Value, Vec<u8>), String> {
++        self.request_with_input(value, &[])
++    }
++
++    fn request_with_input(&mut self, value: Value, data: &[u8]) -> Result<(Value, Vec<u8>), String> {
+         serde_json::to_writer(&mut self.input, &value).map_err(|e| e.to_string())?;
+         self.input
+             .write_all(b"\n")
++            .and_then(|_| self.input.write_all(data))
+             .and_then(|_| self.input.flush())
+             .map_err(|e| format!("writing reference request: {e}"))?;
+         self.receive_with_payload()
+@@ -406,6 +411,7 @@ pub struct ReferenceBackend {
+     model: ModelInfo,
+     runtime: RuntimeInfo,
+     tokenizer: tokenizers::Tokenizer,
++    tokenizer_path: PathBuf,
+     options: ReferenceOptions,
+     _lock: NpuLock,
+ }
+@@ -423,21 +429,33 @@ impl ReferenceBackend {
+         }
+         let build = build_info(&options.bridge)?;
+         crate::gguf::preflight_direct_route(&options.model_dir, &options.kernel_dir)?;
+-        let tokenizer_path = options.model_dir.join("tokenizer.json");
+-        let tokenizer =
+-            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
+         let weight_name = if options.model_dir.join("model.q4nx").is_file() {
+             "model.q4nx"
+         } else {
+             "model.gguf"
+         };
++        let weights_path = options.model_dir.join(weight_name);
++        let tokenizer_path = tokenizer_source(&options.model_dir, weight_name)?;
++        let native_tokenizer = tokenizer_path == weights_path;
++        let tokenizer = if native_tokenizer {
++            crate::tokenizer::load_gguf_encoder(&weights_path)?
++        } else {
++            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?
++        };
+         eprintln!("Hashing model, tokenizer, and kernels (outside benchmark timers)...");
++        let weights_sha256 = hash_file(&weights_path)?;
++        // The whole GGUF is the source for both weights and the embedded tokenizer.
++        let tokenizer_sha256 = if native_tokenizer {
++            weights_sha256.clone()
++        } else {
++            hash_file(&tokenizer_path)?
++        };
+         let model = ModelInfo {
+             id: options.model_id.clone(),
+             revision: options.model_revision.clone(),
+             quantization: options.quantization.clone(),
+-            weights_sha256: hash_file(&options.model_dir.join(weight_name))?,
+-            tokenizer_sha256: hash_file(&tokenizer_path)?,
++            weights_sha256,
++            tokenizer_sha256,
+         };
+         let kernels = kernel_hash(&options.kernel_dir)?;
+         let model_config_sha256 = optional_hash(&options.model_dir.join("config.json"))?;
+@@ -503,6 +521,7 @@ impl ReferenceBackend {
+             model,
+             runtime,
+             tokenizer,
++            tokenizer_path,
+             options,
+             _lock: lock,
+         })
+@@ -515,10 +534,11 @@ impl ReferenceBackend {
+             .reference
+             .as_ref()
+             .ok_or("missing reference provenance")?;
+-        if hash_file(&self.options.model_dir.join(&weights.weights_file))?
+-            != self.model.weights_sha256
+-            || hash_file(&self.options.model_dir.join("tokenizer.json"))?
+-                != self.model.tokenizer_sha256
++        let weights_path = self.options.model_dir.join(&weights.weights_file);
++        if hash_file(&weights_path)? != self.model.weights_sha256
++            || tokenizer_source(&self.options.model_dir, &weights.weights_file)? != self.tokenizer_path
++            || (self.tokenizer_path != weights_path
++                && hash_file(&self.tokenizer_path)? != self.model.tokenizer_sha256)
+             || kernel_hash(&self.options.kernel_dir)? != self.runtime.kernel_sha256
+             || optional_hash(&self.options.model_dir.join("config.json"))?
+                 != weights.model_config_sha256
+@@ -540,6 +560,15 @@ impl ReferenceBackend {
+     }
+ }
+ 
++fn tokenizer_source(dir: &Path, weights_file: &str) -> Result<PathBuf, String> {
++    let json = dir.join("tokenizer.json");
++    if weights_file == "model.gguf" && !json.try_exists().map_err(|e| e.to_string())? {
++        Ok(dir.join(weights_file))
++    } else {
++        Ok(json)
++    }
++}
++
+ fn optional_hash(path: &Path) -> Result<Option<String>, String> {
+     if path.is_file() {
+         hash_file(path).map(Some)
+@@ -750,14 +779,22 @@ mod tests {
+     }
+ }
+ 
++/// Bounds one reply's logits; a 64-row long verify pass of a 200K vocabulary is 51 MB.
++const MAX_LOGITS_BYTES: u64 = 64_000_000;
++
+ /// Resident generation backend using the same verified C++ bridge as Phlegm Bench.
+ /// Rust owns sampling and the device lock; the C++ child owns XRT resources.
+ pub struct NpuBackend {
+     verify_width: usize,
++    /// (min_rows, max_rows) of the bridge's long verify passes for lookup drafts.
++    long_verify: Option<(usize, usize)>,
+     draft_max: usize,
++    dspark: bool,
+     process: Process,
+     context_capacity: usize,
+     real_vocab: usize,
++    prefill_chunk: Option<usize>,
++    image_placeholder: Option<u32>,
+     _lock: NpuLock,
+     /// SERVER-PROMPT-REUSE: whether the model has recurrent layers (None: reuse is off, or the
+     /// bridge predates it), the tokens at the bridge's positions [0, len), its mark, and the
+@@ -853,6 +890,10 @@ impl NpuBackend {
+             .and_then(Value::as_u64)
+             .and_then(|v| usize::try_from(v).ok())
+             .ok_or("missing real vocabulary")?;
++        let prefill_chunk = hello.get("prefill_chunk").map(|value| {
++            value.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|&n| n > 0)
++                .ok_or("invalid NPU prefill chunk size")
++        }).transpose()?;
+         if context_capacity != options.context_capacity || real_vocab == 0 {
+             return Err("NPU engine loaded unexpected capacity or vocabulary".into());
+         }
+@@ -862,16 +903,34 @@ impl NpuBackend {
+             .and_then(Value::as_u64)
+             .filter(|_| reuse)
+             .map(|n| n > 0);
++        let dspark = process.protocol == 2 && hello["draft"]["method"] == "dspark";
++        let verify_limit = if dspark { 8 } else { 4 };
++        let verify_width = if process.protocol == 2 {
++            hello["verify_width"].as_u64().unwrap_or(0).min(verify_limit) as usize
++        } else { 0 };
++        let draft_max = if dspark || hello["draft"]["method"] == "mtp" {
++            hello["draft"]["max"].as_u64().unwrap_or(0).min((verify_width.saturating_sub(1)) as u64) as usize
++        } else { 0 };
++        if dspark && (draft_max == 0 || recurrent.is_some()) {
++            return Err("invalid DSpark bridge capabilities".into());
++        }
++        let long_verify = (process.protocol == 2 && !dspark && draft_max == 0 && verify_width > 0)
++            .then(|| Some((hello["long_verify"]["min_rows"].as_u64()?, hello["long_verify"]["max_rows"].as_u64()?)))
++            .flatten()
++            .map(|(min, max)| (min as usize, max.min(256) as usize))
++            .filter(|&(min, max)| min >= 2 && min <= max && max > verify_width
++                && (max * real_vocab * 4) as u64 <= MAX_LOGITS_BYTES);
+         Ok(Self {
+-            verify_width: if process.protocol == 2 {
+-                hello.get("verify_width").and_then(Value::as_u64).unwrap_or(0).min(4) as usize
+-            } else { 0 },
+-            draft_max: if hello["draft"]["method"] == "mtp" {
+-                hello["draft"]["max"].as_u64().unwrap_or(0).min(3) as usize
+-            } else { 0 },
++            verify_width,
++            long_verify,
++            draft_max,
++            dspark,
+             process,
+             context_capacity,
+             real_vocab,
++            prefill_chunk,
++            image_placeholder: hello.get("image_placeholder").and_then(Value::as_u64)
++                .and_then(|n| u32::try_from(n).ok()).filter(|&n| (n as usize) < real_vocab),
+             _lock: lock,
+             recurrent,
+             context: Vec::new(),
+@@ -907,6 +966,17 @@ impl NpuBackend {
+ }
+ 
+ impl NpuBackend {
++    fn wants_dspark(&self, params: &GenParams) -> bool {
++        self.dspark && params.speculative == crate::speculative::SpeculativeMode::Auto && params.max_tokens > 1
++    }
++
++    fn reset_for_generation(&mut self, dspark: bool) -> Result<(), String> {
++        let mut reset = json!({"command":"reset"});
++        if dspark { reset["dspark"] = json!(true); }
++        self.process.request(reset)?;
++        Ok(())
++    }
++
+     fn generate_with_drafter(
+         &mut self,
+         prompt_ids: &[u32],
+@@ -933,7 +1003,7 @@ impl NpuBackend {
+         let (start, how) = reuse_start(&context, old_mark, self.recurrent, prompt_ids);
+         let kept_mark = match how {
+             Start::Reset => {
+-                self.process.request(json!({"command":"reset"}))?;
++                self.reset_for_generation(self.wants_dspark(params))?;
+                 None
+             }
+             Start::Append => old_mark,
+@@ -942,17 +1012,30 @@ impl NpuBackend {
+                 old_mark.filter(|&m| m <= pos)
+             }
+         };
+-        let mut prefill = json!({"command":"prefill_logits", "prompt":&prompt_ids[start..]});
+         // A model with recurrent layers saves their state at the conversation's end (or the
+         // prompt's), where the next turn's prompt will part from this one.
+         let want_mark = (self.recurrent == Some(true)).then(|| {
+             params.reuse_mark.filter(|&k| k > start && k <= prompt_ids.len()).unwrap_or(prompt_ids.len())
+         });
++        let mut sent = start;
++        if let Some(chunk) = self.prefill_chunk.filter(|_| want_mark.is_none()) {
++            // Give each bridge block its own timeout and compute the head only
++            // after the last part of the prompt.
++            while prompt_ids.len() - sent > chunk {
++                let end = sent + chunk;
++                let ack = self.process.request(json!({"command":"prefill_chunk", "prompt":&prompt_ids[sent..end]}))?;
++                if ack.get("position").and_then(Value::as_u64) != Some(end as u64) {
++                    return Err("NPU engine acknowledged an unexpected prefill position".into());
++                }
++                sent = end;
++            }
++        }
++        let mut prefill = json!({"command":"prefill_logits", "prompt":&prompt_ids[sent..]});
+         if let Some(k) = want_mark {
+             prefill["mark"] = json!(k);
+         }
+         let (reply, bytes) = self.process.request_with_payload(prefill)?;
+-        let mut logits = self.logits_of(&bytes)?;
++        let logits = self.logits_of(&bytes)?;
+         self.mark = match want_mark {
+             Some(_) => Some(
+                 reply
+@@ -972,6 +1055,14 @@ impl NpuBackend {
+         if let Some(mut drafter) = drafter {
+             return self.generate_speculative(prompt_ids, params, on_token, logits, drafter.as_mut());
+         }
++        self.sample_logits(logits, prompt_ids, params, on_token, true)
++    }
++
++    fn sample_logits(
++        &mut self, mut logits: Vec<f32>, prompt_ids: &[u32], params: &mut GenParams,
++        on_token: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
++        reuse_context: bool,
++    ) -> Result<(), String> {
+         let mut history: Vec<i64> = prompt_ids.iter().map(|&id| i64::from(id)).collect();
+         for index in 0..params.max_tokens {
+             let next = params.sampler.try_sample(&logits, &history)? as u32;
+@@ -983,12 +1074,80 @@ impl NpuBackend {
+             if index + 1 < params.max_tokens {
+                 let context = std::mem::take(&mut self.context);
+                 logits = self.logits(json!({"command":"decode_logits", "token":next}))?;
+-                self.context = context;
+-                self.context.push(next);
++                if reuse_context {
++                    self.context = context;
++                    self.context.push(next);
++                }
+             }
+         }
+         Ok(())
+     }
++
++    fn prefill_with_images(
++        &mut self, prompt: &[u32], images: &[crate::backend::PromptImage], budget: usize, dspark: bool,
++    ) -> Result<Vec<f32>, String> {
++        self._lock.ensure_held()?;
++        let placeholder = self.image_placeholder.ok_or("this NPU model does not accept images")?;
++        let chunk = self.prefill_chunk.ok_or("image prefill requires a chunk size")?;
++        if prompt.is_empty() || budget == 0 || prompt.len().checked_add(budget - 1).is_none_or(|n| n > self.context_capacity)
++            || prompt.iter().any(|&id| id as usize >= self.real_vocab) {
++            return Err("prompt or output count exceeds the NPU model's context/vocabulary".into());
++        }
++        let mut previous_end = 0;
++        for image in images {
++            if !(40..=4096).contains(&image.width) || !(40..=4096).contains(&image.height)
++                || image.rgb.len() != 3 * image.width * image.height || image.position < previous_end {
++                return Err("invalid image span".into());
++            }
++            previous_end = image.position.checked_add(image.rows()).ok_or("image span overflow")?;
++            if !prompt.get(image.position..previous_end).is_some_and(|span| span.iter().all(|&id| id == placeholder)) {
++                return Err("image span does not match the prompt".into());
++            }
++        }
++        // Image bytes are absent from the token cache key. A media request starts fresh and
++        // leaves no reusable token prefix for the next request.
++        self.context.clear();
++        self.mark = None;
++        self.reused = 0;
++        self.reset_for_generation(dspark)?;
++        let mut sent = 0;
++        for image in images {
++            while sent < image.position {
++                let end = (sent + chunk).min(image.position);
++                let ack = self.process.request(json!({"command":"prefill_chunk", "prompt":&prompt[sent..end]}))?;
++                check_position(&ack, end)?;
++                sent = end;
++            }
++            let (ready, _) = self.process.request_with_input(json!({"command":"encode_image", "width":image.width,
++                 "height":image.height}), &image.rgb)?;
++            let image_rows = image.rows();
++            if ready.get("image_rows").and_then(Value::as_u64) != Some(image_rows as u64) {
++                return Err("NPU engine reported an unexpected image length".into());
++            }
++            let image_end = sent + image_rows;
++            while sent < image_end {
++                let end = (sent + chunk).min(image_end);
++                let want = end == prompt.len();
++                let (ack, bytes) = self.process.request_with_payload(json!({"command":"prefill_image_chunk",
++                     "rows": end - sent, "want_logits":want}))?;
++                check_position(&ack, end)?;
++                if want { return self.logits_of(&bytes); }
++                sent = end;
++            }
++        }
++        while prompt.len() - sent > chunk {
++            let end = sent + chunk;
++            let ack = self.process.request(json!({"command":"prefill_chunk", "prompt":&prompt[sent..end]}))?;
++            check_position(&ack, end)?;
++            sent = end;
++        }
++        self.logits(json!({"command":"prefill_logits", "prompt":&prompt[sent..]}))
++    }
++}
++
++fn check_position(ack: &Value, position: usize) -> Result<(), String> {
++    if ack.get("position").and_then(Value::as_u64) == Some(position as u64) { Ok(()) }
++    else { Err("NPU engine acknowledged an unexpected prefill position".into()) }
+ }
+ 
+ impl Backend for NpuBackend {
+@@ -1002,6 +1161,27 @@ impl Backend for NpuBackend {
+         self.generate_with_drafter(prompt_ids, params, on_token, drafter)
+     }
+ 
++    fn image_placeholder(&self) -> Option<u32> {
++        self.image_placeholder
++    }
++
++    fn generate_with_images(
++        &mut self, prompt: &[u32], images: &[crate::backend::PromptImage], params: &mut GenParams,
++        on_token: &mut dyn FnMut(crate::backend::TokenEvent<'_>) -> std::ops::ControlFlow<()>,
++    ) -> Result<(), String> {
++        if images.is_empty() { return self.generate(prompt, params, on_token); }
++        let dspark = self.wants_dspark(params);
++        let logits = self.prefill_with_images(prompt, images, params.max_tokens, dspark)?;
++        if dspark {
++            self.context = prompt.to_vec();
++            let mut drafter = crate::speculative::Bridge { max: self.draft_max };
++            let result = self.generate_speculative(prompt, params, on_token, logits, &mut drafter);
++            self.context.clear();
++            return result;
++        }
++        self.sample_logits(logits, prompt, params, on_token, false)
++    }
++
+     fn context_capacity(&self) -> Option<usize> {
+         Some(self.context_capacity)
+     }
+diff --git a/phlegm-core/src/bench/reference/speculation.rs b/phlegm-core/src/bench/reference/speculation.rs
+index 16e1541..e7053c7 100644
+--- a/phlegm-core/src/bench/reference/speculation.rs
++++ b/phlegm-core/src/bench/reference/speculation.rs
+@@ -1,7 +1,9 @@
+ //! Protocol 2 client and verified row walk. The bridge owns all tentative state.
+ use super::*;
+ use crate::backend::TokenEvent;
+-use crate::speculative::{Bridge, Draft, Drafter, Lookup, SpecPolicy, SpeculativeMode};
++use crate::speculative::{
++    Bridge, Draft, DraftPolicy, Drafter, LongLookup, LongPolicy, Lookup, SpecPolicy, SpeculativeMode,
++};
+ use std::ops::ControlFlow;
+ 
+ impl NpuBackend {
+@@ -14,7 +16,7 @@ impl NpuBackend {
+             return Ok(None);
+         }
+         match mode {
+-            SpeculativeMode::Mtp if self.draft_max == 0 => {
++            SpeculativeMode::Mtp if self.draft_max == 0 || self.dspark => {
+                 Err("mtp speculative decoding requires a bridge MTP drafter (P4 stage 4)".into())
+             }
+             SpeculativeMode::Mtp => Ok(Some(Box::new(Bridge {
+@@ -23,6 +25,7 @@ impl NpuBackend {
+             SpeculativeMode::Auto if self.draft_max > 0 => Ok(Some(Box::new(Bridge {
+                 max: self.draft_max,
+             }))),
++            _ if self.long_verify.is_some() => Ok(Some(Box::new(LongLookup))),
+             _ => Ok(Some(Box::new(Lookup::default()))),
+         }
+     }
+@@ -54,7 +57,16 @@ impl NpuBackend {
+         history.push(first);
+         sample_history.push(i64::from(first));
+         let mut emitted = 1;
+-        let mut policy = SpecPolicy::new(self.verify_width);
++        let width = if self.dspark && params.speculative == SpeculativeMode::Lookup {
++            self.verify_width.min(4)
++        } else {
++            self.verify_width
++        };
++        let mut policy: Box<dyn DraftPolicy> = match self.long_verify {
++            Some((min, max)) if self.draft_max == 0 => Box::new(LongPolicy::new(min, max)),
++            _ => Box::new(SpecPolicy::new(width)),
++        };
++        let (mut cycles, mut proposed, mut matched) = (0usize, 0usize, 0usize);
+         while emitted < params.max_tokens {
+             let remaining = params.max_tokens - emitted;
+             let room = self.context_capacity - self.context.len();
+@@ -74,6 +86,9 @@ impl NpuBackend {
+                     bridge_drafts = n.min(k);
+                 }
+             }
++            if tokens.len() - 1 < policy.min_draft() {
++                tokens.truncate(1);
++            }
+             // Take before *every* mutating command. A failed/invalid reply must
+             // never leave a reusable prefix or mark pointing at uncertain state.
+             let context = std::mem::take(&mut self.context);
+@@ -153,10 +168,16 @@ impl NpuBackend {
+                 return Err(e);
+             }
+             policy.observe(drafted, accepted);
++            cycles += 1;
++            proposed += drafted;
++            matched += accepted;
+             if done {
+                 break;
+             }
+         }
++        if std::env::var("PHLEGM_SPEC_STATS").as_deref() == Ok("1") {
++            eprintln!("phlegm: speculation cycles={cycles} drafted={proposed} accepted={matched} emitted={emitted}");
++        }
+         Ok(())
+     }
+ }
+diff --git a/phlegm-core/src/gguf.rs b/phlegm-core/src/gguf.rs
+index 2f9c4b9..684c2a0 100644
+--- a/phlegm-core/src/gguf.rs
++++ b/phlegm-core/src/gguf.rs
+@@ -90,12 +90,17 @@ pub fn read_metadata_file(path: &Path) -> Result<HashMap<String, Metadata>, Stri
+ }
+ 
+ /// A bare model directory must select exactly one GGUF, independently of its
+-/// publisher's filename. Ambiguous directories fail instead of picking a file.
++/// publisher's filename. The vision projector and DSpark weights are GGUF sidecars.
+ pub fn model_file(dir: &Path) -> Result<std::path::PathBuf, String> {
+     let mut files = Vec::new();
+     for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+         let path = entry.map_err(|e| e.to_string())?.path();
+-        if path.is_file() && path.extension().is_some_and(|s| s.eq_ignore_ascii_case("gguf")) {
++        if path.is_file()
++            && path.extension().is_some_and(|s| s.eq_ignore_ascii_case("gguf"))
++            && !path.file_name().is_some_and(|s| {
++                s.eq_ignore_ascii_case("mmproj.gguf") || s.eq_ignore_ascii_case("dspark.gguf")
++            })
++        {
+             files.push(path);
+         }
+     }
+diff --git a/phlegm-core/src/gguf_tokenizer.rs b/phlegm-core/src/gguf_tokenizer.rs
+index cd2d9ec..dd45364 100644
+--- a/phlegm-core/src/gguf_tokenizer.rs
++++ b/phlegm-core/src/gguf_tokenizer.rs
+@@ -53,8 +53,11 @@ fn id(m: &Meta, key: &str, len: usize) -> Result<Option<u32>, String> {
+ }
+ 
+ pub(super) fn load(dir: &Path) -> Result<(Tokenizer, Value), String> {
+-    let path = gguf::model_file(dir)?;
+-    from_metadata(&gguf::read_metadata_file(&path)?).map_err(|e| format!("{}: {e}", path.display()))
++    load_file(&gguf::model_file(dir)?)
++}
++
++pub(super) fn load_file(path: &Path) -> Result<(Tokenizer, Value), String> {
++    from_metadata(&gguf::read_metadata_file(path)?).map_err(|e| format!("{}: {e}", path.display()))
+ }
+ 
+ fn from_metadata(m: &Meta) -> Result<(Tokenizer, Value), String> {
+@@ -80,6 +83,11 @@ fn from_metadata(m: &Meta) -> Result<(Tokenizer, Value), String> {
+             false,
+             r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+         ),
++        ("gpt2", "inkling2") => (
++            false,
++            false,
++            r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
++        ),
+         ("gemma4", "gemma4") => (true, false, r"[^\n]+|[\n]+"),
+         _ => {
+             return Err(format!(
+@@ -474,7 +482,12 @@ mod tests {
+             bytes.extend(key.as_bytes());
+             value(&mut bytes, v);
+         }
+-        std::fs::write(dir.join("publisher-Q4_K_M.gguf"), &bytes).unwrap();
++        std::fs::write(dir.join("mmproj.gguf"), b"projector sidecar").unwrap();
++        std::fs::write(dir.join("dspark.gguf"), b"draft sidecar").unwrap();
++        let weights = dir.join("publisher-Q4_K_M.gguf");
++        std::fs::write(&weights, &bytes).unwrap();
++        let encoder = super::super::load_gguf_encoder(&weights).unwrap();
++        assert_eq!(encoder.encode("ab", false).unwrap().get_ids(), [2]);
+         assert_eq!(
+             ChatTokenizer::load(&dir).unwrap().encode("ab").unwrap(),
+             [2]
+diff --git a/phlegm-core/src/server.rs b/phlegm-core/src/server.rs
+index 218cd53..5c43b26 100644
+--- a/phlegm-core/src/server.rs
++++ b/phlegm-core/src/server.rs
+@@ -25,6 +25,8 @@
+ //! concurrent handlers and one FIFO model lease; discovery stays available during generation.
+ 
+ use crate::backend::{Backend, GenParams};
++#[path = "server_media.rs"]
++mod media;
+ use crate::placeholder_tokenizer::PlaceholderTokenizer;
+ use crate::reasoning_effort::{template_kwargs, Levels, TemplateVars, Thinking};
+ use crate::sampler::{Penalties, Ramp, Sampler};
+@@ -749,7 +751,23 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
+     if constraint.is_some() {
+         kwargs.insert("enable_thinking".into(), json!(false));
+     }
+-    let prompt = match if legacy { Ok(String::new()) } else { state.tokenizer.apply_chat_template(&messages, &kwargs) } {
++    let raw_messages = req_json.get("messages").and_then(Value::as_array).filter(|_| !legacy);
++    let multimodal = match raw_messages.filter(|raw| media::has_images(raw)).map(|raw| {
++        let placeholder = state.backend.lock().unwrap().image_placeholder()
++            .ok_or("this model does not accept images")?;
++        let (contents, images) = media::parse(raw, messages.len() - raw.len())?;
++        Ok::<_, String>((placeholder, contents, images))
++    }).transpose() {
++        Ok(media) => media,
++        Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
++    };
++    let prompt = match if legacy { Ok(String::new()) }
++        else if let Some((_, contents, _)) = &multimodal {
++            match &state.tokenizer {
++                ServerTokenizer::Real(t) => t.render_chat_with_contents(&messages, contents, true, &kwargs),
++                _ => Err("image input requires the model tokenizer".into()),
++            }
++        } else { state.tokenizer.apply_chat_template(&messages, &kwargs) } {
+         Ok(p) => p,
+         Err(e) => {
+             respond_json(
+@@ -766,6 +784,12 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
+             Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
+         }
+     } else { state.tokenizer.encode(&prompt) };
++    let (prompt_ids, images) = if let Some((placeholder, _, mut images)) = multimodal {
++        match media::expand(&prompt_ids, placeholder, &mut images) {
++            Ok(ids) => (ids, images),
++            Err(e) => { respond_json(request, 400, &json!({"error":{"message":e,"type":"invalid_request_error"}})); return; }
++        }
++    } else { (prompt_ids, Vec::new()) };
+     let max_tokens = match output_budget(
+         requested_max_tokens,
+         &state.cfg,
+@@ -818,10 +842,10 @@ fn handle_chat_body(request: Request, state: &Arc<ServerState>, legacy: bool, bo
+         max_tokens,
+         sampler,
+         stop_ids,
+-        reuse_mark: if legacy { None } else { state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids) },
++        reuse_mark: if legacy || !images.is_empty() { None } else { state.tokenizer.conversation_end(&messages, &kwargs, &prompt_ids) },
+     };
+ 
+-    generation::respond(request, state, prompt_ids, params, model, reasoning,
++    generation::respond(request, state, prompt_ids, images, params, model, reasoning,
+         tool_format.map(|f| (f, tools)), options);
+ }
+ 
+diff --git a/phlegm-core/src/server_generation.rs b/phlegm-core/src/server_generation.rs
+index 2ba8af3..338f02d 100644
+--- a/phlegm-core/src/server_generation.rs
++++ b/phlegm-core/src/server_generation.rs
+@@ -352,6 +352,7 @@ pub(super) fn respond(
+     request: Request,
+     state: &Arc<ServerState>,
+     prompt: Vec<u32>,
++    images: Vec<crate::backend::PromptImage>,
+     mut params: GenParams,
+     model: String,
+     reasoning: Option<Reasoning>,
+@@ -444,7 +445,7 @@ pub(super) fn respond(
+     };
+     let (result, cached) = {
+         let mut backend = state.backend.lock().unwrap();
+-        let result = backend.generate(&prompt, &mut params, &mut |event| {
++        let result = backend.generate_with_images(&prompt, &images, &mut params, &mut |event| {
+             ids.push(event.id);
+             let result = (|| -> Result<(), String> {
+                 if let Some(l) = logs.as_mut() {
+diff --git a/phlegm-core/src/server_generation_tests.rs b/phlegm-core/src/server_generation_tests.rs
+index 5371ce5..bb07c75 100644
+--- a/phlegm-core/src/server_generation_tests.rs
++++ b/phlegm-core/src/server_generation_tests.rs
+@@ -312,6 +312,7 @@ fn scripted_request(text: &str, req: Value, reasoning: Option<Reasoning>) -> (St
+                 request,
+                 &state,
+                 vec![1],
++                Vec::new(),
+                 GenParams {
+                     speculative: Default::default(),
+                     max_tokens: 1000,
+@@ -743,6 +744,7 @@ fn six_cpu_protocol_fixtures_stream_with_reasoning_and_validated_calls() {
+                 server.recv().unwrap(),
+                 &state,
+                 vec![1],
++                Vec::new(),
+                 GenParams {
+                     speculative: Default::default(),
+                     max_tokens: 1000,
+diff --git a/phlegm-core/src/speculative.rs b/phlegm-core/src/speculative.rs
+index cc499b8..9748c91 100644
+--- a/phlegm-core/src/speculative.rs
++++ b/phlegm-core/src/speculative.rs
+@@ -107,6 +107,39 @@ impl Lookup {
+     }
+ }
+ 
++/// Long drafts for a block-route verify pass: chained matches of 4 tokens, never padded.
++/// Shorter matches are common in prose and a rejected long pass costs several decode tokens.
++pub struct LongLookup;
++impl Drafter for LongLookup {
++    fn draft(&mut self, history: &[u32], max: usize) -> Draft {
++        let single = Lookup {
++            nmax: 4,
++            nmin: 4,
++            extend: false,
++        };
++        let mut work = history.to_vec();
++        let mut out = Vec::new();
++        while out.len() < max {
++            let (n, chunk) = single.lookup(&work, max - out.len());
++            if n == 0 || chunk.is_empty() {
++                break;
++            }
++            work.extend_from_slice(&chunk);
++            out.extend(chunk);
++        }
++        Draft::Tokens(out)
++    }
++}
++
++pub trait DraftPolicy {
++    fn max_draft(&mut self, remaining: usize, room: usize) -> usize;
++    /// Drafts shorter than this are dropped, and the cycle runs one row.
++    fn min_draft(&self) -> usize {
++        0
++    }
++    fn observe(&mut self, drafted: usize, accepted: usize);
++}
++
+ /// Bounded per-request backoff: halve the budget after a rejection; after a
+ /// completely rejected draft, run two width-one cycles before probing again.
+ pub struct SpecPolicy {
+@@ -123,7 +156,9 @@ impl SpecPolicy {
+             cooldown: 0,
+         }
+     }
+-    pub fn max_draft(&mut self, remaining: usize, room: usize) -> usize {
++}
++impl DraftPolicy for SpecPolicy {
++    fn max_draft(&mut self, remaining: usize, room: usize) -> usize {
+         if self.cooldown > 0 {
+             self.cooldown -= 1;
+             return 0;
+@@ -132,7 +167,7 @@ impl SpecPolicy {
+             .min(remaining.saturating_sub(1))
+             .min(room.saturating_sub(1))
+     }
+-    pub fn observe(&mut self, drafted: usize, accepted: usize) {
++    fn observe(&mut self, drafted: usize, accepted: usize) {
+         if drafted == 0 {
+             return;
+         }
+@@ -147,6 +182,64 @@ impl SpecPolicy {
+     }
+ }
+ 
++/// Pacing for long drafts. A pass has a large fixed cost, so it pays only when most of a long draft is
++/// accepted. After a pass that accepts less than half, plain decode runs for a cooldown that doubles each
++/// time (8 to 256 tokens), which bounds the loss on text that does not repeat.
++pub struct LongPolicy {
++    floor: usize,
++    ceiling: usize,
++    budget: usize,
++    cooldown: usize,
++    penalty: usize,
++}
++impl LongPolicy {
++    pub fn new(min_rows: usize, max_rows: usize) -> Self {
++        let ceiling = max_rows.saturating_sub(1);
++        Self {
++            floor: min_rows.saturating_sub(1).clamp(1, ceiling.max(1)),
++            ceiling,
++            budget: ceiling,
++            cooldown: 0,
++            penalty: 8,
++        }
++    }
++}
++impl DraftPolicy for LongPolicy {
++    fn max_draft(&mut self, remaining: usize, room: usize) -> usize {
++        if self.cooldown > 0 {
++            self.cooldown -= 1;
++            return 0;
++        }
++        let k = self
++            .budget
++            .min(remaining.saturating_sub(1))
++            .min(room.saturating_sub(1));
++        if k < self.floor {
++            0
++        } else {
++            k
++        }
++    }
++    fn min_draft(&self) -> usize {
++        self.floor
++    }
++    fn observe(&mut self, drafted: usize, accepted: usize) {
++        if drafted == 0 {
++            return;
++        }
++        if accepted == drafted {
++            self.budget = (self.budget * 2 + 1).min(self.ceiling);
++            self.penalty = 8;
++        } else if accepted * 2 >= drafted {
++            self.budget = (self.budget / 2).max(self.floor);
++        } else {
++            self.budget = self.floor;
++            self.cooldown = self.penalty;
++            self.penalty = (self.penalty * 2).min(256);
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -194,4 +287,33 @@ mod tests {
+         p.observe(1, 1);
+         assert_eq!(p.max_draft(20, 20), 2);
+     }
++    #[test]
++    fn long_lookup_chains_without_padding() {
++        let mut d = LongLookup;
++        let Draft::Tokens(t) = d.draft(&[7, 1, 2, 3, 4, 9, 1, 2, 3, 4], 10) else { panic!() };
++        assert_eq!(t, vec![9, 1, 2, 3, 4, 9, 1, 2, 3, 4]);
++        let Draft::Tokens(t) = d.draft(&[1, 2, 3, 5, 1, 2, 3], 10) else { panic!() };
++        assert!(t.is_empty(), "three-token matches do not start a long draft");
++    }
++    #[test]
++    fn long_policy_drops_short_drafts_and_cools_down() {
++        let mut p = LongPolicy::new(16, 64);
++        assert_eq!(p.min_draft(), 15);
++        assert_eq!(p.max_draft(100, 100), 63);
++        assert_eq!(p.max_draft(10, 100), 0);
++        p.observe(63, 40);
++        assert_eq!(p.max_draft(100, 100), 31);
++        p.observe(31, 31);
++        assert_eq!(p.max_draft(100, 100), 63);
++        p.observe(63, 3);
++        for _ in 0..8 {
++            assert_eq!(p.max_draft(100, 100), 0);
++        }
++        assert_eq!(p.max_draft(100, 100), 15);
++        p.observe(15, 0);
++        for _ in 0..16 {
++            assert_eq!(p.max_draft(100, 100), 0);
++        }
++        assert_eq!(p.max_draft(100, 100), 15);
++    }
+ }
+diff --git a/phlegm-core/src/tokenizer.rs b/phlegm-core/src/tokenizer.rs
+index bd91460..3bf4b87 100644
+--- a/phlegm-core/src/tokenizer.rs
++++ b/phlegm-core/src/tokenizer.rs
+@@ -122,12 +122,103 @@ pub fn harmony_progress(text: &str) -> (String, String) {
+     (reasoning, answer)
+ }
+ 
++fn without_partial_marker<'a>(text: &'a str, marker: &str) -> &'a str {
++    let end = (1..marker.len().min(text.len() + 1))
++        .rev()
++        .find(|&n| text.is_char_boundary(text.len() - n) && marker.starts_with(&text[text.len() - n..]))
++        .map_or(text.len(), |n| text.len() - n);
++    &text[..end]
++}
++
++fn inkling_tojson(
++    value: minijinja::Value,
++    kwargs: minijinja::value::Kwargs,
++) -> Result<minijinja::Value, minijinja::Error> {
++    use serde::Serialize;
++    use std::io::{self, Write};
++
++    // Inkling's template controls the exact separators in tool declarations
++    // and arguments. Preserve the publisher's unescaped Unicode and JSON.
++    struct Format<'a> {
++        item: &'a str,
++        key: &'a str,
++    }
++    impl serde_json::ser::Formatter for Format<'_> {
++        fn begin_array_value<W: ?Sized + Write>(&mut self, out: &mut W, first: bool) -> io::Result<()> {
++            if first { Ok(()) } else { out.write_all(self.item.as_bytes()) }
++        }
++        fn begin_object_key<W: ?Sized + Write>(&mut self, out: &mut W, first: bool) -> io::Result<()> {
++            self.begin_array_value(out, first)
++        }
++        fn begin_object_value<W: ?Sized + Write>(&mut self, out: &mut W) -> io::Result<()> {
++            out.write_all(self.key.as_bytes())
++        }
++    }
++
++    let separators: Option<Vec<String>> = kwargs.get("separators")?;
++    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
++    kwargs.assert_all_used()?;
++    let err = |message: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message);
++    let (item, key) = match separators.as_deref() {
++        None => (", ", ": "),
++        Some([item, key]) => (item.as_str(), key.as_str()),
++        _ => return Err(err("JSON separators must contain an item and a key separator".into())),
++    };
++    let mut json = serde_json::to_value(value).map_err(|e| err(e.to_string()))?;
++    if sort_keys.unwrap_or(false) {
++        json.sort_all_objects();
++    }
++    let mut out = Vec::new();
++    json.serialize(&mut serde_json::Serializer::with_formatter(&mut out, Format { item, key }))
++        .map_err(|e| err(e.to_string()))?;
++    let text = String::from_utf8(out).map_err(|e| err(e.to_string()))?;
++    Ok(minijinja::Value::from_safe_string(text))
++}
++
++fn inkling_progress(mut text: &str) -> (String, String) {
++    const MODEL: &str = "<|message_model|>";
++    const THINK: &str = "<|content_thinking|>";
++    const TEXT: &str = "<|content_text|>";
++    const END: &str = "<|end_message|>";
++    const STOP: &str = "<|content_model_end_sampling|>";
++    let mut reasoning = String::new();
++    let mut answer = String::new();
++    while !text.is_empty() {
++        let frame = text.trim_start();
++        if MODEL.starts_with(frame) || STOP.starts_with(frame) || frame.starts_with(STOP) {
++            break;
++        }
++        let body = frame.strip_prefix(MODEL).unwrap_or(frame);
++        let (out, body) = if let Some(rest) = body.strip_prefix(THINK) {
++            (&mut reasoning, rest)
++        } else if let Some(rest) = body.strip_prefix(TEXT) {
++            (&mut answer, rest)
++        } else if THINK.starts_with(body) || TEXT.starts_with(body) {
++            break;
++        } else {
++            // Keep unframed output visible. Other frame types belong to the tool parser.
++            answer.push_str(text);
++            break;
++        };
++        if let Some((value, tail)) = body.split_once(END) {
++            out.push_str(value);
++            text = tail;
++        } else {
++            out.push_str(without_partial_marker(body, END));
++            break;
++        }
++    }
++    (reasoning, answer)
++}
++
+ /// How a model's chat template marks reasoning apart from the answer, read from the model's own
+ /// files at load (`Tokenizer::load`), never from its name.
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum ReasoningFormat {
+     /// GPT-OSS's harmony channels (`harmony_progress` / `harmony_split`).
+     Harmony,
++    /// Inkling's model messages carry distinct thinking and text tags.
++    Inkling,
+     /// A reasoning block between two markers ahead of the answer: Gemma 4's
+     /// `<|channel>thought\n ... <channel|>` (its tokenizer_config `response_template`), Qwen3.5's
+     /// `<think> ... </think>` (its chat template).
+@@ -147,7 +238,7 @@ impl Reasoning {
+     pub fn for_prompt(format: ReasoningFormat, prompt: &str) -> Reasoning {
+         let opened_by_prompt = match &format {
+             ReasoningFormat::Tagged { open, .. } => prompt.trim_end().ends_with(open.trim_end()),
+-            ReasoningFormat::Harmony => false,
++            ReasoningFormat::Harmony | ReasoningFormat::Inkling => false,
+         };
+         Reasoning { format, opened_by_prompt }
+     }
+@@ -178,18 +269,9 @@ impl Reasoning {
+     fn derive(&self, text: &str, partial: bool) -> (String, String) {
+         let (open, close) = match &self.format {
+             ReasoningFormat::Harmony => return harmony_progress(text),
++            ReasoningFormat::Inkling => return inkling_progress(text),
+             ReasoningFormat::Tagged { open, close } => (open.trim_end(), close.as_str()),
+         };
+-        // Drop a trailing piece of text that may be the start of `marker`.
+-        let hold = |t: &'_ str, marker: &str| -> usize {
+-            if !partial {
+-                return t.len();
+-            }
+-            (1..marker.len().min(t.len() + 1))
+-                .rev()
+-                .find(|&n| t.is_char_boundary(t.len() - n) && marker.starts_with(&t[t.len() - n..]))
+-                .map_or(t.len(), |n| t.len() - n)
+-        };
+         let lead = text.trim_start();
+         let inside = if self.opened_by_prompt {
+             text
+@@ -205,7 +287,10 @@ impl Reasoning {
+                 inside[..i].trim_start().to_owned(),
+                 inside[i + close.len()..].trim_start().to_owned(),
+             ),
+-            None => (inside[..hold(inside, close)].trim_start().to_owned(), String::new()),
++            None => {
++                let inside = if partial { without_partial_marker(inside, close) } else { inside };
++                (inside.trim_start().to_owned(), String::new())
++            }
+         }
+     }
+ }
+@@ -432,6 +517,34 @@ pub(crate) mod tests {
+         assert_eq!(harmony.split("<|channel|>analysis<|message|>cut short"), ("cut short".into(), String::new()));
+     }
+ 
++    #[test]
++    fn inkling_tool_json_preserves_the_publishers_compact_format() {
++        let mut env = Environment::new();
++        env.add_filter("tojson", inkling_tojson);
++        let value = env
++            .render_str(
++                r#"{{ tools | tojson(sort_keys=true, separators=(",", ":")) }}"#,
++                minijinja::context! { tools => json!([{"z":[2,3],"a":"☑<>&"}]) },
++            )
++            .unwrap();
++        assert_eq!(value, r#"[{"a":"☑<>&","z":[2,3]}]"#);
++    }
++
++    #[test]
++    fn inkling_messages_stream_reasoning_and_content_separately() {
++        let r = Reasoning::for_prompt(ReasoningFormat::Inkling, "user prompt");
++        let text = "<|message_model|><|content_thinking|>Plan ☑.<|end_message|><|message_model|><|content_text|>OK.<|end_message|>";
++        let mut previous = (String::new(), String::new());
++        for at in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
++            let next = r.progress(&text[..at]);
++            assert!(next.0.starts_with(&previous.0) && next.1.starts_with(&previous.1));
++            previous = next;
++        }
++        assert_eq!(previous, ("Plan ☑.".into(), "OK.".into()));
++        assert_eq!(r.split("<|message_model|><|content_text|>OK.<|end_message|>"), (String::new(), "OK.".into()));
++        assert_eq!(r.split("<|message_model|><|content_thinking|>Cut short"), ("Cut short".into(), String::new()));
++    }
++
+     #[test]
+     fn strftime_utc_matches_known_dates() {
+         assert_eq!(strftime_utc("%Y-%m-%d", 0), "1970-01-01");
+@@ -505,6 +618,11 @@ pub struct Tokenizer {
+     eos_ids: std::collections::HashSet<u32>,
+ }
+ 
++/// Load the tokenizer for an exact GGUF weight file without a chat template.
++pub(crate) fn load_gguf_encoder(file: &Path) -> Result<HfTokenizer, String> {
++    gguf_tokenizer::load_file(file).map(|(encoder, _)| encoder)
++}
++
+ impl Tokenizer {
+     /// Load tokenizer files and the model chat template from a model directory.
+     pub fn load(model_dir: &Path) -> Result<Tokenizer, String> {
+@@ -562,7 +680,11 @@ impl Tokenizer {
+                 .and_then(Value::as_str)
+                 .ok_or("model needs chat_template.jinja or tokenizer_config.json chat_template")?
+                 .to_owned(),
+-        };
++        }
++        // Transformers marks assistant spans for training. Preserve the whitespace
++        // controls while treating these markers as comments during inference.
++        .replace("{%- generation -%}", "{#- generation -#}")
++        .replace("{%- endgeneration -%}", "{#- endgeneration -#}");
+         let mut env = Environment::new();
+         if let Some(token) = &bos_token {
+             env.add_global("bos_token", token.clone());
+@@ -619,6 +741,9 @@ impl Tokenizer {
+         let thinking = config.pointer("/response_template/fields/thinking");
+         let reasoning = if template_src.contains("<|channel|>") {
+             Some(ReasoningFormat::Harmony)
++        } else if template_src.contains("<|content_thinking|>") && template_src.contains("<|content_text|>")
++            && template_src.contains("<|message_model|>") && template_src.contains("<|end_message|>") {
++            Some(ReasoningFormat::Inkling)
+         } else if let (Some(open), Some(close)) = (
+             thinking.and_then(|t| t.get("open")).and_then(Value::as_str),
+             thinking.and_then(|t| t.get("close")).and_then(Value::as_str),
+@@ -630,6 +755,9 @@ impl Tokenizer {
+             None
+         };
+         let tool_format = crate::tool_calls::Format::of(&template_src);
++        if tool_format == Some(crate::tool_calls::Format::Inkling) {
++            env.add_filter("tojson", inkling_tojson);
++        }
+         let template_vars = TemplateVars::of(&template_src);
+         env.add_template_owned("chat", template_src)
+             .map_err(|e| format!("compiling chat_template.jinja: {e}"))?;
+@@ -755,6 +883,7 @@ impl Tokenizer {
+     pub fn think_end_id(&self) -> Option<u32> {
+         match &self.reasoning {
+             Some(ReasoningFormat::Tagged { close, .. }) => self.tk.token_to_id(close),
++            Some(ReasoningFormat::Inkling) => self.tk.token_to_id("<|end_message|>"),
+             _ => None,
+         }
+     }
+@@ -813,11 +942,24 @@ impl Tokenizer {
+         messages: &[ChatMessage],
+         add_generation_prompt: bool,
+         kwargs: &Map<String, Value>,
++    ) -> Result<String, String> {
++        self.render_chat_with_contents(messages, &[], add_generation_prompt, kwargs)
++    }
++
++    pub(crate) fn render_chat_with_contents(
++        &self,
++        messages: &[ChatMessage],
++        contents: &[Option<Value>],
++        add_generation_prompt: bool,
++        kwargs: &Map<String, Value>,
+     ) -> Result<String, String> {
+         let tmpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
+         let mut msgs = Vec::new();
+-        for m in messages {
++        for (index, m) in messages.iter().enumerate() {
+             let mut msg = serde_json::to_value(m).map_err(|e| e.to_string())?;
++            if let Some(Some(content)) = contents.get(index) {
++                msg["content"] = content.clone();
++            }
+             if msg
+                 .get("tool_calls")
+                 .is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+diff --git a/phlegm-core/src/tool_calls.rs b/phlegm-core/src/tool_calls.rs
+index 5e707b1..7222edf 100644
+--- a/phlegm-core/src/tool_calls.rs
++++ b/phlegm-core/src/tool_calls.rs
+@@ -9,11 +9,21 @@ pub enum Format {
+     Hy,
+     Lfm,
+     Harmony,
++    Inkling,
+ }
++const INKLING_MODEL: &str = "<|message_model|>";
++const INKLING_THINK: &str = "<|content_thinking|>";
++const INKLING_TEXT: &str = "<|content_text|>";
++const INKLING_INVOKE: &str = "<|content_invoke_tool_json|>";
++const INKLING_END: &str = "<|end_message|>";
++const INKLING_STOP: &str = "<|content_model_end_sampling|>";
++
+ impl Format {
+     pub fn of(template: &str) -> Option<Self> {
+         if template.contains("<|channel|>") {
+             Some(Self::Harmony)
++        } else if template.contains(INKLING_MODEL) && template.contains(INKLING_INVOKE) {
++            Some(Self::Inkling)
+         } else if template.contains("<|tool_call_start|>") {
+             Some(Self::Lfm)
+         } else if template.contains("<|tool_call>") {
+@@ -31,6 +41,9 @@ impl Format {
+     /// Text safe to stream before the first possible call. After a complete
+     /// marker, buffer through final validation so malformed calls remain text.
+     pub fn stream_prefix(self, text: &str) -> &str {
++        if self == Self::Inkling {
++            return &text[..inkling_tool_offset(text).unwrap_or(text.len())];
++        }
+         if self == Self::Harmony {
+             // Headers can put the recipient before or after the channel. Hold
+             // an unfinished header until its message delimiter resolves it.
+@@ -56,7 +69,7 @@ impl Format {
+             Self::Hy => &["<tool_calls>", "<｜tool▁calls▁begin｜>"],
+             // The installed LFM model also emits bare function lists.
+             Self::Lfm => &["<|tool_call_start|>", "["],
+-            Self::Harmony => unreachable!(),
++            Self::Harmony | Self::Inkling => unreachable!(),
+         };
+         if let Some(at) = markers.iter().filter_map(|m| text.find(m)).min() {
+             return &text[..at];
+@@ -75,6 +88,7 @@ impl Format {
+     pub fn parse(self, text: &str) -> Parsed {
+         let parsed = match self {
+             Self::Harmony => harmony(text),
++            Self::Inkling => inkling(text),
+             Self::Lfm if !text.contains("<|tool_call_start|>") => text.rfind('[').and_then(|at| {
+                 lfm(text[at..].trim()).map(|calls| Parsed {
+                     content: text[..at].into(),
+@@ -88,7 +102,7 @@ impl Format {
+                     Self::Gemma => ("<|tool_call>", "<tool_call|>"),
+                     Self::Hy => ("<tool_calls>", "</tool_calls>"),
+                     Self::Lfm => ("<|tool_call_start|>", "<|tool_call_end|>"),
+-                    Self::Harmony => unreachable!(),
++                    Self::Harmony | Self::Inkling => unreachable!(),
+                 };
+                 blocks(text, open, close, |body| match self {
+                     Self::Function => function(body).map(|c| vec![c]),
+@@ -122,6 +136,56 @@ fn call(name: &str, args: Value) -> Option<Value> {
+     }
+     Some(json!({"type":"function", "function":{"name":name,"arguments":args.to_string()}}))
+ }
++
++// A named assistant frame follows the reasoning and text frames. Hold the
++// header while its kind is still unknown, so a tool name never streams as text.
++fn inkling_tool_offset(text: &str) -> Option<usize> {
++    let mut rest = text;
++    loop {
++        let frame = rest.trim_start();
++        if !frame.is_empty() && INKLING_MODEL.starts_with(frame) {
++            return Some(text.len() - frame.len());
++        }
++        let payload = frame.strip_prefix(INKLING_MODEL)?;
++        if let Some(body) = payload
++            .strip_prefix(INKLING_THINK)
++            .or_else(|| payload.strip_prefix(INKLING_TEXT))
++        {
++            rest = body.split_once(INKLING_END)?.1;
++        } else {
++            return Some(text.len() - frame.len());
++        }
++    }
++}
++
++fn inkling(text: &str) -> Option<Parsed> {
++    let start = inkling_tool_offset(text)?;
++    let mut rest = &text[start..];
++    let mut calls = vec![];
++    while let Some(frame) = rest.trim_start().strip_prefix(INKLING_MODEL) {
++        let (recipient, body) = frame.split_once(INKLING_INVOKE)?;
++        // Consume JSON before checking the frame terminator. String arguments
++        // can include the literal spelling of the terminator.
++        let mut values = serde_json::Deserializer::from_str(body).into_iter::<Value>();
++        let data = values.next()?.ok()?;
++        let name = data.get("name")?.as_str()?;
++        if name != recipient {
++            return None;
++        }
++        let args = data.get("args")?.clone();
++        rest = body[values.byte_offset()..]
++            .trim_start()
++            .strip_prefix(INKLING_END)?;
++        calls.push(call(name, args)?);
++    }
++    if calls.is_empty() || !matches!(rest.trim(), "" | INKLING_STOP) {
++        return None;
++    }
++    let mut content = text[..start].to_owned();
++    content.push_str(rest);
++    Some(Parsed { content, calls })
++}
++
+ fn blocks(
+     text: &str,
+     open: &str,
+@@ -729,6 +793,45 @@ mod tests {
+             assert!(p.calls.is_empty());
+         }
+     }
++    #[test]
++    fn inkling_holds_named_frames_and_preserves_json_arguments() {
++        let prelude = format!(
++            "{INKLING_MODEL}{INKLING_THINK}Plan.{INKLING_END}\
++             {INKLING_MODEL}{INKLING_TEXT}One moment.{INKLING_END}"
++        );
++        let first = format!(
++            r#"{INKLING_MODEL}lookup{INKLING_INVOKE}{{"name":"lookup","args":{{"key":"{INKLING_END}☑"}}}}{INKLING_END}"#
++        );
++        let second = format!(
++            r#"{INKLING_MODEL}finish{INKLING_INVOKE}{{"name":"finish","args":{{}}}}{INKLING_END}"#
++        );
++        let format = Format::of(&format!("{INKLING_MODEL}{INKLING_INVOKE}")).unwrap();
++        assert_eq!(format, Format::Inkling);
++        let text = format!("{prelude}{first}{second}");
++        for (at, _) in text.char_indices().filter(|(at, _)| *at >= prelude.len()) {
++            assert_eq!(format.stream_prefix(&text[..at]), prelude);
++        }
++        let parsed = format.parse(&text);
++        assert_eq!(parsed.content, prelude);
++        assert_eq!(parsed.calls.len(), 2);
++        assert_eq!(parsed.calls[0]["function"]["name"], "lookup");
++        assert_eq!(
++            serde_json::from_str::<Value>(parsed.calls[0]["function"]["arguments"].as_str().unwrap())
++                .unwrap(),
++            json!({"key": format!("{INKLING_END}☑")})
++        );
++        assert_eq!(parsed.calls[1]["function"]["name"], "finish");
++        for invalid in [
++            format!("{prelude}{}", first.replace("\"lookup\"", "\"other\"")),
++            format!("{prelude}{}", first.strip_suffix(INKLING_END).unwrap()),
++            format!("{prelude}{first}<|message"),
++        ] {
++            let parsed = format.parse(&invalid);
++            assert!(parsed.calls.is_empty());
++            assert_eq!(parsed.content, invalid);
++        }
++    }
++
+     #[test]
+     fn unquoted_xml_arguments_keep_declared_string_types() {
+         let tools=Tools::from_request(&json!({"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"s":{"type":"string"},"n":{"type":"integer"}}}}}]})).unwrap();
+diff --git a/phlegm-core/src/server_media.rs b/phlegm-core/src/server_media.rs
+new file mode 100644
+index 0000000..ed35a6f
+--- /dev/null
++++ b/phlegm-core/src/server_media.rs
+@@ -0,0 +1,110 @@
++use crate::backend::PromptImage;
++use serde_json::{json, Value};
++
++pub(super) fn has_images(messages: &[Value]) -> bool {
++    messages.iter().filter_map(|m| m["content"].as_array()).flatten().any(is_image)
++}
++
++fn is_image(part: &Value) -> bool {
++    part["type"] == "image_url"
++}
++
++pub(super) fn parse(messages: &[Value], leading: usize) -> Result<(Vec<Option<Value>>, Vec<PromptImage>), String> {
++    let mut contents = vec![None; leading];
++    let mut images = Vec::new();
++    for message in messages {
++        let Some(parts) = message["content"].as_array().filter(|parts| parts.iter().any(is_image)) else {
++            contents.push(None);
++            continue;
++        };
++        if message["role"].as_str().unwrap_or("user") != "user" {
++            return Err("images are allowed in user messages".into());
++        }
++        let mut content = Vec::new();
++        for part in parts {
++            match part["type"].as_str() {
++                Some("text") => {
++                    let value = part["text"].as_str().ok_or("text content must be a string")?;
++                    content.push(json!({"type":"text", "text":value}));
++                }
++                Some("image_url") => {
++                    let url = part["image_url"]["url"].as_str().ok_or("image_url.url must be a string")?;
++                    images.push(decode_png(url)?);
++                    content.push(json!({"type":"image"}));
++                }
++                _ => return Err("image message content must contain text or image_url parts".into()),
++            }
++        }
++        contents.push(Some(Value::Array(content)));
++    }
++    Ok((contents, images))
++}
++
++fn decode_png(url: &str) -> Result<PromptImage, String> {
++    let data = url.strip_prefix("data:image/png;base64,").ok_or("image_url requires an inline PNG data URL")?;
++    let bytes = base64::decode(data).map_err(|_| "image is not valid base64")?;
++    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
++    decoder.set_transformations(png::Transformations::normalize_to_color8());
++    decoder.set_limits(png::Limits { bytes: 128 * 1024 * 1024 });
++    let info = decoder.read_header_info().map_err(|e| format!("invalid PNG: {e}"))?;
++    let (width, height) = (info.width as usize, info.height as usize);
++    if !(40..=4096).contains(&width) || !(40..=4096).contains(&height) {
++        return Err("image sides must be 40–4096 pixels".into());
++    }
++    let mut reader = decoder.read_info().map_err(|e| format!("invalid PNG: {e}"))?;
++    if reader.info().animation_control.is_some() { return Err("image input requires a still PNG".into()); }
++    let mut decoded = vec![0; reader.output_buffer_size()];
++    let frame = reader.next_frame(&mut decoded).map_err(|e| format!("invalid PNG: {e}"))?;
++    decoded.truncate(frame.buffer_size());
++    let rgb = match frame.color_type {
++        png::ColorType::Rgb => decoded,
++        png::ColorType::Rgba => decoded.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
++        png::ColorType::Grayscale => decoded.into_iter().flat_map(|p| [p; 3]).collect(),
++        png::ColorType::GrayscaleAlpha => decoded.chunks_exact(2).flat_map(|p| [p[0]; 3]).collect(),
++        png::ColorType::Indexed => return Err("PNG palette was not expanded".into()),
++    };
++    if rgb.len() != 3 * width * height { return Err("PNG dimensions changed during decode".into()); }
++    Ok(PromptImage { position: 0, width, height, rgb })
++}
++
++pub(super) fn expand(prompt: &[u32], placeholder: u32, images: &mut [PromptImage]) -> Result<Vec<u32>, String> {
++    let mut pending = images.iter_mut();
++    let mut result = Vec::new();
++    for &id in prompt {
++        if id == placeholder {
++            let image = pending.next().ok_or("chat template emitted an unexpected image placeholder")?;
++            image.position = result.len();
++            result.resize(result.len() + image.rows(), placeholder);
++        } else {
++            result.push(id);
++        }
++    }
++    if pending.next().is_some() { return Err("chat template omitted an image placeholder".into()); }
++    Ok(result)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn expands_image_parts_in_order_and_preserves_text() {
++        let mut png = Vec::new();
++        let pixel = [100, 150, 200, 255];
++        {
++            let mut encoder = png::Encoder::new(&mut png, 41, 40);
++            encoder.set_color(png::ColorType::Rgba);
++            encoder.write_header().unwrap().write_image_data(&pixel.repeat(41 * 40)).unwrap();
++        }
++        let part = json!({"type":"image_url", "image_url":{"url":format!("data:image/png;base64,{}", base64::encode(png))}});
++        let messages = [json!({"role":"user", "content":[{"type":"text", "text":"before"}, part.clone(),
++                         {"type":"text", "text":"between"}, part]})];
++        let (content, mut images) = parse(&messages, 1).unwrap();
++        assert!(content[0].is_none());
++        assert_eq!(content[1].as_ref().unwrap()[2]["text"], "between");
++        assert_eq!(images[0].rgb[..3], pixel[..3]);
++        assert_eq!(expand(&[10, 99, 11, 99, 12], 99, &mut images).unwrap(), [10, 99, 99, 11, 99, 99, 12]);
++        assert_eq!((images[0].position, images[1].position), (1, 4));
++        assert!(expand(&[10, 99, 11], 99, &mut images).is_err());
++    }
++}
