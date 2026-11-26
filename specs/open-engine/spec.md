@@ -9603,6 +9603,46 @@ same order on every channel and runs the same calls, so every logit is unchanged
   quiet-box absolute (no iGPU client; the head at its 10.4 ms) is open. Evidence: `target/npu-dev/decode-stream/` (`ab1/`, `ab2/`, `time1/`, `gates/`), plan
   `.plans/clover.md` 2026-11-06.
 
+### OPEN-DECODE-STREAM-LX: the split q8 decode and verify images stream as the merged image does
+**Applies to:** `open_kernels/designs/layer_x/xlayer.py` (`weight_ring`, `X_WRING` / `X_WORDER` / `X_SEQ`), `lx.py`,
+`ax.py`, `vlx.py`, `vax.py`, `open_kernels/recipes/qwen36moe.py` (`probe_env`)
+**Verification:** manual (the NPU and the model)
+
+A qwen36moe spec with q8 projection roles keeps the split images (`merged_image()` is false: the main cores have no
+room for the q8 GEMV entries beside the merged image's), so OPEN-DECODE-STREAM-UX did not reach it. The split decode
+images (`lx0`, `lx1`, `ax0`, `ax1`) and the verify images (`vlx*`, `vax*`) shall stream the same way:
+- each main core's weight fifo through a 16-deep ring of 10 KB elements in its column's memtile (`X_WRING`) in the
+  linear images (`lx`, `vlx`); not in the attention images (`X_WRING_AX`, default 0: see the result);
+- the MoE parts' down fills ahead of the wait on the hidden, and the linear part's out-projection fills right behind
+  the last DeltaNet fill (`X_WORDER`);
+- a routed slot's up and gate halves as one transfer, and part 0 of `lx` in `linear_sequence_seq`'s issue order
+  (`X_SEQ`); `ax` part 0 keeps `full_sequence`'s order (`X_SEQ_FULL`, default 0); the verify fronts keep theirs.
+Every core and helper receives the same bytes in the same order and runs the same calls: every logit is unchanged and
+the main-core programs are the same size. Each knob is an export variable in the build key; `=0` builds the images
+as before.
+
+**Acceptance criteria:**
+- Program memory as before (`lx` 16,096 of 16,384 B, `ax` 14,208, `vlx` 15,616, `vax` 14,304).
+- Against the previous set: prefill logits and 32 greedy decode steps byte-identical; `--verify-check` PASS.
+- Decode and the MTP cycle timed against the previous set, alternating.
+
+**Result 2026-11-26 (Strix Halo, Default power mode, load 9-27; `kernels-ring` = `kernels-fa262k` with the eight images
+rebuilt).** Gates: prefill logits of a 1,024-token prompt and 32 greedy steps, 33 files byte-identical, the same
+tokens; `--verify-check 6` PASS; `--spec-mtp 96` SPEC IDENTICAL. Program memory unchanged. Decode, 64 tokens after a
+24-token prompt, three alternating rounds (step-trace minima, ms):
+
+| set | step | lx0 | lx1 | ax0 | ax1 |
+|---|---|---|---|---|---|
+| before | 94.3 / 94.3 / 94.4 | 1.246 | 0.444 | 1.811 | 0.448 |
+| ring and order everywhere | 96.6-99.5 (worse) | 1.120 | 0.406 | 2.18 | 0.409 |
+| ring on the linear images only (the default) | 93.3 / 93.3 / 93.4 | 1.118 | 0.407 | 1.812 | 0.424 |
+
+The ring makes the linear images' dispatches 9-10 % shorter, but `ax0` -- always entered from the `lx` context --
+takes 0.36 ms longer with it (with either issue order), so the attention images keep the plain fifo. The step gains
+1 ms only: `lx0` entered from `ax` costs 2.35 ms against 1.14 ms in place, and with `ax0`, `ln` and `lm` the context
+switches are about 20 ms of the 93 ms step (OPEN-FAMILY-QWEN36MOE-GGUF "What is left"). The MTP cycle is unchanged
+(verify pass 142.3 against 142.6 ms).
+
 ### OPEN-DECODE-ONE-CONTEXT-DENSE: a dense decode token runs in one hardware context
 **Applies to:** openflowlm-next (`open_kernels/designs/dense/dx.py` `DX_ONECTX` / `DX_HEAD`, `open_kernels/recipes/dense.py`
 `one_context()` / `programs()` / `builds()`, `src/open_qwen36/core.cpp` `Core::step_impl`)

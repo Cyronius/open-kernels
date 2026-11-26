@@ -83,6 +83,7 @@ def vax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, p
     afns = XL.attn_kernels(inc, a)
 
     of_w, of_y, of_x = XL.main_fifos(t)
+    w_src = XL.weight_ring(of_w, t, XL.X_WRING_AX)   # OPEN-DECODE-STREAM-LX
     of_lni, of_lno = XL.ln_fifos(tl)
     of_ain, of_aout, of_og = XL.attn_fifos(a)
 
@@ -184,11 +185,11 @@ def vax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, p
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod,
                            y_conss, ACT_T, CA_BYTES, r * AA_BYTES + AA_XM, r * AA_BYTES + AA_ROUT, r * AA_BYTES + AA_RES,
                            r * AA_BYTES + AA_HP, CA_SGW, nx=X.NX_DECODE, xres_t=XRES_T, xres_off=r * HID,
-                           slot0=r * X.NE)
+                           slot0=r * X.NE, early_down=XL.X_WORDER, ug_bd=XL.X_SEQ)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
-                            [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            [w_src[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_ain.prod(tile=Tile(2, 0)), of_aout.cons(tile=Tile(1, 0)),

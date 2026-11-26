@@ -96,6 +96,7 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
 
     # ---- fifos
     of_w, of_y, of_x = XL.main_fifos(t)
+    w_src = of_w if DENSE else XL.weight_ring(of_w, t)   # OPEN-DECODE-STREAM-LX
     of_lni, of_lno = XL.ln_fifos(tl)
     of_side, of_gact, of_gout, of_pin, of_pout = XL.glue_post_fifos(g)
 
@@ -252,17 +253,22 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
         if DENSE:
             dense_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                            side_p, gact_p, gout_c, pin_p, pout_c, stop=STOP)
+        elif part == 0 and XL.X_SEQ and STOP == 99:      # OPEN-DECODE-STREAM-LX: ux's issue order
+            XL.linear_sequence_seq(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
+                                   side_p, gact_p, gout_c, pin_p, pout_c, A_BYTES, C_BYTES, STATE_BYTES,
+                                   early_out=XL.X_WORDER)
         elif part == 0:
             XL.linear_sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
-                               side_p, gact_p, gout_c, pin_p, pout_c, stop=STOP)
+                               side_p, gact_p, gout_c, pin_p, pout_c, stop=STOP, early_out=XL.X_WORDER)
         else:
             # 8. the MoE block (moeroute2 has pointed the routed slots' fills at the router's choice)
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                           A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=X.NX_DECODE)
+                           A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=X.NX_DECODE,
+                           early_down=XL.X_WORDER and not DENSE, ug_bd=XL.X_SEQ and not DENSE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
-                            [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            [w_src[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_side.prod(tile=Tile(2, 0)), of_gact.prod(tile=Tile(3, 0)), of_gout.cons(tile=Tile(2, 0)),

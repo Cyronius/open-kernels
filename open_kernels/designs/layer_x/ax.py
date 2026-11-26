@@ -99,6 +99,7 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
 
     # ---- fifos
     of_w, of_y, of_x = XL.main_fifos(t)
+    w_src = of_w if DENSE else XL.weight_ring(of_w, t, XL.X_WRING_AX)   # OPEN-DECODE-STREAM-LX
     of_lni, of_lno = XL.ln_fifos(tl)
     of_ain, of_aout, of_og = XL.attn_fifos(a)
 
@@ -202,16 +203,20 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         if DENSE:
             dense_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                            ain_p, aout_c, og_cs)
+        elif part == 0 and XL.X_SEQ_FULL:                 # OPEN-DECODE-STREAM-LX: ux's issue order (off: slower here)
+            XL.full_sequence_seq(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
+                                 ain_p, aout_c, og_cs, AA_BYTES, CA_BYTES, KV_BYTES)
         elif part == 0:
             XL.full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                              ain_p, aout_c, og_cs)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                           AA_BYTES, CA_BYTES, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW, nx=X.NX_DECODE)
+                           AA_BYTES, CA_BYTES, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW, nx=X.NX_DECODE,
+                           early_down=XL.X_WORDER and not DENSE, ug_bd=XL.X_SEQ and not DENSE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
-                            [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            [w_src[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_ain.prod(tile=Tile(2, 0)), of_aout.cons(tile=Tile(1, 0)),

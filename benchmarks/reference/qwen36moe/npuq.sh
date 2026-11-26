@@ -2,6 +2,8 @@
 # Run a command under arbiter npu once no other loaded NPU client is alive (2026-11-23; Linux 2026-11-26).
 # Another process on the NPU can hang this run's queue (F-0185), so foreign contexts seen during the run are logged too.
 # NPUQ_MEASURE=1 takes the whole machine (arbiter --measure) for benchmark numbers.
+# NPUQ_DIRECT=1: the caller already holds the NPU (an `arbiter run --measure` unit, say): run the command as is
+[ -n "${NPUQ_DIRECT:-}" ] && exec "$@"
 if [ -z "${WINDIR:-}" ]; then
   # Linux: arbiter run makes its own process group, so it waits, runs and releases in one call
   m=(); [ -n "${NPUQ_MEASURE:-}" ] && m=(--measure)

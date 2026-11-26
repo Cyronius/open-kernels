@@ -18,8 +18,7 @@ for mode in ${MODES:-off lookup mtp}; do
     # a forced kill skips the lock release, and phlegm cannot see a dead owner on Windows
     rm -f "$(cygpath "$LOCALAPPDATA")/Temp/phlegm-npu.lock"
   else
-    kill -INT $pid; wait $pid 2>/dev/null
-    while pgrep -f phlegm-reference-bench > /dev/null; do sleep 2; done
+    kids=$(pgrep -P $pid); kill $pid; wait $pid 2>/dev/null; [ -n "$kids" ] && kill $kids 2>/dev/null
   fi
 done
 for n in rewrite explain; do for m in lookup mtp; do cmp -s $O/serve_off_$n.txt $O/serve_${m}_$n.txt && echo "$n $m IDENTICAL" || echo "$n $m DIFFERS"; done; done

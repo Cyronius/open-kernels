@@ -84,6 +84,7 @@ def vlx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Co
     GK = XL.glue_post_kernels(inc, g)
 
     of_w, of_y, of_x = XL.main_fifos(t)
+    w_src = XL.weight_ring(of_w, t)   # OPEN-DECODE-STREAM-LX
     of_lni, of_lno = XL.ln_fifos(tl)
     of_side, of_gact, of_gout, of_pin, of_pout = XL.glue_post_fifos(g)
 
@@ -218,7 +219,7 @@ def vlx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Co
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod,
                            y_conss, ACT_T, C_BYTES, r * A_BYTES + A_XM, r * A_BYTES + A_ROUT, r * A_BYTES + A_RES,
                            r * A_BYTES + A_HP, C_SGW, nx=X.NX_DECODE, xres_t=XRES_T, xres_off=r * HID,
-                           slot0=r * X.NE)
+                           slot0=r * X.NE, early_down=XL.X_WORDER, ug_bd=XL.X_SEQ)
 
     def sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                  side_p, gact_p, gout_c, pin_p, pout_c):
@@ -230,7 +231,7 @@ def vlx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Co
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
-                            [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
+                            [w_src[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_side.prod(tile=Tile(2, 0)), of_gact.prod(tile=Tile(3, 0)), of_gout.cons(tile=Tile(2, 0)),
