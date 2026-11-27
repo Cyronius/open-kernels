@@ -1,6 +1,6 @@
 # Qwen3.6 decode: stage hand-offs on chip (plan, not started)
 
-Status 2026-11-27: written for a go / no-go. Nothing here is built or measured unless it says so.
+Status 2026-11-27: written for a go / no-go; question 3's probe measured (below). Nothing else is built.
 
 ## Where the step is
 
@@ -65,6 +65,20 @@ Open questions, in the order they would be answered:
 - Risk: the placed dialect is new to this repo; the MoE parts' `moeroute2` instruction-stream patching must keep
   working on the changed streams.
 
+## Question 3, measured (2026-11-27)
+
+A timing-only build knob (`UX_HO_PROBE`, removed after) issued `lx0`'s `x` fill for `xn` before the entry norm's
+drain completes (hand-off 1) and the `og` fill before post's drains complete (hand-off 5): the main cores then read
+stale bytes, so only the time counts. Rebuilt through `export_qwen36_kernels.py --only lx0` (the unchanged build
+reproduces the shipped `insts.bin` byte for byte), swapped into a copy of the shipped set. One `--measure` unit, three
+alternating rounds (NOISY only for another session's one-core loop): `lx0` minimum 1.106-1.109 ms against
+1.120-1.126, the step 70.9-71.0 against 71.3-71.4. Two waits cost about 7 us each, 0.4 ms a step over 30 layers.
+
+So a hand-off is cheap: if every wait in `lx0`, `ax0` and the MoE parts' hidden round trip cost the same, all of them
+together come to roughly 2-4 ms a step (inferred from this price and the counts above), well short of the 15 ms gap,
+and most of `lx0`'s ~5.7 ms over its floor is elsewhere (the streams' rates while the stages overlap). The memtile
+schedule would buy at most a few percent for several days of placed-dialect work.
+
 ## Asks
 
-Go / no-go from the user. If go: question 3 first, and stop if one hand-off costs too little to pay for the rest.
+Recommendation after question 3: no-go on the memtile schedule. The step stays at 71.3 ms with its remainders named.

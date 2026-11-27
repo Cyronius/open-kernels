@@ -1837,6 +1837,11 @@ from the layer context straight to the head's: tail 15.3-15.7 ms either way, ste
 108.1 / 109.5 / 110.0 (three alternating rounds on a loaded box; all 48 tokens the same). Without the `ln` context
 the head's entry costs what the two did: folding the norm into the head image would buy nothing. Rejected; the
 tail's 3 ms is the two big contexts' entries and only the head inside the layer image removes it.
+What one DDR hand-off costs, measured 2026-11-27 (plan `qwen36moe-decode-onchip.md`, question 3): `lx0` with its
+`xn` and `og` fills issued without waiting for the drains in front of them (timing only) runs 1.106-1.109 ms against
+1.120-1.126, the step 70.9-71.0 against 71.3-71.4 (one `--measure` unit, three alternating rounds): about 7 us a
+wait. Every hand-off on chip would come to roughly 2-4 ms a step at that price (inferred); the memtile schedule that
+would do it is not pursued.
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
