@@ -1830,7 +1830,13 @@ the layer context, started right after the head and waited at the next step's en
 env-gated engine change, both removed): `lx0` after the head drops to the plain 1.14-1.40 ms, but the host now
 blocks on `lxsw` instead, and the step stays where it was (70.1 against 70.2 ms on the quietest round, 87.8 against
 88.1 on a loaded one; three alternating rounds, tokens identical). The host's time between the head and the next
-step is too short to hide a 1.5-2 ms switch: lever (2) is rejected; lever (1) (about 0.1-0.2 ms) stays untried.
+step is too short to hide a 1.5-2 ms switch: lever (2) is rejected; lever (1) is measured next.
+Lever (1)'s ceiling measured the same day: the final norm on the host instead of the `ln` dispatch (an env-gated
+probe, removed: read `xres`, `rmsnorm_rows` with the GGUF's `output_norm`, write `hn` as bf16), so the step goes
+from the layer context straight to the head's: tail 15.3-15.7 ms either way, step 109.2 / 109.5 / 111.0 against
+108.1 / 109.5 / 110.0 (three alternating rounds on a loaded box; all 48 tokens the same). Without the `ln` context
+the head's entry costs what the two did: folding the norm into the head image would buy nothing. Rejected; the
+tail's 3 ms is the two big contexts' entries and only the head inside the layer image removes it.
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
