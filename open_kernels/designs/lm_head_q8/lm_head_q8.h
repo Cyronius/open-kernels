@@ -43,7 +43,20 @@ static constexpr unsigned kTileK = 256;      // K per chunk
 #ifndef LMHEAD_SCALES_F32
 #define LMHEAD_SCALES_F32 0
 #endif
-#if LMHEAD_SCALES_F32
+#ifndef LMHEAD_Q6
+#define LMHEAD_Q6 0
+#endif
+#if LMHEAD_Q6
+// OPEN-LMHEAD-Q6: a GGUF Q6_K head at its own 6.6 bits a value (lm_head_q8.h's chunk geometry, 32 rows x 256 K):
+//   d   [32]      f32  at [0    : 128)    the row's Q6_K super-block scale (one per 256 k = one per chunk)
+//   sc  [16][32]  int8 at [128  : 640)    sub-block scales, index g*32 + r (g = 16-k group)
+//   lo  [2][32][64] B  at [640  : 4736)   per row half rb, per (kb, oc) block of 128 codes in the q8 code order
+//                                         (k_local*16 + r): low nibble = code j, high nibble = code 64 + j
+//   hi  [2][32][32] B  at [4736 : 6784)   the codes' top two bits: byte b holds codes b, 32+b, 64+b, 96+b
+// value = d[r] * sc[g][r] * (code - 32), code = lo | hi << 4 in [0, 63]
+static constexpr unsigned kScaleBytes = 0;
+static constexpr unsigned kTileBytes = 6784;
+#elif LMHEAD_SCALES_F32
 static constexpr unsigned kScaleBytes = 1024;
 static constexpr unsigned kTileBytes = 9216;
 #else
@@ -174,6 +187,102 @@ __attribute__((noinline)) inline void gemv_q8_tile(const uint8_t *__restrict til
   event1();
 }
 
+#if LMHEAD_Q6
+// One 128-code block (8 k x 16 rows) of the Q6 chunk as the two signed 64-code halves the q8 kernel loads.
+static inline void q6_block(const uint8_t *__restrict lo, const uint8_t *__restrict hi, aie::vector<int8_t, 64> &q0,
+                            aie::vector<int8_t, 64> &q1) {
+  const aie::vector<uint8_t, 64> n = aie::load_v<64>(lo);
+  const aie::vector<uint8_t, 32> h = aie::load_v<32>(hi);
+  const aie::vector<uint8_t, 64> h01 = aie::concat(h, aie::downshift(h, 2));
+  const aie::vector<uint8_t, 64> h23 = aie::concat(aie::downshift(h, 4), aie::downshift(h, 6));
+  const aie::vector<uint8_t, 64> c0 =
+      aie::bit_or(aie::bit_and((uint8_t)15, n), aie::upshift(aie::bit_and((uint8_t)3, h01), 4));
+  const aie::vector<uint8_t, 64> c1 = aie::bit_or(aie::downshift(n, 4), aie::upshift(aie::bit_and((uint8_t)3, h23), 4));
+  q0 = aie::sub(c0.template cast_to<int8_t>(), (int8_t)32);
+  q1 = aie::sub(c1.template cast_to<int8_t>(), (int8_t)32);
+}
+
+static inline aie::vector<bfloat16, kRows> q6_scale(const int8_t *__restrict p) {
+  const aie::vector<int32_t, kRows> v = aie::unpack(aie::unpack(aie::load_v<kRows>(p)));
+  aie::accum<accfloat, kRows> a;
+  a.from_vector(aie::to_float<float>(v, 0));
+  return a.template to_vector<bfloat16>();     // |sc| <= 128: exact in bf16
+}
+
+__attribute__((noinline)) inline void gemv_q6_tile(const uint8_t *__restrict tile, const uint8_t *__restrict tab,
+                                                   unsigned kt, bool first, float *__restrict y) {
+  event0();
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const float *__restrict d = (const float *)tile;
+  const int8_t *__restrict sc = (const int8_t *)(tile + 128);
+  const uint8_t *__restrict lo = tile + 640;
+  const uint8_t *__restrict hi = tile + 4736;
+  const int16_t *__restrict xi = (const int16_t *)tab + kt * kTileK;
+  const int32_t *__restrict sh = (const int32_t *)(tab + 2 * kK) + kt * kKBlocks;
+
+  aie::accum<accfloat, kRows> acc = aie::zeros<accfloat, kRows>();   // this chunk, before d
+#pragma clang loop unroll(disable)
+  for (unsigned kb = 0; kb < kKBlocks; ++kb) {
+    aie::vector<int32_t, 8> v[2][4];       // [16-k group][row octet]
+#pragma clang loop unroll(full)
+    for (unsigned rb = 0; rb < 2; ++rb) {
+      aie::mmul<4, 8, 8, int16_t, int8_t> C[2][2];   // [group][rows 0..7 | 8..15]
+#pragma clang loop unroll(full)
+      for (unsigned oc = 0; oc < 4; ++oc) {
+        const aie::vector<int16_t, 32> A =
+            aie::load_v<8>(xi + kb * kKInBlock + oc * 8).template grow_replicate<32>();
+        aie::vector<int8_t, 64> q0, q1;
+        q6_block(lo + rb * 2048 + (kb * 4 + oc) * 64, hi + rb * 1024 + (kb * 4 + oc) * 32, q0, q1);
+        auto [l8, h8] = aie::interleave_unzip(q0, q1, 8);
+        const unsigned g = oc / 2;
+        if (oc % 2 == 0) {
+          C[g][0].mul(A, l8);
+          C[g][1].mul(A, h8);
+        } else {
+          C[g][0].mac(A, l8);
+          C[g][1].mac(A, h8);
+        }
+      }
+#pragma clang loop unroll(full)
+      for (unsigned g = 0; g < 2; ++g) {
+        v[g][2 * rb] = C[g][0].template to_vector<int32_t>().template extract<8>(0);
+        v[g][2 * rb + 1] = C[g][1].template to_vector<int32_t>().template extract<8>(0);
+      }
+    }
+#pragma clang loop unroll(full)
+    for (unsigned g = 0; g < 2; ++g) {
+      const aie::vector<int32_t, kRows> vi = aie::concat(v[g][0], v[g][1], v[g][2], v[g][3]);
+      aie::accum<accfloat, kRows> part;
+      part.from_vector(aie::to_float<float>(vi, sh[kb]));
+      const aie::vector<bfloat16, kRows> ph = part.template to_vector<bfloat16>();
+      const aie::vector<bfloat16, kRows> pl = aie::sub(part, ph).template to_vector<bfloat16>();
+      const aie::vector<bfloat16, kRows> sv = q6_scale(sc + (2 * kb + g) * kRows);
+      acc = aie::mac(acc, ph, sv);
+      acc = aie::mac(acc, pl, sv);
+    }
+  }
+  // y += d * acc, both split hi / lo (the product to ~16 mantissa bits, as the q8 tile's scale step)
+  const aie::vector<float, kRows> dv = aie::load_v<kRows>(d);
+  aie::accum<accfloat, kRows> da;
+  da.from_vector(dv);
+  const aie::vector<bfloat16, kRows> dh = da.template to_vector<bfloat16>();
+  const aie::vector<bfloat16, kRows> dl = aie::sub(da, dh).template to_vector<bfloat16>();
+  const aie::vector<bfloat16, kRows> ah = acc.template to_vector<bfloat16>();
+  const aie::vector<bfloat16, kRows> al = aie::sub(acc, ah).template to_vector<bfloat16>();
+  aie::accum<accfloat, kRows> out;
+  if (first)
+    out = aie::zeros<accfloat, kRows>();
+  else
+    out.from_vector(aie::load_v<kRows>(y));
+  out = aie::mac(out, ah, dh);
+  out = aie::mac(out, ah, dl);
+  out = aie::mac(out, al, dh);
+  aie::store_v(y, out.template to_vector<float>());
+  event1();
+}
+#define gemv_q8_tile gemv_q6_tile    // the entry points (lm_head_q8.cc) call the format's tile
+#endif
+
 #if LMHEAD_ROWS == 2
 // Two token rows through one chunk: one unzip and one mmul for both (A rows 0 and 1 hold the tokens, 2 and 3 are
 // zero), the epilogue per token as gemv_q8_tile's. 2-token table: gptoss/gx_rows.h's layout.
@@ -257,4 +366,93 @@ __attribute__((noinline)) inline void gemv_q8_tile2(const uint8_t *__restrict ti
   aie::store_v(y1, acc[1].template to_vector<float>());
   event1();
 }
+#endif
+
+#if LMHEAD_Q6 && LMHEAD_ROWS == 2
+// The Q6 tile for two token rows (gemv_q8_tile2's form: A rows 0 and 1 hold the tokens), the verify pass's head.
+__attribute__((noinline)) inline void gemv_q6_tile2(const uint8_t *__restrict tile, const uint8_t *__restrict tab,
+                                                    unsigned kt, bool first, float *__restrict y0,
+                                                    float *__restrict y1) {
+  event0();
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const float *__restrict d = (const float *)tile;
+  const int8_t *__restrict sc = (const int8_t *)(tile + 128);
+  const uint8_t *__restrict lo = tile + 640;
+  const uint8_t *__restrict hi = tile + 4736;
+  const int16_t *__restrict xg = (const int16_t *)tab + kt * kTileK * 2;
+  const int32_t *__restrict sh[2];
+  sh[0] = (const int32_t *)(tab + 4 * kK) + kt * kKBlocks;
+  sh[1] = sh[0] + kK / 32;
+
+  aie::accum<accfloat, kRows> acc[2] = {aie::zeros<accfloat, kRows>(), aie::zeros<accfloat, kRows>()};
+#pragma clang loop unroll(disable)
+  for (unsigned kb = 0; kb < kKBlocks; ++kb) {
+    aie::vector<int32_t, 8> v[2][2][4];    // [token][16-k group][row octet]
+#pragma clang loop unroll(full)
+    for (unsigned rb = 0; rb < 2; ++rb) {
+      aie::mmul<4, 8, 8, int16_t, int8_t> C[2][2];
+#pragma clang loop unroll(full)
+      for (unsigned oc = 0; oc < 4; ++oc) {
+        const aie::vector<int16_t, 32> A =
+            aie::concat(aie::load_v<16>(xg + (kb * 4 + oc) * 16), aie::zeros<int16_t, 16>());
+        aie::vector<int8_t, 64> q0, q1;
+        q6_block(lo + rb * 2048 + (kb * 4 + oc) * 64, hi + rb * 1024 + (kb * 4 + oc) * 32, q0, q1);
+        auto [l8, h8] = aie::interleave_unzip(q0, q1, 8);
+        const unsigned g = oc / 2;
+        if (oc % 2 == 0) {
+          C[g][0].mul(A, l8);
+          C[g][1].mul(A, h8);
+        } else {
+          C[g][0].mac(A, l8);
+          C[g][1].mac(A, h8);
+        }
+      }
+#pragma clang loop unroll(full)
+      for (unsigned g = 0; g < 2; ++g) {
+        const aie::vector<int32_t, 32> cl = C[g][0].template to_vector<int32_t>();
+        const aie::vector<int32_t, 32> ch = C[g][1].template to_vector<int32_t>();
+#pragma clang loop unroll(full)
+        for (unsigned t = 0; t < 2; ++t) {
+          v[t][g][2 * rb] = cl.template extract<8>(t);
+          v[t][g][2 * rb + 1] = ch.template extract<8>(t);
+        }
+      }
+    }
+#pragma clang loop unroll(full)
+    for (unsigned g = 0; g < 2; ++g) {
+      const aie::vector<bfloat16, kRows> sv = q6_scale(sc + (2 * kb + g) * kRows);
+#pragma clang loop unroll(full)
+      for (unsigned t = 0; t < 2; ++t) {
+        const aie::vector<int32_t, kRows> vi = aie::concat(v[t][g][0], v[t][g][1], v[t][g][2], v[t][g][3]);
+        aie::accum<accfloat, kRows> part;
+        part.from_vector(aie::to_float<float>(vi, sh[t][kb]));
+        const aie::vector<bfloat16, kRows> ph = part.template to_vector<bfloat16>();
+        const aie::vector<bfloat16, kRows> pl = aie::sub(part, ph).template to_vector<bfloat16>();
+        acc[t] = aie::mac(acc[t], ph, sv);
+        acc[t] = aie::mac(acc[t], pl, sv);
+      }
+    }
+  }
+  aie::accum<accfloat, kRows> da;
+  da.from_vector(aie::load_v<kRows>(d));
+  const aie::vector<bfloat16, kRows> dh = da.template to_vector<bfloat16>();
+  const aie::vector<bfloat16, kRows> dl = aie::sub(da, dh).template to_vector<bfloat16>();
+  float *__restrict ys[2] = {y0, y1};
+#pragma clang loop unroll(full)
+  for (unsigned t = 0; t < 2; ++t) {
+    const aie::vector<bfloat16, kRows> ah = acc[t].template to_vector<bfloat16>();
+    const aie::vector<bfloat16, kRows> al = aie::sub(acc[t], ah).template to_vector<bfloat16>();
+    aie::accum<accfloat, kRows> out;
+    if (first)
+      out = aie::zeros<accfloat, kRows>();
+    else
+      out.from_vector(aie::load_v<kRows>(ys[t]));
+    out = aie::mac(out, ah, dh);
+    out = aie::mac(out, ah, dl);
+    out = aie::mac(out, al, dh);
+    aie::store_v(ys[t], out.template to_vector<float>());
+  }
+  event1();
+}
+#define gemv_q8_tile2 gemv_q6_tile2
 #endif

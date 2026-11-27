@@ -954,6 +954,59 @@ int main() {
         if (bad6) return 1;
     }
 
+    // ---- OPEN-LMHEAD-Q6: q35_lmhead6 keeps every Q6_K value, read back the way lm_head_q8.h's q6 tile reads it
+    {
+        constexpr unsigned S = 2, P = 2, rows = 128 * S * 2, cols = 512, nk = cols / 256;
+        BlocksQ6K q6 = make_blocks_q6k(rows, cols, rng);
+        for (unsigned r = 0; r < rows; ++r)                 // random sub-block scales (the synthetic ones are all 1)
+            for (unsigned sb = 0; sb < nk; ++sb) {
+                uint8_t* blk = q6.bytes.data() + (static_cast<size_t>(r) * nk + sb) * 210;
+                for (unsigned g = 0; g < 16; ++g) {
+                    int sc = static_cast<int>(rng() % 41) - 20;
+                    if (!sc) sc = 7;
+                    blk[192 + g] = static_cast<uint8_t>(static_cast<int8_t>(sc));
+                    for (unsigned v = 16 * g; v < 16 * g + 16; ++v) {
+                        float& y = q6.values[static_cast<size_t>(r) * cols + sb * 256 + v];
+                        y *= static_cast<float>(sc);         // 0.5 * (code - 32) -> 0.5 * sc * (code - 32), exact
+                    }
+                }
+            }
+        GgufFile g6(write_gguf_q6k(dir, q6));
+        PackOp op;
+        op.op = "q35_lmhead6";
+        op.tensor = "blk.0.attn_q.weight";
+        op.in_dim = cols;
+        op.groups = S;
+        op.width = P;
+        const size_t nch = rows / 32 * nk, per_band = 4 * nk;
+        std::vector<uint8_t> pool(nch * 6784, 0xAB);
+        pools::apply(op, g6, 0, pool.data(), pool.size(), 6784);
+        size_t bad = 0;
+        for (size_t k = 0; k < nch && !bad; ++k) {
+            const size_t set = k / (S * per_band), in_set = k % (S * per_band);
+            const size_t g = in_set / (S * P), j = in_set % (S * P) / P, i = in_set % P;
+            const size_t band = set * S + j, cb = g * P + i, rb = 4 * band + cb % 4, kt = cb / 4;
+            const uint8_t* c = pool.data() + k * 6784;
+            for (unsigned r = 0; r < 32; ++r) {
+                float d;
+                std::memcpy(&d, c + 4 * r, 4);
+                for (unsigned v = 0; v < 256; ++v) {
+                    const unsigned half = r / 16, ci = (v % 8) * 16 + r % 16, blk = (v / 32) * 4 + (v % 32) / 8;
+                    const uint8_t lo = c[640 + half * 2048 + blk * 64 + ci % 64];
+                    const unsigned code = (ci < 64 ? lo & 15u : lo >> 4) |
+                                          (((c[4736 + half * 1024 + blk * 32 + ci % 32] >> (2 * (ci / 32))) & 3u) << 4);
+                    const float sc = static_cast<float>(static_cast<int8_t>(c[128 + (v / 16) * 32 + r]));
+                    const float got = d * sc * static_cast<float>(static_cast<int>(code) - 32);
+                    const float want = q6.values[(32 * rb + r) * static_cast<size_t>(cols) + kt * 256 + v];
+                    if (f32_bits(got) != f32_bits(want) && !bad++)
+                        std::printf("FAIL q35_lmhead6 chunk %zu row %u k %u: got %.9g want %.9g\n", k, r, v, got, want);
+                }
+            }
+        }
+        std::printf("%s q35_lmhead6 (split order, every Q6_K value bit-exact)\n", bad ? "FAIL" : "ok");
+        if (bad) return 1;
+    }
+
     // ---- OPEN-GGUF-GRANITE-FOLD: the folds granite-4.2-3b's metadata asks for, and their refusals
     {
         const auto folds = [&](const std::vector<std::pair<std::string, float>>& s) {

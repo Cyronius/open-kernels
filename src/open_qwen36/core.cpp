@@ -418,6 +418,23 @@ Core::Core(const CoreConfig& cfg, xrt::device* dev) : cfg_(cfg) {
     // there); anything GGUF does not carry is refused with its name.
     if (gguf_)
         file_ = std::make_unique<GgufFile>((md / "model.gguf").string());
+    // OPEN-LMHEAD-Q6: a Q6_K head runs on its own codes (6.6 bits a value, the lm_q6 / lmv_q6 kernels) instead of
+    // requantized to q8 -- fewer bytes and the GGUF's values exactly. OFLM_OPEN_LMHEAD_Q6=0 keeps the q8 head.
+    if (gguf_ && man_.gguf && !man_.gguf->lmhead_q6_ops.empty()) {
+        Manifest& g = *man_.gguf;
+        const auto* gf = dynamic_cast<const GgufFile*>(file_.get());
+        const char* e = std::getenv("OFLM_OPEN_LMHEAD_Q6");
+        const std::string& head = g.lmhead_q6_ops[0].tensor;
+        if (gf && gf->has(head) && gf->tensor(head).type == GgufFile::Type::Q6_K && !(e && std::string(e) == "0")) {
+            g.kernels["lm"] = g.kernels.at("lm_q6");
+            if (g.kernels.count("lmv") && g.kernels.count("lmv_q6")) g.kernels["lmv"] = g.kernels.at("lmv_q6");
+            g.lmhead_ops = g.lmhead_q6_ops;
+            g.lmhead_pool_bytes = g.lmhead_q6_pool_bytes;
+            g.lmhead_chunk_bytes = g.lmhead_q6_chunk_bytes;
+            g.globals["lmpool"] = g.lmhead_q6_pool_bytes;
+            log("lm_head: the GGUF's Q6_K codes (OPEN-LMHEAD-Q6; OFLM_OPEN_LMHEAD_Q6=0 runs the q8 head)");
+        }
+    }
     nlohmann::json j;
     std::ifstream cf(md / "config.json");
     // #24: config.json is optional for a GGUF -- the metadata carries it.

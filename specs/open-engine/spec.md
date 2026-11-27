@@ -1765,6 +1765,11 @@ With OPEN-MOE-DQBUF as well (2026-11-26 15:44, measure unit; NOISY only for kswa
 Prefill at 8k, ms a token: linear layers 2.14 (experts 0.97, GEMMs 0.43, DeltaNet host 0.27, tails 0.09), full layers
 0.85 (experts 0.32, GEMMs 0.35, attention 0.03).
 
+With OPEN-DECODE-STREAM-UG as well (2026-11-26 20:32, measure unit, CLEAN; `bench/phlegm_bench_measure_wug.json`):
+prefill 220.8 / 275.4 / 309.9 / 328.6 tok/s and decode 13.38 / 12.92 / 12.09 / 10.78 tok/s at 512 / 1k / 2k / 4k. The
+prefill route is unchanged by it and moved 1.5-3 % between the two runs, so this bench does not resolve the step's
+2 % (the alternating step-trace A/B in OPEN-DECODE-STREAM-UG does).
+
 **Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
 norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
 the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
@@ -9734,7 +9739,58 @@ alternating rounds (two NOISY measure units: another process at up to 15 cores):
 The MoE parts are 9 % shorter (40 a step, about 1.5 ms); a 24-deep ring adds nothing measurable, so the ring stays at
 16. The step, timed in a CLEAN measure unit (three alternating rounds, the same 48 tokens): 74.3 / 74.3 / 74.1 ms
 before, 72.8 / 72.8 / 72.4 with `X_WUG` (`lx1` 0.369-0.372 against 0.407-0.410, `ax1` 0.372-0.374 against 0.410):
-1.6 ms a step, 2 %.
+1.6 ms a step, 2 %. After a 4,096-token prompt (CLEAN, two alternating rounds, 48 tokens, the same tokens): 93
+ms a step against 94-95 with `X_WUG=0` (`lx1` / `ax1` 0.372-0.374 against 0.409); the phlegm bench's 4k decode
+(10.78 against 11.25 tok/s) is that bench's run-to-run spread, not this change.
+
+### OPEN-LMHEAD-Q6: a GGUF's Q6_K head runs on its own codes
+**Applies to:** `open_kernels/designs/lm_head_q8/lm_head_q8.h` (`LMHEAD_Q6`: `gemv_q6_tile`, `gemv_q6_tile2`),
+`lm_head_q8.py` (`LMHEAD_Q6`, `LMHEAD_SPLIT`), `open_kernels/recipes/qwen36moe.py` (`lmhead_q6_on`, the `lm_head_q6` /
+`lmv6` builds, the GGUF view's `pack.lm_head_q6` and `lm_q6` / `lmv_q6` kernels), `src/open_qwen36/pools.cpp`
+(`q35_lmhead6`), `manifest.cpp` / `.hpp`, `core.cpp`, `gguf_pack_test.cpp`, `manifest_test.cpp`
+**Verification:** `gguf_pack_test` (q35_lmhead6 bit-exact), `test_qwen36moe_gguf.py`; manual (the NPU and the model)
+
+Unsloth's Qwen3.6-35B-A3B GGUF stores the head (`output.weight`, 248,320 x 2,048) as Q6_K. The q8 head requantized
+it per 32-block (8.5 bits a value, 516 MB a decode step, and not the GGUF's values). The kernel set shall also carry a
+head on the Q6_K codes themselves, and the engine shall run it when the GGUF's head tensor is Q6_K:
+- a chunk keeps lm_head_q8's geometry (32 rows x 256 k) at 6,784 B: the rows' super-block scales `d` (f32), the 16
+  sub-block scales (int8), the codes' low nibbles and their top two bits, laid out so a 64-B and a 32-B load rebuild
+  the two signed 64-code halves the q8 tile loads (`q6_block`); the tile scales each 16-k group's integer sum by its
+  sub-block scale and the chunk's result by `d`, both through the q8 tile's hi / lo bf16 split;
+- the dequant costs the core more than the q8 tile (one core a column: 15.5 ms against 10.5), so the head runs two
+  cores a column (`LMHEAD_SPLIT=2`, `QWEN36MOE_LMHEAD_Q6_SPLIT`): the column's stream carries two-band sets in split
+  order (per set, per chunk group, the two bands' call elements), its memtile splits each object over the two cores
+  and joins their results; the pool is packed in that order (`q35_lmhead6`, `groups` = 2, `width` = 2 chunks a call).
+  Four cores a column run as fast in place but their 32-core context costs about 1 ms more to enter a step;
+- the GGUF view names the head `pack.lm_head_q6` with kernels `lm_q6` and `lmv_q6` (the verify pass's two-row head);
+  the engine swaps them in for `lm` / `lmv` and the pool at load when `output.weight` is Q6_K.
+  `OFLM_OPEN_LMHEAD_Q6=0` keeps the q8 head; `QWEN36MOE_LMHEAD_Q6=0` at export leaves the Q6 head out.
+
+**Acceptance criteria:**
+- `q35_lmhead6` reproduces every Q6_K value bit for bit, read back the way the tile reads it.
+- KL against the llama.cpp Vulkan base no worse than the q8 head's (greedy tokens may part from the q8 head's: the
+  q8 head is a requantization, this one the GGUF's values).
+- `--verify-check` PASS (the two-row head bit-identical to the one-row head); `--spec-mtp` SPEC IDENTICAL.
+- Decode timed against the q8 head, alternating.
+
+**Result 2026-11-26 (Strix Halo, Default power mode).** `gguf_pack_test` ok; ctest 10 of 10. KL (8 chunks, 2,040
+positions, against `base_vk_c512`): mean 0.02402 against 0.02408 for the q8 head, median 0.00669 / 0.00660, p95 0.1049
+/ 0.1047, top token 93.43 % / 93.38 %. Greedy tokens of the 24-token prompt: the first 26 the same with either head,
+then they part (48 tokens: two sequences, the same for both Q6 layouts; `OFLM_OPEN_LMHEAD_Q6=0` gives the q8 head's);
+the exported set's logits byte-identical to a hand-assembled one; `--verify-check 6` PASS (0 of 248,320 differ);
+`--spec-mtp 96` SPEC IDENTICAL with either layout; two cores a column's logits byte-identical to four's (56 files). Program memory 4,528 B (`lm_head_q6`) and 4,864 B (`lmv6`).
+
+Timing (head dispatch minimum, ms; in place = `--bench-kernel lm`, in a step = the step trace's `lm` row):
+
+| head | in place | in a decode step |
+|---|---|---|
+| q8 | 9.61-9.67 | 10.17-10.24 |
+| Q6, four cores a column | 7.50-7.52 | 9.99-10.19 |
+| Q6, two cores a column | 7.54 | 8.83-9.14 |
+
+In place the Q6 head reads 421 MB at 56 GB/s. Four cores a column lose the gain in a step (the step stays 72.8-72.9 ms
+against 72.8-73.1, CLEAN, three alternating rounds); two cores a column keep about 1.1-1.3 ms of it (one NOISY unit:
+another process at up to 16 cores for 107 s).
 
 ### OPEN-DECODE-ONE-CONTEXT-Q8: a q8-projection MoE decode token and its verify pass each run in one hardware context
 **Applies to:** `open_kernels/designs/layer_x/ux.py` (`ALL_Q8`), `vux.py`, `open_kernels/recipes/qwen36moe.py`

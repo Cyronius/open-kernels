@@ -35,9 +35,12 @@ GEMV = HERE.parent / "gemv_q4"          # gemv_tab.h + the activation prep entry
 # GGUF-direct pool chunks (f32 scales, 9216 B) vs the q4nx ones (bf16, 8704 B);
 # see lm_head_q8.h. The entry point is lm_head_q8s32_group in the f32 build.
 SCALES_F32 = int(os.environ.get("LMHEAD_SCALES_F32", 0))
-TILE_BYTES = 9216 if SCALES_F32 else 8704
-KERNEL_SYM = "lm_head_q8s32_group" if SCALES_F32 else "lm_head_q8_group"
-EXTRA_FLAGS = ["-DLMHEAD_SCALES_F32=1", "-DLMHEAD_Q8_PREFIX=lm_head_q8s32"] if SCALES_F32 else []
+Q6 = int(os.environ.get("LMHEAD_Q6", 0))     # OPEN-LMHEAD-Q6: a Q6_K head in its own 6784-B chunks (lm_head_q8.h)
+assert not (Q6 and SCALES_F32), "LMHEAD_Q6 and LMHEAD_SCALES_F32 are two chunk formats"
+TILE_BYTES = 6784 if Q6 else 9216 if SCALES_F32 else 8704
+KERNEL_SYM = "lm_head_q6_group" if Q6 else "lm_head_q8s32_group" if SCALES_F32 else "lm_head_q8_group"
+EXTRA_FLAGS = (["-DLMHEAD_Q6=1", "-DLMHEAD_Q8_PREFIX=lm_head_q6"] if Q6 else
+               ["-DLMHEAD_SCALES_F32=1", "-DLMHEAD_Q8_PREFIX=lm_head_q8s32"] if SCALES_F32 else [])
 # debug: LMHEAD_NULL=1 compiles the arithmetic out and keeps every DMA (lm_head_q8.h), for timing the
 # head's stream floor; the output is garbage. Not in the build key: give it its own --build-root.
 if int(os.environ.get("LMHEAD_NULL", 0)):
@@ -58,6 +61,12 @@ PER_CALL = 2            # 2 x 8704 = 17408 B per element, x2 buffered -> 34 KB o
 # straight to the core, the design every head was built with. Measured SLOWER on MiniCPM5-2B (2026-11-16, quiet
 # host, 3 rounds at 1k): head 6.6 -> 6.9 ms on 4 cores, 5.9 -> 6.3 on 8. Kept as a probe; not a default.
 WRING = int(os.environ.get("LMHEAD_WRING", 0))
+# LMHEAD_SPLIT=S (OPEN-LMHEAD-Q6): S cores a column (rows 2 .. 1+S) instead of one. The column's shim stream carries
+# whole S-band sets in SPLIT ORDER -- per set, per chunk group, the S bands' call elements one after another, as the
+# host packs the pool (pools.cpp) -- into a memtile that splits each S-element object over the S cores, and the S
+# cores' band results join there into one object a set. The Q6 tile's dequant needs the cores; q8 keeps S = 1.
+SPLIT = int(os.environ.get("LMHEAD_SPLIT", 1))
+assert SPLIT in (1, 2, 4) and not (SPLIT > 1 and WRING), "LMHEAD_SPLIT: 1, 2 or 4 cores a column, no ring"
 assert WRING <= 24, "lm_head_q8: a memtile ring deeper than 24 does not fit one BD pool"
 
 
@@ -125,6 +134,10 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
             ExternalFunction("lm_head_prep2", source_file=str(HERE / "lm_head_prep2.cc"),
                              arg_types=[x_ty, tab_ty, np.int32], include_dirs=_include_dirs(), compile_flags=kflags))
 
+    if SPLIT > 1:
+        assert bands % SPLIT == 0, (bands, SPLIT)
+        return _split_program(n, n_cores, per_call, bands, n_groups, call_bytes, elem_ty, x_ty, tab_ty, acc_ty, w_ty,
+                              y_ty, xs_ty, kernel, prep)
     of_w = [ObjectFifo(elem_ty, name=f"w{c}", depth=2) for c in range(n_cores)]
     w_src = of_w
     if WRING:
@@ -196,10 +209,83 @@ def lm_head_q8(w: In, x: In, y: Out, *, n: CompileTime[int],
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
+def _split_program(n, n_cores, per_call, bands, n_groups, call_bytes, elem_ty, x_ty, tab_ty, acc_ty, w_ty, y_ty, xs_ty,
+                   kernel, prep):
+    S = SPLIT
+    sets = split_bands(bands // S, n_cores)            # S-band sets a column
+    elems_ty = np.ndarray[(S * call_bytes,), np.dtype[np.uint8]]
+    accs_ty = np.ndarray[(S * BAND_ROWS,), np.dtype[np.float32]]
+    of_wm = [ObjectFifo(elems_ty, name=f"wm{c}", depth=2) for c in range(n_cores)]
+    of_ym = [ObjectFifo(accs_ty, name=f"ym{c}", depth=2) for c in range(n_cores)]
+    of_x = ObjectFifo(x_ty, name="x", depth=1)
+    w_parts = [of_wm[c].cons().split([j * call_bytes for j in range(S)], tile=Tile(c, 1), depths=[2] * S,
+                                     obj_types=[elem_ty] * S, names=[f"w{c}_{j}" for j in range(S)])
+               for c in range(n_cores)]
+    y_parts = [of_ym[c].prod().join([j * BAND_ROWS for j in range(S)], tile=Tile(c, 1), depths=[2] * S,
+                                    obj_types=[acc_ty] * S, names=[f"y{c}_{j}" for j in range(S)])
+               for c in range(n_cores)]
+
+    def make_body(nb: int):
+        def core_body(win, xin, yout, tab, fprep, fn):
+            xe = xin.acquire(1)
+            fprep(xe, tab)
+            xin.release(1)
+            for _ in range_(nb):
+                ye = yout.acquire(1)
+                for g in range_(n_groups):
+                    we = win.acquire(1)
+                    fn(we, tab, ye, g)
+                    win.release(1)
+                yout.release(1)
+
+        def core_body2(win, xin, yout, tab, fprep, fn):
+            for t in range(2):
+                xe = xin.acquire(1)
+                fprep(xe, tab, t)
+                xin.release(1)
+            for _ in range_(nb):
+                ye = yout.acquire(2)
+                for g in range_(n_groups):
+                    we = win.acquire(1)
+                    fn(we, tab, ye[0], ye[1], g)
+                    win.release(1)
+                yout.release(2)
+        return core_body if RW == 1 else core_body2
+
+    workers = [Worker(make_body(sets[c]),
+                      fn_args=[w_parts[c][j].cons(), of_x.cons(), y_parts[c][j].prod(),
+                               Buffer(tab_ty, name=f"tab{c}_{j}"), prep, kernel],
+                      tile=Tile(c, 2 + j), stack_size=0x1000)
+               for c in range(n_cores) for j in range(S)]
+    set_bytes, set_rows = S * BAND_BYTES, S * BAND_ROWS
+    w_taps, y_taps, off = [], [], 0
+    for c in range(n_cores):
+        ns = sets[c]
+        w_taps.append(TensorAccessPattern((1, bands * BAND_BYTES), off * set_bytes, [1, 1, 1, ns * set_bytes],
+                                          [0, 0, 0, 1]))
+        y_taps.append(TensorAccessPattern((1, n), off * set_rows, [1, 1, 1, ns * set_rows], [0, 0, 0, 1])
+                      if RW == 1 else
+                      TensorAccessPattern((1, RW * n), off * set_rows, [1, ns, RW, set_rows], [0, set_rows, n, 1]))
+        off += ns
+
+    def sequence(a_w, a_x, c_y, w_prods, x_prod, y_conss):
+        tg = TaskGroup()
+        x_prod.fill(a_x, group=tg)
+        for c in range(n_cores):
+            w_prods[c].fill(a_w, tap=w_taps[c], group=tg)
+            y_conss[c].drain(c_y, tap=y_taps[c], wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(sequence, [w_ty, x_ty if RW == 1 else xs_ty, y_ty, [f.prod(tile=Tile(c, 0)) for c, f in enumerate(of_wm)],
+                            of_x.prod(), [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of_ym)]])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+
+
 DESIGN = lm_head_q8
 _src = (b"".join((HERE / f).read_bytes() for f in ("lm_head_q8.h", "lm_head_q8.cc"))
         + (GEMV / "gemv_tab.h").read_bytes() + f"K={K}".encode()
         + ((HERE.parent / "gptoss" / "gx_rows.h").read_bytes() + f"rows{RW}".encode() if RW > 1 else b""))
 SPECIALIZE = {"n": N, "n_cores": N_CORES, "per_call": PER_CALL,
-              "srchash": int(hashlib.sha1(_src + str(SCALES_F32).encode()
-                                          + (f"wring{WRING}".encode() if WRING else b"")).hexdigest()[:8], 16)}
+              "srchash": int(hashlib.sha1(_src + str(SCALES_F32).encode() + (b"q6" if Q6 else b"")
+                                          + (f"wring{WRING}".encode() if WRING else b"")
+                                          + (f"split{SPLIT}".encode() if SPLIT > 1 else b"")).hexdigest()[:8], 16)}

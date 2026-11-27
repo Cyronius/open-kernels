@@ -204,6 +204,18 @@
         "src/open_qwen36/block_host.cpp": "a6d04ae1f40b6d8e2b393a536dc8cc21203394ac639483a8205fc5ca36e4d40f",
         "src/open_qwen36/CMakeLists.txt": "1a155fa13c3e24dec7801733514f7428cbc60ecce933236fc3e5352222c244e8"
       }
+    },
+    {
+      "id": "qwen36moe-lmhead-q6",
+      "origin": "open-kernels: a GGUF's Q6_K head packed on its own codes (q35_lmhead6: 6784-B chunks of 32 rows x 256 k in split order for two cores a column) and run by the kernel set's lm_q6 / lmv_q6 kernels, chosen at load when the head tensor is Q6_K (OFLM_OPEN_LMHEAD_Q6=0 keeps the q8 head); manifest pack.lm_head_q6; a bit-exact pack test and the fixture's file count (OPEN-LMHEAD-Q6)",
+      "files": {
+        "src/open_qwen36/core.cpp": "76b507a5b80885916f67edd920a0d121d03e901ebe1c19dba76a968ee23c5a30",
+        "src/open_qwen36/manifest.cpp": "189c4f0ed26efd7253b2a562e449f61b028e8fafa42dd6f256962b03b64dda8d",
+        "src/open_qwen36/manifest.hpp": "b18868f5e6db3354d0764609ab7b46238bdbf4793785f0481e0aa3fcb6a2391d",
+        "src/open_qwen36/pools.cpp": "c1d810b9e94141c2352ac5650568cc7d94b14fe6019c3751ad79051b27ffe16a",
+        "src/open_qwen36/gguf_pack_test.cpp": "aa207aa23e1d0b20a8f1a122542f6b12c5bce394ea6188fff1c4d557601c015c",
+        "src/open_qwen36/manifest_test.cpp": "713adfa5a0e19523cd9557f02f8f82a5ac05afba06693183782e8e7b8aa729ae"
+      }
     }
   ]
 }

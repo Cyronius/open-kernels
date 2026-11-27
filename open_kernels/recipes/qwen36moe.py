@@ -94,7 +94,7 @@ def router_split(spec: ModelSpec | None = None) -> bool:
 
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
 # is unchanged. In the build key so a probe set never shares a key with a real one.
-_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX", "X_WUG", "QWEN36MOE_MB_NT")
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX", "X_WUG", "QWEN36MOE_MB_NT", "QWEN36MOE_LMHEAD_Q6", "QWEN36MOE_LMHEAD_Q6_SPLIT")
 
 
 def probe_env() -> dict[str, str]:
@@ -1968,9 +1968,33 @@ def gguf_view(spec: ModelSpec, base: dict) -> dict | None:
                         w["pack"] = [_gguf_op(spec, op) for op in w["pack"]]
     pk = g["pack"]
     pk["lm_head"]["ops"] = [_gguf_op(spec, op) for op in pk["lm_head"]["ops"]]
+    if lmhead_q6_on(spec):
+        # OPEN-LMHEAD-Q6: the engine takes this head in place of lm_head when the GGUF's head tensor is Q6_K
+        nch = spec.vocab // 32 * (spec.hidden // 256)      # chunks of 32 rows x 256 k
+        pk["lm_head_q6"] = {"pool_bytes": roundup(nch * LMHEAD_Q6_CHUNK, MB), "chunk_bytes": LMHEAD_Q6_CHUNK,
+                            "ops": [{"op": "q35_lmhead6", "tensor": GGUF_GLOBALS["lm_head.weight"], "dst": 0,
+                                     "in_dim": spec.hidden, "groups": LMHEAD_Q6_SPLIT, "width": LMHEAD_Q6_PER_CALL}]}
+        g["contexts"]["lm6"] = "lm_head_q6/final.xclbin"
+        g["kernels"]["lm_q6"] = {"context": "lm6", "insts": "lm_head_q6/insts.bin", "build": "lm_head_q6"}
+        if "lmv" in g["kernels"]:
+            g["contexts"]["lmv6"] = "lmv6/final.xclbin"
+            g["kernels"]["lmv_q6"] = {"context": "lmv6", "insts": "lmv6/insts.bin", "build": "lmv6"}
     pk["embed"]["tensor"] = GGUF_GLOBALS[pk["embed"]["tensor"]]
     pk["norm"]["tensor"] = GGUF_GLOBALS[pk["norm"]["tensor"]]
     return g
+
+
+# OPEN-LMHEAD-Q6: a GGUF's Q6_K head on its own codes (designs/lm_head_q8 LMHEAD_Q6, 6784-B chunks of 32 rows x 256 k),
+# two cores a column (LMHEAD_SPLIT: one core's dequant cannot keep up with the stream; four keep up too, but their
+# 32-core context costs ~1 ms more to enter), two chunks a call (lm_head_q8.py PER_CALL)
+LMHEAD_Q6_CHUNK, LMHEAD_Q6_PER_CALL = 6784, 2
+LMHEAD_Q6_SPLIT = int(os.environ.get("QWEN36MOE_LMHEAD_Q6_SPLIT", "2"))
+
+
+def lmhead_q6_on(spec: ModelSpec) -> bool:
+    """Whether the kernel set carries the Q6 head (QWEN36MOE_LMHEAD_Q6=0 at export leaves it out)."""
+    return (os.environ.get("QWEN36MOE_LMHEAD_Q6", "1") != "0" and spec.vocab % (128 * LMHEAD_Q6_SPLIT) == 0
+            and spec.hidden % 256 == 0 and not spec.hadamard)
 
 
 # GGUF projection types the q4_1 law holds with their codes kept (q35_put)
@@ -2074,6 +2098,14 @@ def builds(spec: ModelSpec, max_ctx: int = 4096) -> dict[str, dict]:
     b["lm_head_q8"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_full",
                        "env": {"LMHEAD_N": str(spec.vocab), "LMHEAD_K": str(spec.hidden),
                                "LMHEAD_CORES": str(LIMITS["n_cols"])}}
+    if lmhead_q6_on(spec):
+        # OPEN-LMHEAD-Q6: the head on a GGUF's Q6_K codes, LMHEAD_Q6_SPLIT cores a column (the GGUF view's lm_q6 / lmv_q6)
+        q6 = {"LMHEAD_Q6": "1", "LMHEAD_SPLIT": str(LMHEAD_Q6_SPLIT)}
+        b["lm_head_q6"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_q6",
+                           "env": {**b["lm_head_q8"]["env"], **q6}}
+        if "lmv" in b:
+            b["lmv6"] = {"design": "lm_head_q8/lm_head_q8.py", "build_dir": "lm_head_q8/build_q6_rows2",
+                         "env": {**b["lmv"]["env"], **q6}}
     if spec.quant == "q4_1":
         # The GGUF-direct twins: the same layer designs against the f32-scale pool
         # layout (the q4_1 codes with f32 block scales). The env says which variant

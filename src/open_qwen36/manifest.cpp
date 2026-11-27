@@ -116,7 +116,7 @@ PackOp parse_op(const json& j, const std::string& where) {
         p.op == "bfp16_dit" || p.op == "put" || p.op == "expert_down" || p.op == "expert_down_gguf" || p.op == "q35_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
         p.op == "transpose" || p.op == "transpose_banked" || p.op == "gx_q8" || p.op == "gx_down" ||
         p.op == "gx_down_mx4" || p.op == "gx_lmhead" || p.op == "gp_bfp16" ||
-        p.op == "q35_mat" || p.op == "q35_q8" || p.op == "q35_bf16" || p.op == "q35_lmhead" || p.op == "q35_t" ||
+        p.op == "q35_mat" || p.op == "q35_q8" || p.op == "q35_bf16" || p.op == "q35_lmhead" || p.op == "q35_lmhead6" || p.op == "q35_t" ||
         p.op == "q35_vec" || p.op == "q35_conv") {
         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
     } else if (p.op == "expert_stripes" || p.op == "expert_stripes_gguf" || p.op == "q35_stripes" || p.op == "gx_ug" || p.op == "gx_ug_mx4") {
@@ -145,6 +145,7 @@ PackOp parse_op(const json& j, const std::string& where) {
     else if (p.op == "q35_stripes") need_all({{"stripe_bytes", p.stripe_bytes}, {"stripes", p.stripes}, {"experts", p.experts}});
     else if (p.op == "q35_down") need_all({{"expert_bytes", p.expert_bytes}, {"experts", p.experts}});
     else if (p.op == "q35_lmhead") need_all({{"in_dim", p.in_dim}});
+    else if (p.op == "q35_lmhead6") need_all({{"in_dim", p.in_dim}, {"groups", p.groups}, {"width", p.width}});
     else if (p.op == "q35_t") need_all({{"rows", p.rows}, {"cols", p.cols}});
     else if (p.op == "q35_vec") need_all({{"cap", p.cap}, {"elem", p.elem}});
     else if (p.op == "q35_conv") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
@@ -1048,6 +1049,15 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     m.norm_bytes = get<size_t>(need(pack, "norm", where), "bytes", where + " pack.norm");
     for (const auto& o : need(need(pack, "lm_head", where), "ops", where + " pack.lm_head")) m.lmhead_ops.push_back(parse_op(o, where + " pack.lm_head"));
     if (m.lmhead_ops.empty()) fail(where, "pack.lm_head has no ops");
+    if (pack.contains("lm_head_q6")) {
+        const auto& q6 = pack["lm_head_q6"];
+        for (const auto& o : need(q6, "ops", where + " pack.lm_head_q6"))
+            m.lmhead_q6_ops.push_back(parse_op(o, where + " pack.lm_head_q6"));
+        m.lmhead_q6_pool_bytes = get<size_t>(q6, "pool_bytes", where + " pack.lm_head_q6");
+        m.lmhead_q6_chunk_bytes = get<size_t>(q6, "chunk_bytes", where + " pack.lm_head_q6");
+        if (m.lmhead_q6_ops.empty()) fail(where, "pack.lm_head_q6 has no ops");
+        if (!m.kernels.count("lm_q6")) fail(where, "pack.lm_head_q6 without an lm_q6 kernel");
+    }
     m.hf_config_check = need(j, "hf_config_check", where);
     if (j.contains("hf_config_defaults")) {
         if (!j["hf_config_defaults"].is_object()) fail(where, "hf_config_defaults is not an object");
