@@ -1797,7 +1797,12 @@ The head cannot join the layer image: every shim tile's two input channels alrea
 main cores have 128 B of program memory left. With OPEN-DECODE-STREAM-UG the step is 72.4-72.8 ms (CLEAN, 2026-11-26). Issuing each DeltaNet round as soon as its glue tile's
 records are in DDR (glue value tile h holds exactly round h's eight records), with the next tile queued, instead of
 after the whole glue: `lx0` 1.125-1.131 against 1.125-1.130 ms, step 72.7-72.9 against 72.7-72.8 (CLEAN, three
-alternating rounds, tokens identical) -- the glue's tail is not on `lx0`'s critical path; not kept. A 24-deep weight ring (`UX_WRING=24`) steps in 73.9 / 73.7 ms against
+alternating rounds, tokens identical) -- the glue's tail is not on `lx0`'s critical path; not kept. Transfers a dispatch issues (BD writes in the instruction
+streams of `kernels-fa262k`): `lx0` 234, `lx1` / `ax1` 233, `ax0` 107, `lm` 17. At ~0.7 us an issue that is a 0.16 ms
+floor for `lx0` against 1.125 ms, and `lx1` issues as many transfers for a third of the bytes in 0.372 ms: the issue
+rate alone does not bound either; what is left is waits between dependent stages (the hidden's round trip, the
+glue / DeltaNet / post hand-offs through DDR), which only an on-chip hand-off (memtile join and broadcast) removes, and
+the main cores' two input channels are both taken. A 24-deep weight ring (`UX_WRING=24`) steps in 73.9 / 73.7 ms against
 74.1 / 74.2 (noise; `lx0` 1.115 either way): the ring's depth is not what holds the linear front at 43 GB/s. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
