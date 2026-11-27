@@ -1825,6 +1825,12 @@ Probe for lever (2), 2026-11-27 (a temporary env sleep before each step, 0 again
 a loaded box, tokens identical): `lx0` after the head 3.18-3.33 ms mean either way against 1.38-1.41 for the other
 29: an idle NPU does not switch back by itself; the switch is paid when the next layer-context dispatch arrives, so
 only a dispatch queued behind the head (the empty stream) can move it under the host's time.
+Lever (2) measured, 2026-11-27: a hand-made empty instruction stream (`lxsw`, a transaction header with no ops) on
+the layer context, started right after the head and waited at the next step's entry (a probe kernel set and an
+env-gated engine change, both removed): `lx0` after the head drops to the plain 1.14-1.40 ms, but the host now
+blocks on `lxsw` instead, and the step stays where it was (70.1 against 70.2 ms on the quietest round, 87.8 against
+88.1 on a loaded one; three alternating rounds, tokens identical). The host's time between the head and the next
+step is too short to hide a 1.5-2 ms switch: lever (2) is rejected; lever (1) (about 0.1-0.2 ms) stays untried.
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
