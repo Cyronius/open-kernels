@@ -57,13 +57,18 @@ show each of these items with measurements:
 - Benchmarks are recorded: `oflm bench` or `phlegm bench` results (prefill and decode against
   context length, with the machine and stack named) on the model's page in
   `docs/docs/benchmarks/`, and a row in the README's "Recommended models"
-  table.
+  table. A development build counts for the bar (`phlegm bench --development`,
+  or `oflm bench` from a branch); say which build ran.
 - Most of the model's own features are exposed: its vision and audio towers,
   MTP heads (as the drafter), reasoning and tool calling, and for image models
   every supported resolution and image editing. Name each feature left out
   and the reason.
 
 If an item is not done, the PR stays a draft and lists the item.
+
+Reaching the bar is not a release. Release steps (benchmarks on a tagged Phlegm
+or OFLM build, published release notes) happen when a release is cut, and are
+not open items of the bar.
 
 Track each top-tier model's progress (OFLM #240) in `RECOMMENDED_MODELS.md`.
 
