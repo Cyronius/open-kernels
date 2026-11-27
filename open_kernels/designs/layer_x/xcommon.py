@@ -585,7 +585,7 @@ def moe_body(win, ain, yout, B, K, nx=NX):
 
 def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
                  A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False, ug_bd=False,
-                 xres_t=HID, xres_off=0, slot0=0):
+                 xres_t=HID, xres_off=0, slot0=0, early_ug=False):
     """Host sequence of the MoE block (one instruction-stream part). Routed slot j's fills carry
     placeholder pool offsets (expert j); moeroute2 rewrites them from the router output.
     nx must match the body's: NE drops the shared expert's fills with its slot.
@@ -602,14 +602,21 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
     slot (the stream issues ~0.7 us a transfer). moeroute2 patches the transfer's base, which is
     the up half's offset as before.
 
-    slot0 (vlx.py, two rows): routed slot e compiles as placeholder expert slot0 + e, so moeroute2 tells the rows apart."""
+    slot0 (vlx.py, two rows): routed slot e compiles as placeholder expert slot0 + e, so moeroute2 tells the rows apart.
+
+    early_ug (X_WUG, with early_down): slot e+1's up | gate fills are issued before the wait on slot e's hidden
+    as well, so the weight channels keep moving through the hidden's DDR round trip instead of idling once
+    slot e's down slice is queued. Each channel still carries up, gate, down, up, ... in the core's order; the
+    throttle's wait before slot e+1's up | gate is on slot e-1's down, whose hidden went out a slot earlier."""
     spp, cps = C.STRIPES_PER_PROJ, C.CORES_PER_STRIPE
     pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, ELEM))
     for c in range(N_CORES):
         pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_ROUT, CALL_BYTES))
         pipe_w.fill(w_prods[c], a_consts, bt(C_BYTES, C_SGW, CALL_BYTES))
         pipe_w.fill(w_prods[c], a_act, bt(A_BYTES, A_RES + c * ROWS_PC * 4, CALL_BYTES))
-    for e in range(nx):
+    assert not early_ug or early_down, "early_ug queues up | gate behind the early down fills"
+
+    def ug_fills(e):
         for c in range(N_CORES):
             if e < NE:
                 up = (2 * spp * (slot0 + e) + 2 * (c // cps)) * STRIPE + (c % cps) * PAIR
@@ -627,7 +634,19 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
             else:
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_UP + c * HALF, HALF))
                 pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_GATE + c * HALF, HALF))
+            if not early_ug:
+                pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
+
+    def y_drains():
+        for c in range(N_CORES):
             pipe_y.drain(y_conss[c], a_act, bt(A_BYTES, A_HP + c * HID_PC * 4, HID_PC * 4))
+
+    if early_ug:
+        ug_fills(0)
+        y_drains()
+    for e in range(nx):
+        if not early_ug:
+            ug_fills(e)
 
         def down_fills():
             for c in range(N_CORES):
@@ -639,8 +658,12 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
                                                        DOWN_PER_CORE * DOWN_BAND))
         if early_down:
             down_fills()
+        if early_ug and e + 1 < nx:
+            ug_fills(e + 1)
         pipe_y.finish(*y_conss)                           # the hidden parts are in DDR
         pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_HP, ELEM))
+        if early_ug and e + 1 < nx:
+            y_drains()
         if not early_down:
             down_fills()
     for c in range(N_CORES):

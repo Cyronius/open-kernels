@@ -94,7 +94,7 @@ def router_split(spec: ModelSpec | None = None) -> bool:
 
 # Timing-only ablations of the layer_x main cores (xcommon.py): outputs are garbage, the DMA
 # is unchanged. In the build key so a probe set never shares a key with a real one.
-_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX", "QWEN36MOE_MB_NT")
+_LAYER_PROBE_VARS = ("UX_WRING", "UX_WORDER", "UX_RSPLIT", "UX_SEQ", "LX_NULL_GEMV", "LX_NULL_DN", "X_WRING", "X_WORDER", "X_SEQ", "X_SEQ_FULL", "X_WRING_AX", "X_WUG", "QWEN36MOE_MB_NT")
 
 
 def probe_env() -> dict[str, str]:

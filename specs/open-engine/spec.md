@@ -1781,7 +1781,7 @@ measure unit, `OFLM_OPEN_STEP_TRACE=1`, 63 steps; bytes from the manifest's stre
 |---|---|---|---|---|---|
 | `lx0` (q8 projections, conv, DeltaNet, router) | 30 | 1.126 | 48.6 | 43 GB/s | the stream's issue rate and its waits on the conv glue and DeltaNet; the main core has 128 B of program memory free |
 | `ax0` (q8 projections, attention, router) | 10 | 0.868 | 33.7 | 39 GB/s | as `lx0`; past 32k the attention walk dominates (compute-bound, 0.37 us a row a full layer) |
-| `lx1` / `ax1` (8 routed experts) | 40 | 0.407 | 15.3 | 38 GB/s | per expert the hidden makes a DDR round trip between up / gate and down (early down fills already queue the down weights behind it) |
+| `lx1` / `ax1` (8 routed experts) | 40 | 0.372 | 15.3 | 41 GB/s | per expert the hidden makes a DDR round trip between up / gate and down; the down and the next up / gate fills now stream through it (OPEN-DECODE-STREAM-UG, 0.407 before) |
 | `lm` (q8 head) | 1 | 10.21 | 516 | 51 GB/s | at its floor |
 | `ln` + the two context changes of the tail | 1 | 0.20 | | | `lx0` after `lm` costs 2.75 ms against 1.15 in place: about 1.6 ms a step |
 | host | | 0.1 | | | router read and patch; the q8 shared expert overlaps the MoE dispatch |
@@ -1794,7 +1794,7 @@ tail's two context changes -- not the cores. The tail's switches, measured: `lm`
 10.12-10.21 in the step, `ln` 0.074 against 0.18-0.20, and `lx0` after `lm` 2.73 against 1.13: about 2.2 ms a step.
 The head cannot join the layer image: every shim tile's two input channels already carry the layer image's streams
 (eight weight fifos plus x, the norm helper, the glue, post, attention and the router's second channel), and the
-main cores have 128 B of program memory left. A 24-deep weight ring (`UX_WRING=24`) steps in 73.9 / 73.7 ms against
+main cores have 128 B of program memory left. With OPEN-DECODE-STREAM-UG the step is 72.4-72.8 ms (CLEAN, 2026-11-26). A 24-deep weight ring (`UX_WRING=24`) steps in 73.9 / 73.7 ms against
 74.1 / 74.2 (noise; `lx0` 1.115 either way): the ring's depth is not what holds the linear front at 43 GB/s. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
@@ -9691,6 +9691,42 @@ takes 0.36 ms longer with it (with either issue order), so the attention images 
 1 ms only: `lx0` entered from `ax` costs 2.35 ms against 1.14 ms in place, and with `ax0`, `ln` and `lm` the context
 switches are about 20 ms of the 93 ms step (OPEN-FAMILY-QWEN36MOE-GGUF "What is left"). The MTP cycle is unchanged
 (verify pass 142.3 against 142.6 ms).
+
+### OPEN-DECODE-STREAM-UG: a MoE part's next up | gate fills go out ahead of the wait on the hidden
+**Applies to:** `open_kernels/designs/layer_x/xcommon.py` (`moe_sequence` `early_ug`), `xlayer.py` (`X_WUG`), `ux.py`,
+`vux.py`, `lx.py`, `ax.py`, `vlx.py`, `vax.py`, `open_kernels/recipes/qwen36moe.py` (`probe_env`)
+**Verification:** manual (the NPU and the model)
+
+With the down fills issued early (`X_WORDER`), a routed slot's sequence still stopped on the wait for the slot's hidden
+(each core's rows to DDR, then the whole hidden back to every core) before it issued the next slot's up | gate fills, so
+once slot e's down slice was queued the weight channels idled for the rest of the round trip. With `X_WUG` (default 1,
+with `X_WORDER`) slot e+1's up | gate fills are issued before that wait and slot e+1's hidden drains after it. Each
+channel carries the same bytes in the same order (up | gate, down, up | gate, ...); the throttle's wait in front of slot
+e+1's up | gate is on slot e-1's down, whose hidden was sent a slot earlier, so the stream cannot wait on itself. The
+main-core programs are unchanged; `X_WUG=0` at export builds the images as before.
+
+**Acceptance criteria:**
+- Program memory as before.
+- Against the previous set: prefill and greedy decode logits byte-identical; `--verify-check` PASS; `--spec-mtp` SPEC
+  IDENTICAL.
+- Decode timed against the previous set, alternating.
+
+**Result 2026-11-26 (Strix Halo, Default power mode; `kernels-wug` = the full set exported with `X_WUG=1`).** Gates:
+prefill logits and 31 greedy steps of the 24-token prompt, 56 dump files byte-identical to `kernels-fa262k`;
+`--verify-check 6` PASS (0 of 248,320 logits differ); `--spec-mtp 96` SPEC IDENTICAL. Program memory unchanged (`lx`
+16,256 B of 16,384, `vlx` / `vax` 15,920). Decode, 48 tokens after the 24-token prompt, step-trace minima over three
+alternating rounds (two NOISY measure units: another process at up to 15 cores):
+
+| set | lx1 | ax1 | lx0 | ax0 |
+|---|---|---|---|---|
+| before | 0.410-0.412 | 0.410-0.413 | 1.124-1.130 | 0.866-0.868 |
+| `X_WUG=1` | 0.373-0.377 | 0.373-0.376 | 1.126-1.131 | 0.856-0.874 |
+| `X_WUG=1`, ring 24 | 0.371-0.373 | 0.373-0.375 | 1.114-1.117 | 0.852-0.854 |
+
+The MoE parts are 9 % shorter (40 a step, about 1.5 ms); a 24-deep ring adds nothing measurable, so the ring stays at
+16. The step, timed in a CLEAN measure unit (three alternating rounds, the same 48 tokens): 74.3 / 74.3 / 74.1 ms
+before, 72.8 / 72.8 / 72.4 with `X_WUG` (`lx1` 0.369-0.372 against 0.407-0.410, `ax1` 0.372-0.374 against 0.410):
+1.6 ms a step, 2 %.
 
 ### OPEN-DECODE-ONE-CONTEXT-Q8: a q8-projection MoE decode token and its verify pass each run in one hardware context
 **Applies to:** `open_kernels/designs/layer_x/ux.py` (`ALL_Q8`), `vux.py`, `open_kernels/recipes/qwen36moe.py`

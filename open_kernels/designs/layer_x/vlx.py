@@ -219,7 +219,7 @@ def vlx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Co
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod,
                            y_conss, ACT_T, C_BYTES, r * A_BYTES + A_XM, r * A_BYTES + A_ROUT, r * A_BYTES + A_RES,
                            r * A_BYTES + A_HP, C_SGW, nx=X.NX_DECODE, xres_t=XRES_T, xres_off=r * HID,
-                           slot0=r * X.NE, early_down=XL.X_WORDER, ug_bd=XL.X_SEQ)
+                           slot0=r * X.NE, early_down=XL.X_WORDER, ug_bd=XL.X_SEQ, early_ug=XL.X_WORDER and XL.X_WUG)
 
     def sequence(a_pool, c_xres, a_consts, a_state, a_act, lni, lno, w_prods, x_prod, y_conss,
                  side_p, gact_p, gout_c, pin_p, pout_c):

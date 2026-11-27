@@ -264,7 +264,8 @@ def lx(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, *, part: Com
             # 8. the MoE block (moeroute2 has pointed the routed slots' fills at the router's choice)
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
                            A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=X.NX_DECODE,
-                           early_down=XL.X_WORDER and not DENSE, ug_bd=XL.X_SEQ and not DENSE)
+                           early_down=XL.X_WORDER and not DENSE, ug_bd=XL.X_SEQ and not DENSE,
+                           early_ug=XL.X_WORDER and XL.X_WUG and not DENSE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),

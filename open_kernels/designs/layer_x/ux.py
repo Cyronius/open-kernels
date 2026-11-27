@@ -303,14 +303,14 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         elif part == 1:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, A_XM, A_ROUT, A_RES, A_HP, C_SGW,
-                           early_down=WORDER, ug_bd=SEQ, nx=X.NX_DECODE)
+                           early_down=WORDER, ug_bd=SEQ, nx=X.NX_DECODE, early_ug=WORDER and XL.X_WUG)
         elif part == 2:
             full_sequence(a_pool, c_xres, a_consts, a_state, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                           ain_p, aout_c, og_cs, rin_p)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW,
-                           early_down=WORDER, ug_bd=SEQ, nx=X.NX_DECODE)
+                           early_down=WORDER, ug_bd=SEQ, nx=X.NX_DECODE, early_ug=WORDER and XL.X_WUG)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
@@ -337,4 +337,6 @@ _src = b"".join(sorted(f.read_bytes() for f in HERE.glob("*.cc")) + sorted(f.rea
                    (HERE.parent.parent / "include" / "vecmath.h").read_bytes(), (HERE.parent.parent / "include" / "scalar_fp.h").read_bytes(), SPEC.spec_hash().encode()])
 if WRING or WORDER or RSPLIT or SEQ:   # a probe build never shares a jit key with the plain image
     _src += f"WRING={WRING} WORDER={int(WORDER)} RSPLIT={int(RSPLIT)} SEQ={int(SEQ)}".encode()
+if XL.X_WUG:
+    _src += b" WUG=1"
 SPECIALIZE = {"part": PART, "srchash": int(hashlib.sha1(_src).hexdigest()[:8], 16)}

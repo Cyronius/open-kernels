@@ -72,6 +72,7 @@ YB = X.BAND_ROWS * 4                          # one band's y bytes
 # X_WRING=0 / X_WORDER=0 at export build the images as before (both in the build key, recipe probe_env).
 X_WRING = int(os.environ.get("X_WRING", "16"))
 X_WORDER = os.environ.get("X_WORDER", "1") == "1"
+X_WUG = os.environ.get("X_WUG", "1") == "1"   # slot e+1's up | gate fills ahead of slot e's hidden wait (moe_sequence early_ug)
 X_SEQ = os.environ.get("X_SEQ", "1") == "1"   # a routed slot's up | gate halves as one transfer (moe_sequence ug_bd)
 # ax part 0 in full_sequence_seq's order: measured slower on the q8 attention front (ax0 1.81 -> 2.18 ms), so off
 X_SEQ_FULL = os.environ.get("X_SEQ_FULL", "0") == "1"
