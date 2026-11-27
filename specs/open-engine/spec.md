@@ -1821,6 +1821,10 @@ context overlaps the host's logit read, sampling and embedding (at most that hos
 box). A bit-exact host final norm is not one of them: `ln_fn` sums hi/lo bf16 products on the accumulator and uses
 `srsqrt`, so a host copy would part from the NPU's `hn` in the last bits and need the KL gate for 0.2 ms. The 1.4 /
 1.6 ms entries themselves only go away with the head inside the layer image, which the shim budget above rules out.
+Probe for lever (2), 2026-11-27 (a temporary env sleep before each step, 0 against 3 ms, two alternating rounds on
+a loaded box, tokens identical): `lx0` after the head 3.18-3.33 ms mean either way against 1.38-1.41 for the other
+29: an idle NPU does not switch back by itself; the switch is paid when the next layer-context dispatch arrives, so
+only a dispatch queued behind the head (the empty stream) can move it under the host's time.
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
