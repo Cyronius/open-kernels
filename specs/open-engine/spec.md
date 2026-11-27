@@ -1811,6 +1811,17 @@ the main cores' two input channels are both taken. A 24-deep weight ring (`UX_WR
 74.1 / 74.2 (noise; `lx0` 1.115 either way): the ring's depth is not what holds the linear front at 43 GB/s. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
 
+The tail with the Q6 head (2026-11-27, from the step traces above; inferred, not built): `ln` 0.18-0.20 ms in a step
+against 0.074 in place, the Q6 head 8.9-9.0 against 7.54 (its 16-core context is bigger to enter than `ln`'s), `lx0`
+after the head about 1.6 ms over its in-place time: about 3.1 ms a step of context entry, the largest single named
+remainder after the linear front. Two levers are left, both small: (1) the final norm as a first stream on the head's
+image (a free tile in rows 4-5), which removes the `ln` context and one host round trip (about 0.1-0.2 ms); (2) an
+empty fifth instruction stream on the layer image, queued right behind the head, so the switch back to the layer
+context overlaps the host's logit read, sampling and embedding (at most that host time, about 0.3-0.5 ms on a quiet
+box). A bit-exact host final norm is not one of them: `ln_fn` sums hi/lo bf16 products on the accumulator and uses
+`srsqrt`, so a host copy would part from the NPU's `hn` in the last bits and need the KL gate for 0.2 ms. The 1.4 /
+1.6 ms entries themselves only go away with the head inside the layer image, which the shim budget above rules out.
+
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
 sub-tiles, `moe_batch.h`), the DeltaNet conv and delta rule on the host 0.77 ms (the NPU kernel for them is not
