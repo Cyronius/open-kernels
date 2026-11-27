@@ -669,3 +669,9 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
 - 2026-11-26 15:44, measure unit after OPEN-MOE-DQBUF: prefill 227 / 280 / 315 / 334 tok/s, decode 13.3 / 13.0 / 12.4 /
   11.3 tok/s at 512 / 1k / 2k / 4k (`bench/phlegm_bench_measure_1544.json`); 8k CLI prefill 2.99 ms a token. Vision
   tower 2.2 s for 3,200 patches on the quiet box (AVX-512 BF16 linears tried: no faster, 2 % less exact, dropped).
+- 2026-11-27, OPEN-DECODE-STREAM-UG + OPEN-LMHEAD-Q6 exported (`kernels-fa262k`): decode 71.3 ms a step (72.2-72.4 with
+  `OFLM_OPEN_LMHEAD_Q6=0`). Measure unit (NOISY only for another session's one-core wait loop): prefill 223 / 277 / 313
+  / 332 tok/s, decode 13.5 / 13.1 / 12.5 / 11.4 tok/s at 512 / 1k / 2k / 4k (`bench/phlegm_bench_measure_q6.json`,
+  sha256 69689673697316fb...). The unit before it, with a 30-core process alongside, is kept as
+  `phlegm_bench_q6_NOISY.json` and not used. MemDraft (the Qwen3.5-9B code table) as the draft source: 35 % of
+  one-token drafts taken against MTP's 90 %, 0.95-1.05x against MTP's 1.20x on a loaded box; MTP stays the drafter.
