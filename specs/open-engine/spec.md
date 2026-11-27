@@ -9792,6 +9792,11 @@ In place the Q6 head reads 421 MB at 56 GB/s. Four cores a column lose the gain 
 against 72.8-73.1, CLEAN, three alternating rounds); two cores a column keep about 1.1-1.3 ms of it (one NOISY unit:
 another process at up to 16 cores for 107 s).
 
+Exported set, 2026-11-27 (`kernels-fa262k` as shipped, `OFLM_OPEN_LMHEAD_Q6` 0 / 1 alternating, three rounds, 48
+tokens of the 24-token prompt; one `--measure` unit, NOISY only for one bash process at one core for 71 s): the step
+71.3 ms with the Q6 head in every round against 72.2-72.4 ms with the q8 head; the `lm` row 8.87-9.05 against
+10.23-10.36. Each head's tokens the same in every round (c5c9f2ad Q6, f0b34bc4 q8).
+
 ### OPEN-DECODE-ONE-CONTEXT-Q8: a q8-projection MoE decode token and its verify pass each run in one hardware context
 **Applies to:** `open_kernels/designs/layer_x/ux.py` (`ALL_Q8`), `vux.py`, `open_kernels/recipes/qwen36moe.py`
 (`merged_image`, `merged_verify`, `STREAM_MEASURED_KERNELS`)
