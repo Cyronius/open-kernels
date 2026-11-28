@@ -20,7 +20,11 @@ def _view():
 
 def test_view_is_the_q4_1_manifest_with_gguf_pack_ops():
     m, g = _view()
-    assert g["layout"] == m["layout"] and g["kernels"] == m["kernels"] and g["contexts"] == m["contexts"]
+    # OPEN-LMHEAD-Q6: the view adds the Q6_K head's kernels and contexts, nothing else
+    q6k, q6c = {"lm_q6", "lmv_q6"}, {"lm6", "lmv6"}
+    assert g["layout"] == m["layout"]
+    assert {k: v for k, v in g["kernels"].items() if k not in q6k} == m["kernels"]
+    assert {k: v for k, v in g["contexts"].items() if k not in q6c} == m["contexts"]
     assert g["spec_hash"] == m["spec_hash"] and g["pack"]["chunk_bytes"] == 5120 == m["pack"]["chunk_bytes"]
     for name, lt in g["layer_types"].items():
         base = m["layer_types"][name]
@@ -49,6 +53,20 @@ def test_view_is_the_q4_1_manifest_with_gguf_pack_ops():
     assert g["pack"]["norm"]["tensor"] == "output_norm.weight"
     assert g["pack"]["lm_head"]["ops"][0]["op"] == "q35_lmhead"
     assert "gguf" not in g
+
+
+def test_view_carries_the_q6_head():
+    """OPEN-LMHEAD-Q6: the GGUF view's alternative head -- the Q6_K codes in 6784-B chunks, two cores a column --
+    with its own kernels; the base (container) view has none."""
+    m, g = _view()
+    q6 = g["pack"]["lm_head_q6"]
+    op = q6["ops"][0]
+    assert op == {"op": "q35_lmhead6", "tensor": "output.weight", "dst": 0, "in_dim": 2048, "groups": 2, "width": 2}
+    nch = 248320 // 32 * (2048 // 256)
+    assert q6["chunk_bytes"] == 6784 and nch * 6784 <= q6["pool_bytes"] < nch * 6784 + (1 << 20)
+    assert g["kernels"]["lm_q6"] == {"context": "lm6", "insts": "lm_head_q6/insts.bin", "build": "lm_head_q6"}
+    assert g["contexts"]["lm6"] == "lm_head_q6/final.xclbin"
+    assert "lm_head_q6" not in m["pack"] and "lm_q6" not in m["kernels"]
 
 
 def test_q_gate_split_and_value_head_untile_fields():

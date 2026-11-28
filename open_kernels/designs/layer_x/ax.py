@@ -212,7 +212,8 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
                            AA_BYTES, CA_BYTES, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW, nx=X.NX_DECODE,
-                           early_down=XL.X_WORDER and not DENSE, ug_bd=XL.X_SEQ and not DENSE)
+                           early_down=XL.X_WORDER and not DENSE, ug_bd=XL.X_SEQ and not DENSE,
+                           early_ug=XL.X_WORDER and XL.X_WUG and not DENSE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),

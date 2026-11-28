@@ -1888,6 +1888,51 @@ static void apply_op(const PackOp& op, const WeightFile& m, int layer, uint8_t* 
                 }
             }
         }
+    } else if (op.op == "q35_lmhead6") {
+        // OPEN-LMHEAD-Q6: a Q6_K head, [vocab, hidden], kept at its own codes in lm_head_q8.h's LMHEAD_Q6 chunks
+        // (32 rows x 256 k, 6784 B: d f32[32], sc int8[16][32], low nibbles [2][32][64], top bits [2][32][32]),
+        // in SPLIT ORDER for `groups` (S) cores a column taking `width` (P) chunks a call: per S-band set, per
+        // chunk group, the S bands' P chunks. Every value is the GGUF's d * sc * (code - 32), bit for bit.
+        const std::string name = with_layer(op.tensor, layer);
+        const Q35Tensor t = q35_tensor(m, name, 0);
+        const size_t S = op.groups, P = op.width, nk = op.in_dim / 256, per_band = 4 * nk;
+        if (t.type != GgufFile::Type::Q6_K) fail("q35_lmhead6 " + name + " is not Q6_K");
+        if (t.cols != op.in_dim || op.in_dim % 256 || t.rows % (128 * S) || !S || !P || per_band % P)
+            fail("q35_lmhead6 " + name + ": [" + std::to_string(t.rows) + ", " + std::to_string(t.cols) + "] vs in_dim " +
+                 std::to_string(op.in_dim) + ", split " + std::to_string(S) + ", per call " + std::to_string(P));
+        constexpr size_t Q6C = 6784;
+        const size_t nch = t.rows / 32 * nk;
+        bounds(op, nch * Q6C, dst_bytes);
+#pragma omp parallel for schedule(dynamic)
+        for (long long kk = 0; kk < static_cast<long long>(nch); ++kk) {
+            // pool chunk kk -> (set, group, band in the set, chunk in the call) -> (band, chunk in the band)
+            const size_t k = static_cast<size_t>(kk), set = k / (S * per_band), in_set = k % (S * per_band);
+            const size_t g = in_set / (S * P), j = in_set % (S * P) / P, i = in_set % P;
+            const size_t band = set * S + j, cb = g * P + i, rb = 4 * band + cb % 4, kt = cb / 4;
+            uint8_t* c = dst + op.dst + k * Q6C;
+            std::memset(c + 640, 0, Q6C - 640);
+            for (unsigned r = 0; r < 32; ++r) {
+                const uint8_t* B = t.row(0, 32 * rb + r) + kt * 210;     // ql[128] qh[64] sc[16] d(f16)
+                uint16_t h;
+                std::memcpy(&h, B + 208, 2);
+                const float d = fp16_to_f32(h);
+                std::memcpy(c + 4 * r, &d, 4);
+                for (unsigned gg = 0; gg < 16; ++gg) c[128 + gg * 32 + r] = B[192 + gg];
+                const unsigned half = r / 16, rl = r % 16;
+                for (unsigned v = 0; v < 256; ++v) {
+                    const unsigned hv = v / 128, w = v % 128, qt = w / 32, l = w % 32;
+                    const uint8_t qlb = B[hv * 64 + l + (qt & 1) * 32];
+                    const unsigned code = ((qt < 2 ? qlb & 15u : qlb >> 4) | (((B[128 + hv * 32 + l] >> (2 * qt)) & 3u) << 4));
+                    // the code's place: block (kb, oc) of 8 k x 16 rows, code index (k % 8) * 16 + rl in it
+                    const unsigned kb = v / 32, oc = (v % 32) / 8, ci = (v % 8) * 16 + rl, blk = kb * 4 + oc;
+                    uint8_t* lo = c + 640 + half * 2048 + blk * 64;
+                    uint8_t* hi = c + 4736 + half * 1024 + blk * 32;
+                    if (ci < 64) lo[ci] |= static_cast<uint8_t>(code & 15u);
+                    else lo[ci - 64] |= static_cast<uint8_t>((code & 15u) << 4);
+                    hi[ci % 32] |= static_cast<uint8_t>((code >> 4) << (2 * (ci / 32)));
+                }
+            }
+        }
     } else if (op.op == "q35_t" || op.op == "q35_vec" || op.op == "q35_conv") {
         // the small consts: bf16 (q35_t, q35_conv, q35_vec elem 2) or f32 (q35_vec elem 4)
         const std::vector<float> v = q35_values(op, m, layer);

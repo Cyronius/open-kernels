@@ -360,9 +360,14 @@ int main(int argc, char** argv) {
           m.globals.at("gemm_x_k2048") == 2048 * 256 * 2 && m.globals.at("gemm_y_n12288") == 12288 * 256 * 4 &&
           m.globals.at("gemm_x_k512") == 512 * 256 * 2 && m.globals.at("gemm_y_n1024") == 1024 * 256 * 4,
           "route contexts, kernels and globals");
-    check(m.files().size() == 76, "76 files named (9 xclbin + 67 insts: the route adds one GEMM context whatever K, the MoE one, seven "
+    check(m.files().size() == 78, "78 files named (10 xclbin + 68 insts: the route adds one GEMM context whatever K, the MoE one, seven "
                                   "streams, the token-batched expert kernel one context and six streams, the attention GEMM one "
-                                  "context and 32 streams, and attn_fa256 one context and 16 streams)");
+                                  "context and 32 streams, and attn_fa256 one context and 16 streams; the GGUF view's Q6_K head "
+                                  "one context and one stream, OPEN-LMHEAD-Q6)");
+    check(m.gguf && m.gguf->lmhead_q6_ops.size() == 1 && m.gguf->lmhead_q6_ops[0].op == "q35_lmhead6" &&
+          m.gguf->lmhead_q6_ops[0].groups == 2 && m.gguf->lmhead_q6_ops[0].width == 2 &&
+          m.gguf->lmhead_q6_chunk_bytes == 6784 && m.gguf->kernels.at("lm_q6").context == "lm6" && m.lmhead_q6_ops.empty(),
+          "the GGUF view's Q6_K head (pack.lm_head_q6, lm_q6); the container view has none");
     // the attention products on the NPU (OPEN-PREFILL-ATTN): a stream per 256 rows of window, both
     // products, on one xclbin; full attention only
     const auto& ab = fg.attn_block;

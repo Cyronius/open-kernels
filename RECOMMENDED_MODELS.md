@@ -21,7 +21,7 @@ Update this file in the same commit as the evidence. Each model's full audit is 
 | Gemma 4 E2B / E4B | done for E4B text (#238); E2B not rerun | open (unprofiled; prefill fell 85 to 62 tok/s) | open (32k once, not repeated) | open (towers refused) | open (Unsloth MTP, prompt lookup) | open (Google QAT Q4_0; Unsloth reason to record) | [planned](specs/open-engine/plans/gemma4e-production-bar.md); vision, video, audio not open |
 | BERT embeddings (bge x3, minilm, nomic, gte) | ? | ? | ? | ? | n/a | ? | not started |
 | whisper-v3:turbo | ? | ? | ? | open (decoder on host) | ? | ? | not started |
-| qwen3.6-moe:35b-a3b | done (layer-major block route; image prompts too) | done (decode 73 ms a step, 1.30x its 56 ms stream floor, on one context; prefill 334 tok/s at 8k: experts at 16 tokens a visit, MoE pipelined, DeltaNet fused, `attn_fa256`) | done (needle at 262,000, also through `phlegm serve` in 36 min; `attn_fa256` 6x at 262k) | done (host stages named; vision tower on the host) | done (MTP head + two-row verify, exact; 1.24-1.40x Strix Point; on Strix Halo's faster one-context decode 1.05x on code, cost-aware fallback elsewhere) | done (Unsloth UD-Q4_K_S, q8 projections kept) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-QWEN36MOE-GGUF); benches are development runs |
+| qwen3.6-moe:35b-a3b | done (layer-major block route; image prompts too) | done (decode 71.3 ms a step, 1.27x its 56 ms stream floor, on one context; prefill 334 tok/s at 8k: experts at 16 tokens a visit, MoE pipelined, DeltaNet fused, `attn_fa256`) | done (needle at 262,000, also through `phlegm serve` in 36 min; `attn_fa256` 6x at 262k) | done (host stages named; vision tower on the host) | done (MTP head + two-row verify, exact; 1.24-1.40x Strix Point; on Strix Halo's faster one-context decode 1.05x on code, cost-aware fallback elsewhere) | done (Unsloth UD-Q4_K_S, q8 projections kept, the Q6_K head on its own codes) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-QWEN36MOE-GGUF); benches are development runs |
 | gpt-oss:20b | done (`attn_fa_gx` to 131k) | done, rest named (decode 82-84 ms short; 409 ms a step at 131k, compute-bound over a 170 ms stream floor) | done (needle at 130,500) | done (host stages named) | done (measured rejection: prompt lookup, DFlash) | done (ggml-org MXFP4 GGUF) | **passes** ([audit](specs/open-engine/spec.md), OPEN-FAMILY-GPTOSS); bench is a development run |
 | qwen3.5:4b (or :9b) | ? | open (prefill numbers) | open | ? | open | open | not started |
 | Ternary Bonsai 2 27B | ? | ? | open (8k of 262k) | ? | done (DFlash 2 + lookup) | open (reads PQ2_0 via q4nx-build) | not started; work not on main |
@@ -86,7 +86,7 @@ Audit: `spec.md` OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b" (2026-11-21).
 
 ### qwen3.6-moe:35b-a3b
 
-Audit: `spec.md` OPEN-FAMILY-QWEN36MOE-GGUF, "Production bar: qwen3.6-moe:35b-a3b" (2026-11-24, updated 2026-11-26).
+Audit: `spec.md` OPEN-FAMILY-QWEN36MOE-GGUF, "Production bar: qwen3.6-moe:35b-a3b" (2026-11-24, updated 2026-11-27, closed 2026-11-28).
 Plans: [qwen36moe-production-bar.md](specs/open-engine/plans/qwen36moe-production-bar.md),
 [qwen36moe-attn-fa256.md](specs/open-engine/plans/qwen36moe-attn-fa256.md), handoff
 [qwen36moe-handoff.md](specs/open-engine/plans/qwen36moe-handoff.md).
@@ -101,12 +101,16 @@ Plans: [qwen36moe-production-bar.md](specs/open-engine/plans/qwen36moe-productio
   routed dispatches recovered on a new hardware context (OPEN-ROUTE-REDO). Runs on Linux (Strix Halo) and Windows.
 - Speed (Strix Point, Windows, performance mode, `phlegm bench --development`, 2026-11-24): prefill 156 / 180 / 188 /
   188 tok/s and decode 9.1 / 8.9 / 8.6 / 8.1 tok/s at 512 / 1k / 2k / 4k; with `attn_fa256` 4k 218 tok/s, 32k 193,
-  262k 107 (CLI). Strix Halo (Linux, Default power mode, an `arbiter --measure` unit, 2026-11-26, one-context images):
-  prefill 227 / 280 / 315 / 334 tok/s and decode 13.3 / 13.0 / 12.4 / 11.3 tok/s at 512 / 1k / 2k / 4k.
-- Left, named in the audit: decode at 1.31x its 56 ms stream floor (the streams at 38-43 GB/s against 52, the routed
+  262k 107 (CLI). Strix Halo (Linux, Default power mode, an `arbiter --measure` unit, 2026-11-27, one-context images, early
+  up|gate fills, the Q6_K head): prefill 223 / 277 / 313 / 332 tok/s and decode 13.5 / 13.1 / 12.5 / 11.4 tok/s at
+  512 / 1k / 2k / 4k.
+- Left, named in the audit: decode at 1.27x its 56 ms stream floor (the streams at 38-43 GB/s against 52, the routed
   experts' hidden round trip); the DeltaNet conv and delta rule and the vision tower on the host; the token-batched
   expert kernel core-bound at 8 tokens a visit; `attn_fa256` at 2.3x its transfer floor; the verify pass at 1.67
   plain steps, which leaves MTP near break-even on Strix Halo.
+- Closed 2026-11-28: the bar is met. Next on this model, in order: a verify pass of three or four rows near the
+  price of two (the drafter's payoff on Strix Halo), then a long-context profile on the shipped set (the 131k /
+  262k numbers predate it; at 131k the host stages were over half of prefill).
 - OFLM side: registry entry (Unsloth MTP GGUF, `UD-Q4_K_S`, qwen35moe, 262,144, mmproj and MTP drafter); `oflm add` /
   `serve` / `bench`; benchmark page; README row.
 

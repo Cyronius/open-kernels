@@ -1319,6 +1319,17 @@
     "LMHEAD_CORES": "8"
    }
   },
+  "lm_head_q6": {
+   "design": "lm_head_q8/lm_head_q8.py",
+   "build_dir": "lm_head_q8/build_q6",
+   "env": {
+    "LMHEAD_N": "248320",
+    "LMHEAD_K": "2048",
+    "LMHEAD_CORES": "8",
+    "LMHEAD_Q6": "1",
+    "LMHEAD_SPLIT": "2"
+   }
+  },
   "mx_linear": {
    "design": "layer_x/mx.py",
    "build_dir": "layer_x/build_mx_linear",
@@ -2198,7 +2209,8 @@
    "mb": "mb_s256/final.xclbin",
    "ag": "ag_s256/final.xclbin",
    "fa": "fa256/final.xclbin",
-   "gemm": "gemm_n1024_k2048/final.xclbin"
+   "gemm": "gemm_n1024_k2048/final.xclbin",
+   "lm6": "lm_head_q6/final.xclbin"
   },
   "kernels": {
    "ln": {
@@ -2547,6 +2559,11 @@
     "context": "gemm",
     "insts": "gemm_n12288_k2048/insts.bin",
     "build": "gemm_n12288_k2048"
+   },
+   "lm_q6": {
+    "context": "lm6",
+    "insts": "lm_head_q6/insts.bin",
+    "build": "lm_head_q6"
    }
   },
   "layer_types": {
@@ -3316,6 +3333,17 @@
      "LMHEAD_CORES": "8"
     }
    },
+   "lm_head_q6": {
+    "design": "lm_head_q8/lm_head_q8.py",
+    "build_dir": "lm_head_q8/build_q6",
+    "env": {
+     "LMHEAD_N": "248320",
+     "LMHEAD_K": "2048",
+     "LMHEAD_CORES": "8",
+     "LMHEAD_Q6": "1",
+     "LMHEAD_SPLIT": "2"
+    }
+   },
    "mx_linear": {
     "design": "layer_x/mx.py",
     "build_dir": "layer_x/build_mx_linear",
@@ -3939,6 +3967,20 @@
    "norm": {
     "tensor": "output_norm.weight",
     "bytes": 4096
+   },
+   "lm_head_q6": {
+    "pool_bytes": 421527552,
+    "chunk_bytes": 6784,
+    "ops": [
+     {
+      "op": "q35_lmhead6",
+      "tensor": "output.weight",
+      "dst": 0,
+      "in_dim": 2048,
+      "groups": 2,
+      "width": 2
+     }
+    ]
    }
   }
  }

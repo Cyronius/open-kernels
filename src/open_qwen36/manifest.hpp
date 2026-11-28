@@ -406,6 +406,10 @@ struct Manifest {
     std::string embed_tensor, norm_tensor;
     double embed_scale = 1.0;                 ///< applied to token lookup only; never the tied lm_head
     std::vector<PackOp> lmhead_ops;          ///< pack.lm_head.ops into the lmpool global
+    /// OPEN-LMHEAD-Q6: pack.lm_head_q6, the head on a GGUF's Q6_K codes for the `lm_q6` / `lmv_q6` kernels; the
+    /// engine takes it in place of lm_head when the GGUF's head tensor is Q6_K (empty = the kernel set has none)
+    std::vector<PackOp> lmhead_q6_ops;
+    size_t lmhead_q6_pool_bytes = 0, lmhead_q6_chunk_bytes = 0;
     size_t norm_bytes = 0;
     nlohmann::json hf_config_check;
     /// What a key ABSENT from config.json means, for the keys of hf_config_check a config

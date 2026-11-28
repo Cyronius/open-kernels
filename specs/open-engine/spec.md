@@ -1687,14 +1687,30 @@ images), NPU power mode Default (setting it needs root there), on a box shared w
 | Bar item | State | Evidence |
 |---|---|---|
 | Block prefill | Done. The layer-major block route (T = 256) is the default in the CLI, `phlegm run` and `serve` | speed table |
-| Near optimal | Done (2026-11-26). Decode streams 2.9 GB a step: floor about 56 ms at 52 GB/s; measured 73.0 ms a step (13.7 tok/s), dispatch minima 68.5 ms, after OPEN-DECODE-ONE-CONTEXT-Q8 (the 20 lx / ax context switches a step gone: 94.0 -> 78.9 ms) and OPEN-DECODE-STREAM-UX's knobs (-> 73.5 ms), bit-identical. Prefill 2.99 ms a token at 8k (334 tok/s) after `attn_fa256`, OPEN-MOE-PIPE, OPEN-DN-FUSED and OPEN-MOE-DQBUF (the experts at 16 tokens a visit: 1.17x). What is left is spread over the streams' rates (38-43 GB/s against 52) and named under "What is left" | measure units, "What is left" |
+| Near optimal | Done (2026-11-26). Decode streams 2.9 GB a step: floor about 56 ms at 52 GB/s; measured 73.0 ms a step (13.7 tok/s), dispatch minima 68.5 ms, after OPEN-DECODE-ONE-CONTEXT-Q8 (the 20 lx / ax context switches a step gone: 94.0 -> 78.9 ms) and OPEN-DECODE-STREAM-UX's knobs (-> 73.5 ms), bit-identical. Prefill 2.99 ms a token at 8k (334 tok/s) after `attn_fa256`, OPEN-MOE-PIPE, OPEN-DN-FUSED and OPEN-MOE-DQBUF (the experts at 16 tokens a visit: 1.17x). What is left is spread over the streams' rates (38-43 GB/s against 52) and named under "What is left". 2026-11-27: OPEN-DECODE-STREAM-UG and OPEN-LMHEAD-Q6 exported, 71.3 ms a step (1.27x the floor), tokens unchanged by the first and KL unchanged by the second | measure units, "What is left" |
 | Real context | Done. Needles pass at 4k, 8k (x3), 32k (10/50/90 %), 131,072 (50 %) and 262,000 (50 %), on `attn_block` (2026-11-25) and again on `attn_fa256` (2026-11-26): 262,000-token prefill 2,457 s against 14,706 s. Through `phlegm serve` on Strix Halo (MTP on, `--max-ctx 263168`, a 262,005-token chat prompt): PASS, 2,163 s end to end | speed table, [qwen36moe-attn-fa256.md](plans/qwen36moe-attn-fa256.md) |
 | All on the NPU | Done with named host stages (tables below): in prefill the DeltaNet conv and delta rule (0.77 ms a token at 4k), the layer tails and routers, the MoE gather / scatter (now under the NPU's passes); in decode the router read and the q8 shared expert (overlapped); the vision tower (3.7-4.0 s for 3,200 patches) | host stages, "What is left" |
 | Drafter | Done: the MTP head (`blk.40`) drafts one token and a two-row verify pass checks it (OPEN-VERIFY-ROWS-QWEN36MOE, OPEN-SPEC-MTP-QWEN36MOE), on one context since 2026-11-26 (`vux`, verify 142.5 -> 121.8 ms); output byte-identical to `off`, also after an image. Strix Point (split decode): `phlegm serve --speculative mtp` 1.24-1.40x. Strix Halo with one-context decode (plain 73 ms): 1.05x on code, and phlegm's cost-aware policy (SERVER-SPEC-COST) falls back to plain steps where drafting does not pay (prose 0.97x). Prompt lookup runs on the same pass (1.06x / 0.98x). The verify pass costs 1.67 plain steps: glue, DeltaNet and post run once a row, and two rows stream twice the experts | plan phase 5, OPEN-DECODE-ONE-CONTEXT-Q8 |
 | `phlegm run` / `serve` | Done: plain, streamed, reasoning on and off, a tool-call round trip, images (`phlegm run --image`, `serve` image parts), MTP speculation, needles through `serve` at 32,768 (PASS, 189 s) and 262,005 tokens (PASS, 2,163 s) | plan log, OPEN-VISION-BLOCK |
-| Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1, the Q6_K head to `lm_head_q8`. Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread. Strix Halo, 2026-11-26 (another text, OPEN-DN-FUSED): block-route KL 0.0241 against llama.cpp Vulkan and 0.0278 against llama.cpp CPU, inside llama.cpp's own CPU-vs-Vulkan 0.0269 | OPEN-SHARED-HOST-Q8, OPEN-DN-FUSED |
-| Benchmarks | Done for the kernel side: `phlegm bench --development` on Strix Point (a measure unit) and on Strix Halo (Linux, Default power mode, a shared box), 512 to 4k (below), with CLI runs to 262k; the docs page and README row are OFLM's | bench tables |
+| Quantized | Done. Unsloth UD-Q4_K_S: Q4_K experts keep their codes, Q8_0 projections and the shared expert stay q8; the 3 Q6_K `ffn_down_exps` go to q4_1; the Q6_K head ran as `lm_head_q8` until 2026-11-27 and now streams its own Q6_K codes (OPEN-LMHEAD-Q6: KL 0.02402 against the q8 head's 0.02408). Sequential gate KL 0.0230 (median 0.0084, same top 93.0 %) against the 0.019 llama.cpp backend spread. Strix Halo, 2026-11-26 (another text, OPEN-DN-FUSED): block-route KL 0.0241 against llama.cpp Vulkan and 0.0278 against llama.cpp CPU, inside llama.cpp's own CPU-vs-Vulkan 0.0269 | OPEN-SHARED-HOST-Q8, OPEN-DN-FUSED |
+| Benchmarks | Done for the kernel side: `phlegm bench --development` on Strix Point (a measure unit) and on Strix Halo (Linux, Default power mode, a shared box), 512 to 4k (below; latest 2026-11-27, the shipped set: prefill 223 / 277 / 313 / 332, decode 13.5 / 13.1 / 12.5 / 11.4 tok/s), with CLI runs to 262k; the docs page and README row are OFLM's | bench tables |
 | Features | Reasoning, tool calling, the MTP head (drafter row) and vision pass. Vision: the mmproj tower on the host CPU (named below), image prompts on the block route at M-RoPE positions, `phlegm serve` image parts, answers equal to llama.cpp's on the test image (OPEN-VISION-BLOCK, SERVER-IMAGE-INPUT). Left out: video input (phlegm takes no video) | this table |
+
+**Closed 2026-11-28: the bar is met.** Every row above is measured. Two rows pass on their evidence but are the
+weakest, and are the next work on this model, not bar gaps:
+
+1. Drafter: MTP's one-token drafts are taken about 90 % of the time, but the two-row verify pass costs 1.67 plain
+   steps, so on Strix Halo's one-context decode MTP nets 1.05x on code and phlegm falls back to plain steps on prose.
+   A verify pass of three or four rows near the price of two would lift MTP and any other drafter (MemDraft too,
+   with a Qwen3.6-trained table).
+2. Long context is not re-profiled on the shipped set: the 131k / 262k rows of the speed table are Strix Point runs
+   from before one-context decode and `attn_fa256`, and at 131k the host stages (DeltaNet conv and delta rule, the
+   layer tails, routers) took 1,066 s of prefill against the NPU's 910 s. The near-optimal audit covers short-context
+   decode.
+
+Caveats on the evidence: the Strix Halo numbers are NPU power mode Default on a shared box; `phlegm bench` stops at
+4k and longer contexts are CLI and `phlegm serve` needle runs; the lost routed dispatch (below) is recovered, not
+gone.
 
 Reliability: about one routed MoE dispatch in 30,000 to 300,000 is lost by the driver or firmware (OPEN-ROUTE-ALT).
 The engine runs the layer again on a new hardware context (OPEN-ROUTE-REDO); 8 real losses in one gate run were
@@ -1765,6 +1781,11 @@ With OPEN-MOE-DQBUF as well (2026-11-26 15:44, measure unit; NOISY only for kswa
 Prefill at 8k, ms a token: linear layers 2.14 (experts 0.97, GEMMs 0.43, DeltaNet host 0.27, tails 0.09), full layers
 0.85 (experts 0.32, GEMMs 0.35, attention 0.03).
 
+With OPEN-DECODE-STREAM-UG as well (2026-11-26 20:32, measure unit, CLEAN; `bench/phlegm_bench_measure_wug.json`):
+prefill 220.8 / 275.4 / 309.9 / 328.6 tok/s and decode 13.38 / 12.92 / 12.09 / 10.78 tok/s at 512 / 1k / 2k / 4k. The
+prefill route is unchanged by it and moved 1.5-3 % between the two runs, so this bench does not resolve the step's
+2 % (the alternating step-trace A/B in OPEN-DECODE-STREAM-UG does).
+
 **Where the time goes.** Decode step at position 52 (110 ms): the first dispatch of each layer (`lx0` / `ax0`:
 norms, q8 projections, DeltaNet or attention, router) 68 ms; the wait on the routed MoE (`lx1` / `ax1`) 8 ms with
 the shared expert overlapped; lm_head 12.5 ms. The q8 projections are the largest stream (decision 2 of the plan:
@@ -1781,13 +1802,62 @@ measure unit, `OFLM_OPEN_STEP_TRACE=1`, 63 steps; bytes from the manifest's stre
 |---|---|---|---|---|---|
 | `lx0` (q8 projections, conv, DeltaNet, router) | 30 | 1.126 | 48.6 | 43 GB/s | the stream's issue rate and its waits on the conv glue and DeltaNet; the main core has 128 B of program memory free |
 | `ax0` (q8 projections, attention, router) | 10 | 0.868 | 33.7 | 39 GB/s | as `lx0`; past 32k the attention walk dominates (compute-bound, 0.37 us a row a full layer) |
-| `lx1` / `ax1` (8 routed experts) | 40 | 0.407 | 15.3 | 38 GB/s | per expert the hidden makes a DDR round trip between up / gate and down (early down fills already queue the down weights behind it) |
-| `lm` (q8 head) | 1 | 10.21 | 516 | 51 GB/s | at its floor |
+| `lx1` / `ax1` (8 routed experts) | 40 | 0.372 | 15.3 | 41 GB/s | per expert the hidden makes a DDR round trip between up / gate and down; the down and the next up / gate fills now stream through it (OPEN-DECODE-STREAM-UG, 0.407 before) |
+| `lm` (q8 head) | 1 | 10.21 | 516 | 51 GB/s | at its floor; the Q6 head (OPEN-LMHEAD-Q6, 2026-11-27) streams 421 MB in 8.9-9.1 ms a step |
 | `ln` + the two context changes of the tail | 1 | 0.20 | | | `lx0` after `lm` costs 2.75 ms against 1.15 in place: about 1.6 ms a step |
 | host | | 0.1 | | | router read and patch; the q8 shared expert overlaps the MoE dispatch |
 
-Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.24x / 1.31x). Before today the step
+Sum of minima 69.2 ms, step 73.5 ms, against a 56 ms stream floor at 52 GB/s (1.24x / 1.31x). A build with the main cores' GEMV and DeltaNet
+arithmetic compiled out and every DMA kept (`LX_NULL_GEMV=1 LX_NULL_DN=1`, timing only, 2026-11-26, two alternating
+rounds) steps in 73.1 / 73.4 ms against 74.5 / 74.3 (`lx0` 1.11 against 1.13 ms): the arithmetic is hidden, and what
+is left above the floor is the data movement -- the streams' issue order and waits, the hidden's round trips, the
+tail's two context changes -- not the cores. The tail's switches, measured: `lm` in place (`--bench-kernel lm`) 9.62 ms against
+10.12-10.21 in the step, `ln` 0.074 against 0.18-0.20, and `lx0` after `lm` 2.73 against 1.13: about 2.2 ms a step.
+The head cannot join the layer image: every shim tile's two input channels already carry the layer image's streams
+(eight weight fifos plus x, the norm helper, the glue, post, attention and the router's second channel), and the
+main cores have 128 B of program memory left. With OPEN-DECODE-STREAM-UG the step is 72.4-72.8 ms (CLEAN, 2026-11-26). Issuing each DeltaNet round as soon as its glue tile's
+records are in DDR (glue value tile h holds exactly round h's eight records), with the next tile queued, instead of
+after the whole glue: `lx0` 1.125-1.131 against 1.125-1.130 ms, step 72.7-72.9 against 72.7-72.8 (CLEAN, three
+alternating rounds, tokens identical) -- the glue's tail is not on `lx0`'s critical path; not kept. Transfers a dispatch issues (BD writes in the instruction
+streams of `kernels-fa262k`): `lx0` 234, `lx1` / `ax1` 233, `ax0` 107, `lm` 17. At ~0.7 us an issue that is a 0.16 ms
+floor for `lx0` against 1.125 ms, and `lx1` issues as many transfers for a third of the bytes in 0.372 ms: the issue
+rate alone does not bound either; what is left is waits between dependent stages (the hidden's round trip, the
+glue / DeltaNet / post hand-offs through DDR), which only an on-chip hand-off (memtile join and broadcast) removes, and
+the main cores' two input channels are both taken. A 24-deep weight ring (`UX_WRING=24`) steps in 73.9 / 73.7 ms against
+74.1 / 74.2 (noise; `lx0` 1.115 either way): the ring's depth is not what holds the linear front at 43 GB/s. Before today the step
 was 94 ms (split images: 20 context switches a step at about 1.2 ms each).
+
+The tail with the Q6 head (2026-11-27, from the step traces above; inferred, not built): `ln` 0.18-0.20 ms in a step
+against 0.074 in place, the Q6 head 8.9-9.0 against 7.54 (its 16-core context is bigger to enter than `ln`'s), `lx0`
+after the head about 1.6 ms over its in-place time: about 3.1 ms a step of context entry, the largest single named
+remainder after the linear front. Two levers are left, both small: (1) the final norm as a first stream on the head's
+image (a free tile in rows 4-5), which removes the `ln` context and one host round trip (about 0.1-0.2 ms); (2) an
+empty fifth instruction stream on the layer image, queued right behind the head, so the switch back to the layer
+context overlaps the host's logit read, sampling and embedding (at most that host time, about 0.3-0.5 ms on a quiet
+box). A bit-exact host final norm is not one of them: `ln_fn` sums hi/lo bf16 products on the accumulator and uses
+`srsqrt`, so a host copy would part from the NPU's `hn` in the last bits and need the KL gate for 0.2 ms. The 1.4 /
+1.6 ms entries themselves only go away with the head inside the layer image, which the shim budget above rules out.
+Probe for lever (2), 2026-11-27 (a temporary env sleep before each step, 0 against 3 ms, two alternating rounds on
+a loaded box, tokens identical): `lx0` after the head 3.18-3.33 ms mean either way against 1.38-1.41 for the other
+29: an idle NPU does not switch back by itself; the switch is paid when the next layer-context dispatch arrives, so
+only a dispatch queued behind the head (the empty stream) can move it under the host's time.
+Lever (2) measured, 2026-11-27: a hand-made empty instruction stream (`lxsw`, a transaction header with no ops) on
+the layer context, started right after the head and waited at the next step's entry (a probe kernel set and an
+env-gated engine change, both removed): `lx0` after the head drops to the plain 1.14-1.40 ms, but the host now
+blocks on `lxsw` instead, and the step stays where it was (70.1 against 70.2 ms on the quietest round, 87.8 against
+88.1 on a loaded one; three alternating rounds, tokens identical). The host's time between the head and the next
+step is too short to hide a 1.5-2 ms switch: lever (2) is rejected; lever (1) is measured next.
+Lever (1)'s ceiling measured the same day: the final norm on the host instead of the `ln` dispatch (an env-gated
+probe, removed: read `xres`, `rmsnorm_rows` with the GGUF's `output_norm`, write `hn` as bf16), so the step goes
+from the layer context straight to the head's: tail 15.3-15.7 ms either way, step 109.2 / 109.5 / 111.0 against
+108.1 / 109.5 / 110.0 (three alternating rounds on a loaded box; all 48 tokens the same). Without the `ln` context
+the head's entry costs what the two did: folding the norm into the head image would buy nothing. Rejected; the
+tail's 3 ms is the two big contexts' entries and only the head inside the layer image removes it.
+What one DDR hand-off costs, measured 2026-11-27 (plan `qwen36moe-decode-onchip.md`, question 3): `lx0` with its
+`xn` and `og` fills issued without waiting for the drains in front of them (timing only) runs 1.106-1.109 ms against
+1.120-1.126, the step 70.9-71.0 against 71.3-71.4 (one `--measure` unit, three alternating rounds): about 7 us a
+wait. Every hand-off on chip would come to roughly 2-4 ms a step at that price (inferred); the memtile schedule that
+would do it is not pursued.
 
 Prefill (Strix Halo measure unit, 8k, after OPEN-MOE-DQBUF: 2.99 ms a token; the older split below is a busy-box 4k run at 5.6 ms a token): the token-batched
 experts 2.1 ms (core-bound at 8 tokens a visit; lever: the native `mmul<4, 8, 8>` and one unpacked weight for both
@@ -9682,6 +9752,98 @@ takes 0.36 ms longer with it (with either issue order), so the attention images 
 1 ms only: `lx0` entered from `ax` costs 2.35 ms against 1.14 ms in place, and with `ax0`, `ln` and `lm` the context
 switches are about 20 ms of the 93 ms step (OPEN-FAMILY-QWEN36MOE-GGUF "What is left"). The MTP cycle is unchanged
 (verify pass 142.3 against 142.6 ms).
+
+### OPEN-DECODE-STREAM-UG: a MoE part's next up | gate fills go out ahead of the wait on the hidden
+**Applies to:** `open_kernels/designs/layer_x/xcommon.py` (`moe_sequence` `early_ug`), `xlayer.py` (`X_WUG`), `ux.py`,
+`vux.py`, `lx.py`, `ax.py`, `vlx.py`, `vax.py`, `open_kernels/recipes/qwen36moe.py` (`probe_env`)
+**Verification:** manual (the NPU and the model)
+
+With the down fills issued early (`X_WORDER`), a routed slot's sequence still stopped on the wait for the slot's hidden
+(each core's rows to DDR, then the whole hidden back to every core) before it issued the next slot's up | gate fills, so
+once slot e's down slice was queued the weight channels idled for the rest of the round trip. With `X_WUG` (default 1,
+with `X_WORDER`) slot e+1's up | gate fills are issued before that wait and slot e+1's hidden drains after it. Each
+channel carries the same bytes in the same order (up | gate, down, up | gate, ...); the throttle's wait in front of slot
+e+1's up | gate is on slot e-1's down, whose hidden was sent a slot earlier, so the stream cannot wait on itself. The
+main-core programs are unchanged; `X_WUG=0` at export builds the images as before.
+
+**Acceptance criteria:**
+- Program memory as before.
+- Against the previous set: prefill and greedy decode logits byte-identical; `--verify-check` PASS; `--spec-mtp` SPEC
+  IDENTICAL.
+- Decode timed against the previous set, alternating.
+
+**Result 2026-11-26 (Strix Halo, Default power mode; `kernels-wug` = the full set exported with `X_WUG=1`).** Gates:
+prefill logits and 31 greedy steps of the 24-token prompt, 56 dump files byte-identical to `kernels-fa262k`;
+`--verify-check 6` PASS (0 of 248,320 logits differ); `--spec-mtp 96` SPEC IDENTICAL. Program memory unchanged (`lx`
+16,256 B of 16,384, `vlx` / `vax` 15,920). Decode, 48 tokens after the 24-token prompt, step-trace minima over three
+alternating rounds (two NOISY measure units: another process at up to 15 cores):
+
+| set | lx1 | ax1 | lx0 | ax0 |
+|---|---|---|---|---|
+| before | 0.410-0.412 | 0.410-0.413 | 1.124-1.130 | 0.866-0.868 |
+| `X_WUG=1` | 0.373-0.377 | 0.373-0.376 | 1.126-1.131 | 0.856-0.874 |
+| `X_WUG=1`, ring 24 | 0.371-0.373 | 0.373-0.375 | 1.114-1.117 | 0.852-0.854 |
+
+The MoE parts are 9 % shorter (40 a step, about 1.5 ms); a 24-deep ring adds nothing measurable, so the ring stays at
+16. The step, timed in a CLEAN measure unit (three alternating rounds, the same 48 tokens): 74.3 / 74.3 / 74.1 ms
+before, 72.8 / 72.8 / 72.4 with `X_WUG` (`lx1` 0.369-0.372 against 0.407-0.410, `ax1` 0.372-0.374 against 0.410):
+1.6 ms a step, 2 %. After a 4,096-token prompt (CLEAN, two alternating rounds, 48 tokens, the same tokens): 93
+ms a step against 94-95 with `X_WUG=0` (`lx1` / `ax1` 0.372-0.374 against 0.409); the phlegm bench's 4k decode
+(10.78 against 11.25 tok/s) is that bench's run-to-run spread, not this change.
+
+### OPEN-LMHEAD-Q6: a GGUF's Q6_K head runs on its own codes
+**Applies to:** `open_kernels/designs/lm_head_q8/lm_head_q8.h` (`LMHEAD_Q6`: `gemv_q6_tile`, `gemv_q6_tile2`),
+`lm_head_q8.py` (`LMHEAD_Q6`, `LMHEAD_SPLIT`), `open_kernels/recipes/qwen36moe.py` (`lmhead_q6_on`, the `lm_head_q6` /
+`lmv6` builds, the GGUF view's `pack.lm_head_q6` and `lm_q6` / `lmv_q6` kernels), `src/open_qwen36/pools.cpp`
+(`q35_lmhead6`), `manifest.cpp` / `.hpp`, `core.cpp`, `gguf_pack_test.cpp`, `manifest_test.cpp`
+**Verification:** `gguf_pack_test` (q35_lmhead6 bit-exact), `test_qwen36moe_gguf.py`; manual (the NPU and the model)
+
+Unsloth's Qwen3.6-35B-A3B GGUF stores the head (`output.weight`, 248,320 x 2,048) as Q6_K. The q8 head requantized
+it per 32-block (8.5 bits a value, 516 MB a decode step, and not the GGUF's values). The kernel set shall also carry a
+head on the Q6_K codes themselves, and the engine shall run it when the GGUF's head tensor is Q6_K:
+- a chunk keeps lm_head_q8's geometry (32 rows x 256 k) at 6,784 B: the rows' super-block scales `d` (f32), the 16
+  sub-block scales (int8), the codes' low nibbles and their top two bits, laid out so a 64-B and a 32-B load rebuild
+  the two signed 64-code halves the q8 tile loads (`q6_block`); the tile scales each 16-k group's integer sum by its
+  sub-block scale and the chunk's result by `d`, both through the q8 tile's hi / lo bf16 split;
+- the dequant costs the core more than the q8 tile (one core a column: 15.5 ms against 10.5), so the head runs two
+  cores a column (`LMHEAD_SPLIT=2`, `QWEN36MOE_LMHEAD_Q6_SPLIT`): the column's stream carries two-band sets in split
+  order (per set, per chunk group, the two bands' call elements), its memtile splits each object over the two cores
+  and joins their results; the pool is packed in that order (`q35_lmhead6`, `groups` = 2, `width` = 2 chunks a call).
+  Four cores a column run as fast in place but their 32-core context costs about 1 ms more to enter a step;
+- the GGUF view names the head `pack.lm_head_q6` with kernels `lm_q6` and `lmv_q6` (the verify pass's two-row head);
+  the engine swaps them in for `lm` / `lmv` and the pool at load when `output.weight` is Q6_K.
+  `OFLM_OPEN_LMHEAD_Q6=0` keeps the q8 head; `QWEN36MOE_LMHEAD_Q6=0` at export leaves the Q6 head out.
+
+**Acceptance criteria:**
+- `q35_lmhead6` reproduces every Q6_K value bit for bit, read back the way the tile reads it.
+- KL against the llama.cpp Vulkan base no worse than the q8 head's (greedy tokens may part from the q8 head's: the
+  q8 head is a requantization, this one the GGUF's values).
+- `--verify-check` PASS (the two-row head bit-identical to the one-row head); `--spec-mtp` SPEC IDENTICAL.
+- Decode timed against the q8 head, alternating.
+
+**Result 2026-11-26 (Strix Halo, Default power mode).** `gguf_pack_test` ok; ctest 10 of 10. KL (8 chunks, 2,040
+positions, against `base_vk_c512`): mean 0.02402 against 0.02408 for the q8 head, median 0.00669 / 0.00660, p95 0.1049
+/ 0.1047, top token 93.43 % / 93.38 %. Greedy tokens of the 24-token prompt: the first 26 the same with either head,
+then they part (48 tokens: two sequences, the same for both Q6 layouts; `OFLM_OPEN_LMHEAD_Q6=0` gives the q8 head's);
+the exported set's logits byte-identical to a hand-assembled one; `--verify-check 6` PASS (0 of 248,320 differ);
+`--spec-mtp 96` SPEC IDENTICAL with either layout; two cores a column's logits byte-identical to four's (56 files). Program memory 4,528 B (`lm_head_q6`) and 4,864 B (`lmv6`).
+
+Timing (head dispatch minimum, ms; in place = `--bench-kernel lm`, in a step = the step trace's `lm` row):
+
+| head | in place | in a decode step |
+|---|---|---|
+| q8 | 9.61-9.67 | 10.17-10.24 |
+| Q6, four cores a column | 7.50-7.52 | 9.99-10.19 |
+| Q6, two cores a column | 7.54 | 8.83-9.14 |
+
+In place the Q6 head reads 421 MB at 56 GB/s. Four cores a column lose the gain in a step (the step stays 72.8-72.9 ms
+against 72.8-73.1, CLEAN, three alternating rounds); two cores a column keep about 1.1-1.3 ms of it (one NOISY unit:
+another process at up to 16 cores for 107 s).
+
+Exported set, 2026-11-27 (`kernels-fa262k` as shipped, `OFLM_OPEN_LMHEAD_Q6` 0 / 1 alternating, three rounds, 48
+tokens of the 24-token prompt; one `--measure` unit, NOISY only for one bash process at one core for 71 s): the step
+71.3 ms with the Q6 head in every round against 72.2-72.4 ms with the q8 head; the `lm` row 8.87-9.05 against
+10.23-10.36. Each head's tokens the same in every round (c5c9f2ad Q6, f0b34bc4 q8).
 
 ### OPEN-DECODE-ONE-CONTEXT-Q8: a q8-projection MoE decode token and its verify pass each run in one hardware context
 **Applies to:** `open_kernels/designs/layer_x/ux.py` (`ALL_Q8`), `vux.py`, `open_kernels/recipes/qwen36moe.py`
