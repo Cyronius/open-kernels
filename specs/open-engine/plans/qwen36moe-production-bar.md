@@ -674,4 +674,6 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   / 332 tok/s, decode 13.5 / 13.1 / 12.5 / 11.4 tok/s at 512 / 1k / 2k / 4k (`bench/phlegm_bench_measure_q6.json`,
   sha256 69689673697316fb...). The unit before it, with a 30-core process alongside, is kept as
   `phlegm_bench_q6_NOISY.json` and not used. MemDraft (the Qwen3.5-9B code table) as the draft source: 35 % of
-  one-token drafts taken against MTP's 90 %, 0.95-1.05x against MTP's 1.20x on a loaded box; MTP stays the drafter.
+  one-token drafts taken against MTP's 90 %, 0.95-1.05x against MTP's 1.20x on a loaded box; MTP stays the drafter. The CLI hook used for this
+  (`OFLM_SPEC_MEMDRAFT`) is not committed: a Qwen3.6-trained table, and a verify pass wider than two rows, would come
+  first.
