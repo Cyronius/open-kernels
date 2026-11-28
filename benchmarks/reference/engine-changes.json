@@ -134,6 +134,76 @@
         "src/open_qwen36/gguf_pack_test.cpp": "036efeaf7d4ff36d9f9967f58921ec22f1343050bb09dddad4469434fbecfec4",
         "src/open_qwen36/pools.cpp": "c1a709a4c1dc775852673cf86160e0bb6d878be0c9f1942cb856daa95b885efe"
       }
+    },
+    {
+      "id": "qwen36moe-gguf-production-bar",
+      "origin": "open-kernels: Qwen3.6-35B-A3B from the Unsloth GGUF (Q8_0 roles, exact Q4_K experts, GGUF host constants, q8 shared expert on the host in decode: OPEN-SHARED-HOST-Q8; routed stream in alternate copies: OPEN-ROUTE-ALT; a lost routed dispatch redoes its layer on a new context: OPEN-ROUTE-REDO)",
+      "files": {
+        "src/open_qwen36/block_host.cpp": "0394efb553d66ce6877f348d847e7adf04b74593c2e70e2ed9ae73d254beb771",
+        "src/open_qwen36/block_host.hpp": "72e6421865ebc58dcf6b294335205873e12d55e91b43ac7d569d630555c5f064",
+        "src/open_qwen36/block_host_test.cpp": "844f58ed4b6e9e430d4ca9b55864fac08196f62a7a3b1b145de60503b0b434fb",
+        "src/open_qwen36/cli.cpp": "24e19bc75a23978f4b46441d0e28dd74311d16a2a72a095ab673e46c0fc487c4",
+        "src/open_qwen36/core.cpp": "32583fb106031c711021508317050fbaa6457147ad82df2270784011a5009e67",
+        "src/open_qwen36/core.hpp": "c1d3da607fd59f51e1d2cf747603e4fe093bfc88070e0defd47f363581139813",
+        "src/open_qwen36/gguf_pack_test.cpp": "df4f63cb7978edfad78473a0fed630fb302edcfda133e677f85a21e7593d7a03",
+        "src/open_qwen36/manifest.cpp": "ca018784567c2556ac02e0f829a2240e66f63f3c92c8760f4ffb98e803ed65e5",
+        "src/open_qwen36/manifest.hpp": "63e1ca0899d657022568ad93a2cecc44cf53cc6b33fbc3f0423c42de88d7d05d",
+        "src/open_qwen36/pools.cpp": "f9403b0c4123597f58c921e36cc8e7f8e0fb3bd268b4958a3008130a4ca4ee32",
+        "src/open_qwen36/pools.hpp": "552c25de1f7a904990862ed08f004ab681bd0eebf6b397d0b0c01f3bb9ff14c4"
+      }
+    },
+    {
+      "id": "qwen36moe-verify-mtp",
+      "origin": "open-kernels: Qwen3.6-35B-A3B two-row verify pass (OPEN-VERIFY-ROWS-QWEN36MOE: manifest `verify` program, step_verify / verify_commit, the linear state as a 16-slot ring the commit re-points), the MTP drafter (OPEN-SPEC-MTP-QWEN36MOE: blk.40 packed as a full-attention layer, mtp_step), CoreConfig::verify / mtp so a bridge can load both without OFLM_* variables, and the CLI's --verify-check / --mtp-accept / --spec-mtp",
+      "files": {
+        "src/open_qwen36/cli.cpp": "5652b91491152da18ff57dd46e7e9cfdb9c6f286d256d473d763a68205fc471f",
+        "src/open_qwen36/core.cpp": "f73822507487a65addf3c40aed9fb871cb7832421021881ec4abbd6413369b5f",
+        "src/open_qwen36/core.hpp": "b6a501943d7901febafdf69ac4521c01a6aec9b7b4823222196aad3c2a1cbb7b",
+        "src/open_qwen36/manifest.cpp": "db810a2e6fd244b59615f8a5f367c2b8cfeb132b4393f73f6ab0b1f0a53ea454",
+        "src/open_qwen36/manifest.hpp": "de68ab82491c3a7e3c99f2d37a6f390e7cbdf27c0434e895844ef1120183ad4c"
+      }
+    },
+    {
+      "id": "qwen36moe-attn-fa256",
+      "origin": "open-kernels: Qwen3.6-35B-A3B full-attention block prefill as one attn_fa256 dispatch a block (designs/attn_fa256; manifest gemm_block.attn_fa on a full layer, Core::attention_fa256 / fa256_tier, the block's cache rows synced before the dispatch; OFLM_OPEN_ATTN_FA=0 keeps attn_block)",
+      "files": {
+        "src/open_qwen36/core.cpp": "5b494203587962cdc7572eeda8b98879c516ad73707ec273e1b7210b18f6b869",
+        "src/open_qwen36/core.hpp": "7cf9479327ffabcf9414f2e14547d024852278cedf560473f8718d90a99a0f06",
+        "src/open_qwen36/manifest.cpp": "e025f4411ae627fea76053f086485d2b93400bb039474a6b9a82db00e5185c04"
+      }
+    },
+    {
+      "id": "qwen36moe-vision-block",
+      "origin": "open-kernels: image prompts on the MoE layer-major block route at M-RoPE positions (Core::step_gemm_prompt_mrope, attention_prep's per-row (t, h, w), the counter through step_gemm_prompt / step_verify / verify_commit / seek), vision/prompt.cpp (patchify, smart_resize, prefill_images), the vision tower's packed AVX2 / AVX-512 GEMM and AVX-512 attention, CLI --image; shmem device buffers where userptr is refused; manifest_test counts the attn_fa256 context (OPEN-VISION-BLOCK)",
+      "files": {
+        "src/open_qwen36/CMakeLists.txt": "1fdb19064df6e01e24115faafaec46506c008e73f38abf571209d39d99e56fb2",
+        "src/open_qwen36/block_host.cpp": "123903e9078f78e0e879eae04da1306aab2895f38618b790926bc18f649fa810",
+        "src/open_qwen36/block_host.hpp": "a3a5d735e4e684432af16d1903e4f083027bff808d5e9296aaa343278bd5ec63",
+        "src/open_qwen36/build.cmd": "eb80c448f5041186e37a632edaf6e45a6d5d1bc00ae9f394169296dfa228ac2c",
+        "src/open_qwen36/cli.cpp": "00363ec9bb31209a8c2715e64787e3171633e8db3ebfa96a93c1d1c0f49f20b3",
+        "src/open_qwen36/core.hpp": "c59c3e06bbdc2e85fe0cc15a053d0d3eef8768b18659c3a43bad92b88972a10b",
+        "src/open_qwen36/manifest_test.cpp": "57cbd1156e9ca1468d788e187c0fc618351a9585c7e82f42e29743b17524f947",
+        "src/open_qwen36/README.md": "46f527674827a506184dcf017d2447bd940dfa9eee472f99a258efd180661632",
+        "src/open_qwen36/vision/vit.cpp": "6afa6ba30bd932cc6a37deab3229555eae6dbac20004dfc183df9bed67fb9f4c",
+        "src/open_qwen36/vision/vit.hpp": "65d4649a82d601751c22197e7d910543a4b6ade5b54497b0b1d2fa456ebab142",
+        "src/open_qwen36/vision/prompt.cpp": "9fe9f28401d686d5c094deae9b1c1239ac6d9adbdf3fb11ee2ed858ff2c602c5",
+        "src/open_qwen36/vision/prompt.hpp": "08b056863b941d2d8a2299f9f97e159ae85d3ba42922082a9a33013cda238934"
+      }
+    },
+    {
+      "id": "qwen36moe-moe-pipe",
+      "origin": "open-kernels: the prefill's token-batched MoE passes pipelined (OPEN-MOE-PIPE): two x / y buffer pairs, the host gathers pass i + 1 and scatters pass i - 1 while the NPU runs pass i; scatter order unchanged, logits bit-identical; OFLM_OPEN_MOE_PIPE=0 restores the serial loop",
+      "files": {
+        "src/open_qwen36/core.cpp": "153b20ade318040b581b5b44f7c18cb893936909f1c99ed9ab607102e04b1904"
+      }
+    },
+    {
+      "id": "qwen36moe-dn-fused",
+      "origin": "open-kernels: the prefill delta rule with S read once a token (the next token's S^T k folded into this token's update, same operations in the same order: bit-identical; AVX-512), the DeltaNet conv's SiLU vectorized (AVX-512 exp, about 1 ulp from expf); OFLM_OPEN_DN_UNFUSED=1 keeps the old loops; the CLI's CMake build compiles block_host.cpp without FP contraction, as phlegm's bridge does (OPEN-DN-FUSED)",
+      "files": {
+        "src/open_qwen36/block_host.cpp": "a6d04ae1f40b6d8e2b393a536dc8cc21203394ac639483a8205fc5ca36e4d40f",
+        "src/open_qwen36/CMakeLists.txt": "1a155fa13c3e24dec7801733514f7428cbc60ecce933236fc3e5352222c244e8"
+      }
     }
   ]
 }

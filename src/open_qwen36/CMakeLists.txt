@@ -34,7 +34,8 @@ set(_inc
     "${CMAKE_CURRENT_SOURCE_DIR}/../../open_kernels/harness"  # stream_patch.hpp
 )
 
-add_executable(open_qwen36_cli cli.cpp core.cpp block_host.cpp pools.cpp manifest.cpp q4nx_file.cpp gguf_file.cpp omp_policy.cpp)
+add_executable(open_qwen36_cli cli.cpp core.cpp block_host.cpp pools.cpp manifest.cpp q4nx_file.cpp gguf_file.cpp omp_policy.cpp
+               vision/vit.cpp vision/prompt.cpp)
 target_include_directories(open_qwen36_cli PRIVATE "${XRT_INCLUDE_DIR}" ${_inc})
 target_link_directories(open_qwen36_cli PRIVATE "${XRT_LIB_DIR}")
 target_link_libraries(open_qwen36_cli PRIVATE xrt_coreutil)
@@ -121,3 +122,9 @@ add_test(NAME OPEN-MANIFEST COMMAND manifest_test
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_hy_mt2_7b.json"
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_qwen35_9b.json"
          "${CMAKE_CURRENT_SOURCE_DIR}/../../specs/open-engine/tests/fixtures/manifest_phi4_mini_4b.json")
+
+# block_host.cpp without FP contraction, as phlegm's bridge build compiles it (benchmarks/reference/build.py): the CLI
+# then computes the block prefill's host stages with the same bits as the server
+if(NOT MSVC)
+    set_source_files_properties(block_host.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()

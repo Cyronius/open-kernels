@@ -356,13 +356,13 @@ int main(int argc, char** argv) {
           m.kernels.at("gemm_n1024_k2048").context == "gemm" &&
           m.kernels.at("gemm_n2048_k512").context == "gemm" &&
           m.kernels.at("gemm_n2048_k4096").context == "gemm" &&
-          m.kernels.at("mx_full").context == "mx" && m.contexts.size() == 8 &&
+          m.kernels.at("mx_full").context == "mx" && m.contexts.size() == 9 &&
           m.globals.at("gemm_x_k2048") == 2048 * 256 * 2 && m.globals.at("gemm_y_n12288") == 12288 * 256 * 4 &&
           m.globals.at("gemm_x_k512") == 512 * 256 * 2 && m.globals.at("gemm_y_n1024") == 1024 * 256 * 4,
           "route contexts, kernels and globals");
-    check(m.files().size() == 59, "59 files named (8 xclbin + 51 insts: the route adds one GEMM context whatever K, the MoE one, seven "
-                                  "streams, the token-batched expert kernel one context and six streams, and the attention GEMM one "
-                                  "context and 32 streams)");
+    check(m.files().size() == 76, "76 files named (9 xclbin + 67 insts: the route adds one GEMM context whatever K, the MoE one, seven "
+                                  "streams, the token-batched expert kernel one context and six streams, the attention GEMM one "
+                                  "context and 32 streams, and attn_fa256 one context and 16 streams)");
     // the attention products on the NPU (OPEN-PREFILL-ATTN): a stream per 256 rows of window, both
     // products, on one xclbin; full attention only
     const auto& ab = fg.attn_block;

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,8 @@ struct Linear {
     std::vector<uint16_t> w;
     std::vector<float> b;
     int out = 0, in = 0;
+    /// w re-laid as [out / 16][in][16] for the register-blocked GEMM, made at the first forward (vit.cpp)
+    mutable std::shared_ptr<const std::vector<uint16_t>> packed;
 };
 
 struct VitBlock {

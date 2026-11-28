@@ -101,10 +101,11 @@ PackOp parse_op(const json& j, const std::string& where) {
     // divides by the product of s_0..s_{layer-1}, computed at pack time.
     if (!p.div_running.empty() && (p.op != "put" || p.div_running.find("{j}") == std::string::npos))
         fail(where, p.op + " " + p.tensor + ": div_running names a per-layer {j} tensor, on a put");
-    if (!p.via.empty() && (p.op != "bf16_gemm" || p.via != "q4_1"))
-        fail(where, p.op + " " + p.tensor + ": via must be q4_1, on a bf16_gemm");
-    if (!p.split.empty() && ((p.op != "std_perm" && p.op != "gp_bfp16") || (p.split != "hi" && p.split != "lo")))
-        fail(where, p.op + " " + p.tensor + ": split must be hi or lo, on a std_perm or gp_bfp16");
+    if (!p.via.empty() && ((p.op != "bf16_gemm" && p.op != "q35_bf16") || p.via != "q4_1"))
+        fail(where, p.op + " " + p.tensor + ": via must be q4_1, on a bf16_gemm or q35_bf16");
+    if (!p.split.empty() && ((p.op != "std_perm" && p.op != "gp_bfp16" && p.op != "q35_mat") ||
+                             (p.split != "hi" && p.split != "lo")))
+        fail(where, p.op + " " + p.tensor + ": split must be hi or lo, on a std_perm, q35_mat or gp_bfp16");
     // The same fields pools::apply needs, checked here so a bad manifest is named
     // at load rather than surfacing as a "pools:" error part-way through packing.
     auto need_all = [&](std::initializer_list<std::pair<const char*, uint64_t>> fs) {
@@ -115,7 +116,8 @@ PackOp parse_op(const json& j, const std::string& where) {
         p.op == "bfp16_dit" || p.op == "put" || p.op == "expert_down" || p.op == "expert_down_gguf" || p.op == "q35_down" || p.op == "conv_transpose" || p.op == "lmhead_q8" ||
         p.op == "transpose" || p.op == "transpose_banked" || p.op == "gx_q8" || p.op == "gx_down" ||
         p.op == "gx_down_mx4" || p.op == "gx_lmhead" || p.op == "gp_bfp16" ||
-        p.op == "q35_mat" || p.op == "q35_lmhead" || p.op == "q35_t" || p.op == "q35_vec" || p.op == "q35_conv") {
+        p.op == "q35_mat" || p.op == "q35_q8" || p.op == "q35_bf16" || p.op == "q35_lmhead" || p.op == "q35_t" ||
+        p.op == "q35_vec" || p.op == "q35_conv") {
         if (p.tensor.empty()) fail(where, p.op + " without a tensor");
     } else if (p.op == "expert_stripes" || p.op == "expert_stripes_gguf" || p.op == "q35_stripes" || p.op == "gx_ug" || p.op == "gx_ug_mx4") {
         if (p.up.empty() || p.gate.empty()) fail(where, p.op + " without up / gate");
@@ -139,7 +141,7 @@ PackOp parse_op(const json& j, const std::string& where) {
     else if (p.op == "put") need_all({{"cap", p.cap}});
     else if (p.op == "lmhead_q8") need_all({{"chunk_bytes", p.chunk_bytes}, {"in_dim", p.in_dim}});
     else if (p.op == "conv_transpose") need_all({{"taps", p.taps}, {"groups", p.groups}, {"width", p.width}});
-    else if (p.op == "q35_mat") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
+    else if (p.op == "q35_mat" || p.op == "q35_q8" || p.op == "q35_bf16") need_all({{"nch", p.nch}, {"in_dim", p.in_dim}});
     else if (p.op == "q35_stripes") need_all({{"stripe_bytes", p.stripe_bytes}, {"stripes", p.stripes}, {"experts", p.experts}});
     else if (p.op == "q35_down") need_all({{"expert_bytes", p.expert_bytes}, {"experts", p.experts}});
     else if (p.op == "q35_lmhead") need_all({{"in_dim", p.in_dim}});
@@ -177,7 +179,13 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
                 ((!st.epi.empty() || !st.a_from.empty()) && st.fmt != "bfp16"))
                 fail(where, "run " + st.kernel + ": epi glu / a h / a split3 are bfp16 step options");
         } else if (st.op == "moeroute2") {
-            st.act_off = get<uint64_t>(s, "act_off", where);
+            if (s.contains("act_offs")) {
+                st.act_offs = s.at("act_offs").get<std::vector<uint64_t>>();
+                if (st.act_offs.empty()) fail(where, "moeroute2: empty act_offs");
+                st.act_off = st.act_offs[0];
+            } else {
+                st.act_off = get<uint64_t>(s, "act_off", where);
+            }
         } else if (st.op == "gptoss_route") {
             st.a_xm = get<uint64_t>(s, "a_xm", where);
             st.a_w = get<uint64_t>(s, "a_w", where);
@@ -187,6 +195,13 @@ std::vector<Step> parse_program(const json& j, const std::string& where) {
             st.router_bias = get<std::string>(s, "router_bias", where);
             st.down_bias = get<std::string>(s, "down_bias", where);
             if (!st.hidden_real) fail(where, "gptoss_route without hidden_real");
+        } else if (st.op == "shared_q8") {
+            st.a_xm = get<uint64_t>(s, "a_xm", where);
+            st.a_res = get<uint64_t>(s, "a_res", where);
+            st.up = get<std::string>(s, "up", where);
+            st.gate = get<std::string>(s, "gate", where);
+            st.down = get<std::string>(s, "down", where);
+            st.gate_inp = get<std::string>(s, "gate_inp", where);
         } else {
             fail(where, "unknown program op '" + st.op + "'");
         }
@@ -317,6 +332,9 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         if (d.rb > 1 && d.patch != "attnpos")
             fail(where, "kernel " + k + ": rb " + std::to_string(d.rb) + " needs the attnpos patch table");
         d.kvslice = v.value("kvslice", 0ull);
+        d.rows = v.value("rows", 1ull);
+        if (d.rows < 1 || (d.rows > 1 && d.patch != "moeroute2"))
+            fail(where, "kernel " + k + ": rows " + std::to_string(d.rows) + " needs the moeroute2 patch table");
         // attn_stepw.cc takes blocks of 2, 4 or 8 rows (8: attn.h's block kernel at ATTN_RB 8), and the
         // padding is its own (attn_kvslice_rows), not rb's
         if (d.kvslice && ((d.kvslice != 2 && d.kvslice != 4 && d.kvslice != 8) ||
@@ -462,6 +480,22 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
         else fail(tw, "unknown state kind " + t.state_kind);
         t.program = parse_program(need(v, "program", tw), tw);
         for (const auto& s : t.program) check_step(m, s, tw, "program");
+        if (v.contains("verify")) {
+            const json& vj = v.at("verify");
+            const std::string vw = tw + ".verify";
+            t.verify.rows = get<uint64_t>(vj, "rows", vw);
+            t.verify.act_bytes = get<uint64_t>(vj, "act", vw);
+            t.verify.state_slots = vj.value("state_slots", 0ull);
+            if (t.verify.rows < 2) fail(vw, "rows must be 2 or more");
+            if (t.state_kind == "linear" && t.verify.state_slots != t.verify.rows + 1)
+                fail(vw, "a linear layer's verify pass needs rows + 1 state slots");
+            t.verify.program = parse_program(need(vj, "program", vw), vw);
+            for (const auto& s : t.verify.program) {
+                check_step(m, s, vw, "program");
+                if (s.op == "moeroute2" && s.act_offs.size() != t.verify.rows)
+                    fail(vw, "moeroute2 needs one act offset a row");
+            }
+        }
         // the block prefill route, independent of the sequential `program`
         // above (manifest.hpp's GemmBlockProgram): a per-kind fixed step list
         auto parse_gemm_block = [&](const json& gj, const std::string& gw, GemmBlockProgram& g) {
@@ -488,8 +522,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                         // one format per weight: the q4_1 band law, or one GEMM pool the kernel was built for
                         const std::string& kind = w.pack.front().op;
                         for (const auto& o : w.pack)
-                            if (o.op != "std_perm" && o.op != "bf16_gemm" && o.op != "bfp16_dit" && o.op != "bfp16_gemm")
-                                fail(gw, "weight " + name + ": a packed weight is std_perm, bf16_gemm, bfp16_dit or bfp16_gemm ops, not " + o.op);
+                            if (o.op != "std_perm" && o.op != "bf16_gemm" && o.op != "bfp16_dit" && o.op != "bfp16_gemm" &&
+                                o.op != "q35_mat" && o.op != "q35_bf16")
+                                fail(gw, "weight " + name + ": a packed weight is std_perm, bf16_gemm, bfp16_dit, bfp16_gemm, "
+                                         "q35_mat or q35_bf16 ops, not " + o.op);
                         for (const auto& o : w.pack)
                             if (o.op != kind)
                                 fail(gw, "weight " + name + " mixes " + kind + " and " + o.op + " ops; the GEMM reads one format");
@@ -569,7 +605,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                                                           "and the windows of kernels_s");
                 }
             }
-            if (g.kind == "dense" && gj.contains("attn_fa")) {
+            if ((g.kind == "dense" || g.kind == "full") && gj.contains("attn_fa")) {
                 const json& fj = gj["attn_fa"];
                 const std::string fw = gw + ".attn_fa";
                 AttnFa& f = g.attn_fa;
@@ -577,12 +613,17 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                 f.l_max = get<uint64_t>(fj, "l_max", fw);
                 f.q_head = get<uint64_t>(fj, "q_head", fw);
                 f.qsplit = fj.value("qsplit", true);
-                // the design: 64-dim heads, a 256-token block on 32 cores, 64-key chunks
-                if (f.hd != 64 || g.t != 256 || f.l_max == 0 || f.l_max % 256)
-                    fail(fw, "wants hd 64, t 256 and l_max a positive multiple of 256");
-                if (f.q_head != 4096 * (f.qsplit ? 9u : 5u))
+                // a full layer's is attn_fa256: head dim 256, per head 64 record rows then the block's Q rows, no lo
+                const bool wide = g.kind == "full";
+                if ((wide ? f.hd != 256 || f.qsplit : f.hd != 64) || g.t != 256 || f.l_max == 0 || f.l_max % 256)
+                    fail(fw, wide ? "wants hd 256 without qsplit, t 256 and l_max a positive multiple of 256"
+                                  : "wants hd 64, t 256 and l_max a positive multiple of 256");
+                if (wide && f.q_head != (64 + 256) * 256)
+                    fail(fw, "q_head " + std::to_string(f.q_head) + " is not 64 record rows plus 256 token rows of head dim 256");
+                if (!wide && f.q_head != 4096 * (f.qsplit ? 9u : 5u))
                     fail(fw, "q_head " + std::to_string(f.q_head) + " is not the record plus Q hi" +
                                  (f.qsplit ? " and lo" : "") + " for 256 tokens of head dim 64");
+                if (wide && fj.contains("prep")) fail(fw, "prep is the dense design's stream");
                 // tiers may be sparse: a block takes the narrowest one that covers its window, the rest masked
                 for (const auto& [rows_s, kname] : need(fj, "kernels", fw).items()) {
                     const size_t rows = static_cast<size_t>(std::stoull(rows_s));
@@ -908,7 +949,7 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
                                          std::to_string(m.version) + " manifest; an engine that reads 3 cannot pack it, so it needs version 4");
                         else if (o.op == "bfp16_dit" && m.version < 7)
                             fail(tw, "bfp16_dit needs version 7");
-                        else if (o.op == "bf16_gemm" && m.version < 3)
+                        else if ((o.op == "bf16_gemm" || o.op == "q35_bf16") && m.version < 3)
                             fail(tw, "gemm_block weight " + name + " packs " + o.op + " in a manifest_version " +
                                          std::to_string(m.version) + " manifest; an engine that reads 2 cannot pack it, so it needs version 3");
                     continue;
@@ -952,6 +993,10 @@ Manifest Manifest::parse(const json& j, const std::string& where) {
     }
     m.tail = parse_program(need(j, "tail", where), where + " tail");
     for (const auto& s : m.tail) check_step(m, s, where, "tail");
+    if (j.contains("verify_tail")) {
+        m.verify_tail = parse_program(j.at("verify_tail"), where + " verify_tail");
+        for (const auto& s : m.verify_tail) check_step(m, s, where, "verify_tail");
+    }
     for (const auto& [k, v] : need(j, "globals", where).items()) {
         if (v.is_number()) {
             m.globals[k] = v.get<uint64_t>();

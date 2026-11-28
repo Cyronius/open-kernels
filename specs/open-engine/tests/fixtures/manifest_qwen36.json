@@ -250,6 +250,7 @@
   "mx": "mx_linear/final.xclbin",
   "mb": "mb_s256/final.xclbin",
   "ag": "ag_s256/final.xclbin",
+  "fa": "fa256/final.xclbin",
   "gemm": "gemm_n1024_k2048/final.xclbin"
  },
  "kernels": {
@@ -494,6 +495,86 @@
    "context": "ag",
    "insts": "ag_pv4096/insts.bin",
    "build": "ag_pv4096"
+  },
+  "fa256": {
+   "context": "fa",
+   "insts": "fa256/insts.bin",
+   "build": "fa256"
+  },
+  "fa512": {
+   "context": "fa",
+   "insts": "fa512/insts.bin",
+   "build": "fa512"
+  },
+  "fa768": {
+   "context": "fa",
+   "insts": "fa768/insts.bin",
+   "build": "fa768"
+  },
+  "fa1024": {
+   "context": "fa",
+   "insts": "fa1024/insts.bin",
+   "build": "fa1024"
+  },
+  "fa1280": {
+   "context": "fa",
+   "insts": "fa1280/insts.bin",
+   "build": "fa1280"
+  },
+  "fa1536": {
+   "context": "fa",
+   "insts": "fa1536/insts.bin",
+   "build": "fa1536"
+  },
+  "fa1792": {
+   "context": "fa",
+   "insts": "fa1792/insts.bin",
+   "build": "fa1792"
+  },
+  "fa2048": {
+   "context": "fa",
+   "insts": "fa2048/insts.bin",
+   "build": "fa2048"
+  },
+  "fa2304": {
+   "context": "fa",
+   "insts": "fa2304/insts.bin",
+   "build": "fa2304"
+  },
+  "fa2560": {
+   "context": "fa",
+   "insts": "fa2560/insts.bin",
+   "build": "fa2560"
+  },
+  "fa2816": {
+   "context": "fa",
+   "insts": "fa2816/insts.bin",
+   "build": "fa2816"
+  },
+  "fa3072": {
+   "context": "fa",
+   "insts": "fa3072/insts.bin",
+   "build": "fa3072"
+  },
+  "fa3328": {
+   "context": "fa",
+   "insts": "fa3328/insts.bin",
+   "build": "fa3328"
+  },
+  "fa3584": {
+   "context": "fa",
+   "insts": "fa3584/insts.bin",
+   "build": "fa3584"
+  },
+  "fa3840": {
+   "context": "fa",
+   "insts": "fa3840/insts.bin",
+   "build": "fa3840"
+  },
+  "fa4096": {
+   "context": "fa",
+   "insts": "fa4096/insts.bin",
+   "build": "fa4096"
   },
   "gemm_n1024_k2048": {
    "context": "gemm",
@@ -1001,6 +1082,30 @@
       "3840": "ag_pv3840",
       "4096": "ag_pv4096"
      }
+    },
+    "attn_fa": {
+     "hd": 256,
+     "l_max": 4096,
+     "q_head": 81920,
+     "qsplit": false,
+     "kernels": {
+      "256": "fa256",
+      "512": "fa512",
+      "768": "fa768",
+      "1024": "fa1024",
+      "1280": "fa1280",
+      "1536": "fa1536",
+      "1792": "fa1792",
+      "2048": "fa2048",
+      "2304": "fa2304",
+      "2560": "fa2560",
+      "2816": "fa2816",
+      "3072": "fa3072",
+      "3328": "fa3328",
+      "3584": "fa3584",
+      "3840": "fa3840",
+      "4096": "fa4096"
+     }
     }
    },
    "pack": {
@@ -1161,6 +1266,8 @@
   "ag_a": 16777216,
   "ag_b": 2097152,
   "ag_c": 33554432,
+  "fa_q": 2621440,
+  "fa_o": 4194304,
   "gemm_x_k2048": 1048576,
   "gemm_y_n1024": 1048576,
   "gemm_x_k512": 262144,
@@ -1592,6 +1699,182 @@
     "AG_N": "256"
    }
   },
+  "fa256": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l256_r4096",
+   "env": {
+    "AF_L": "256",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa512": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l512_r4096",
+   "env": {
+    "AF_L": "512",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa768": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l768_r4096",
+   "env": {
+    "AF_L": "768",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa1024": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l1024_r4096",
+   "env": {
+    "AF_L": "1024",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa1280": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l1280_r4096",
+   "env": {
+    "AF_L": "1280",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa1536": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l1536_r4096",
+   "env": {
+    "AF_L": "1536",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa1792": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l1792_r4096",
+   "env": {
+    "AF_L": "1792",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa2048": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l2048_r4096",
+   "env": {
+    "AF_L": "2048",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa2304": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l2304_r4096",
+   "env": {
+    "AF_L": "2304",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa2560": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l2560_r4096",
+   "env": {
+    "AF_L": "2560",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa2816": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l2816_r4096",
+   "env": {
+    "AF_L": "2816",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa3072": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l3072_r4096",
+   "env": {
+    "AF_L": "3072",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa3328": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l3328_r4096",
+   "env": {
+    "AF_L": "3328",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa3584": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l3584_r4096",
+   "env": {
+    "AF_L": "3584",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa3840": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l3840_r4096",
+   "env": {
+    "AF_L": "3840",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
+  "fa4096": {
+   "design": "attn_fa256/attn_fa256.py",
+   "build_dir": "attn_fa256/build_l4096_r4096",
+   "env": {
+    "AF_L": "4096",
+    "AF_HEADS": "16",
+    "AF_KV_HEADS": "2",
+    "AF_KV_LD": "1024",
+    "AF_MAX_ROWS": "4096"
+   }
+  },
   "gemm_n1024_k2048": {
    "design": "gemm_q4_prefill/gemm_q4_prefill.py",
    "build_dir": "gemm_q4_prefill/build_n1024_k2048_t256",
@@ -1914,6 +2197,7 @@
    "mx": "mx_linear/final.xclbin",
    "mb": "mb_s256/final.xclbin",
    "ag": "ag_s256/final.xclbin",
+   "fa": "fa256/final.xclbin",
    "gemm": "gemm_n1024_k2048/final.xclbin"
   },
   "kernels": {
@@ -2159,6 +2443,86 @@
     "insts": "ag_pv4096/insts.bin",
     "build": "ag_pv4096"
    },
+   "fa256": {
+    "context": "fa",
+    "insts": "fa256/insts.bin",
+    "build": "fa256"
+   },
+   "fa512": {
+    "context": "fa",
+    "insts": "fa512/insts.bin",
+    "build": "fa512"
+   },
+   "fa768": {
+    "context": "fa",
+    "insts": "fa768/insts.bin",
+    "build": "fa768"
+   },
+   "fa1024": {
+    "context": "fa",
+    "insts": "fa1024/insts.bin",
+    "build": "fa1024"
+   },
+   "fa1280": {
+    "context": "fa",
+    "insts": "fa1280/insts.bin",
+    "build": "fa1280"
+   },
+   "fa1536": {
+    "context": "fa",
+    "insts": "fa1536/insts.bin",
+    "build": "fa1536"
+   },
+   "fa1792": {
+    "context": "fa",
+    "insts": "fa1792/insts.bin",
+    "build": "fa1792"
+   },
+   "fa2048": {
+    "context": "fa",
+    "insts": "fa2048/insts.bin",
+    "build": "fa2048"
+   },
+   "fa2304": {
+    "context": "fa",
+    "insts": "fa2304/insts.bin",
+    "build": "fa2304"
+   },
+   "fa2560": {
+    "context": "fa",
+    "insts": "fa2560/insts.bin",
+    "build": "fa2560"
+   },
+   "fa2816": {
+    "context": "fa",
+    "insts": "fa2816/insts.bin",
+    "build": "fa2816"
+   },
+   "fa3072": {
+    "context": "fa",
+    "insts": "fa3072/insts.bin",
+    "build": "fa3072"
+   },
+   "fa3328": {
+    "context": "fa",
+    "insts": "fa3328/insts.bin",
+    "build": "fa3328"
+   },
+   "fa3584": {
+    "context": "fa",
+    "insts": "fa3584/insts.bin",
+    "build": "fa3584"
+   },
+   "fa3840": {
+    "context": "fa",
+    "insts": "fa3840/insts.bin",
+    "build": "fa3840"
+   },
+   "fa4096": {
+    "context": "fa",
+    "insts": "fa4096/insts.bin",
+    "build": "fa4096"
+   },
    "gemm_n1024_k2048": {
     "context": "gemm",
     "insts": "gemm_n1024_k2048/insts.bin",
@@ -2342,7 +2706,7 @@
     "pack": {
      "pool": [
       {
-       "op": "expert_stripes_gguf",
+       "op": "q35_stripes",
        "up": "blk.{l}.ffn_up_exps.weight",
        "gate": "blk.{l}.ffn_gate_exps.weight",
        "dst": 0,
@@ -2352,7 +2716,7 @@
        "in_dim": 2048
       },
       {
-       "op": "expert_down_gguf",
+       "op": "q35_down",
        "tensor": "blk.{l}.ffn_down_exps.weight",
        "dst": 335544320,
        "experts": 256,
@@ -2710,12 +3074,36 @@
        "3840": "ag_pv3840",
        "4096": "ag_pv4096"
       }
+     },
+     "attn_fa": {
+      "hd": 256,
+      "l_max": 4096,
+      "q_head": 81920,
+      "qsplit": false,
+      "kernels": {
+       "256": "fa256",
+       "512": "fa512",
+       "768": "fa768",
+       "1024": "fa1024",
+       "1280": "fa1280",
+       "1536": "fa1536",
+       "1792": "fa1792",
+       "2048": "fa2048",
+       "2304": "fa2304",
+       "2560": "fa2560",
+       "2816": "fa2816",
+       "3072": "fa3072",
+       "3328": "fa3328",
+       "3584": "fa3584",
+       "3840": "fa3840",
+       "4096": "fa4096"
+      }
      }
     },
     "pack": {
      "pool": [
       {
-       "op": "expert_stripes_gguf",
+       "op": "q35_stripes",
        "up": "blk.{l}.ffn_up_exps.weight",
        "gate": "blk.{l}.ffn_gate_exps.weight",
        "dst": 0,
@@ -2725,7 +3113,7 @@
        "in_dim": 2048
       },
       {
-       "op": "expert_down_gguf",
+       "op": "q35_down",
        "tensor": "blk.{l}.ffn_down_exps.weight",
        "dst": 335544320,
        "experts": 256,
@@ -2875,6 +3263,8 @@
    "ag_a": 16777216,
    "ag_b": 2097152,
    "ag_c": 33554432,
+   "fa_q": 2621440,
+   "fa_o": 4194304,
    "gemm_x_k2048": 1048576,
    "gemm_y_n1024": 1048576,
    "gemm_x_k512": 262144,
@@ -3304,6 +3694,182 @@
      "AG_M": "2048",
      "AG_K": "4096",
      "AG_N": "256"
+    }
+   },
+   "fa256": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l256_r4096",
+    "env": {
+     "AF_L": "256",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa512": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l512_r4096",
+    "env": {
+     "AF_L": "512",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa768": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l768_r4096",
+    "env": {
+     "AF_L": "768",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa1024": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l1024_r4096",
+    "env": {
+     "AF_L": "1024",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa1280": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l1280_r4096",
+    "env": {
+     "AF_L": "1280",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa1536": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l1536_r4096",
+    "env": {
+     "AF_L": "1536",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa1792": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l1792_r4096",
+    "env": {
+     "AF_L": "1792",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa2048": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l2048_r4096",
+    "env": {
+     "AF_L": "2048",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa2304": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l2304_r4096",
+    "env": {
+     "AF_L": "2304",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa2560": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l2560_r4096",
+    "env": {
+     "AF_L": "2560",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa2816": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l2816_r4096",
+    "env": {
+     "AF_L": "2816",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa3072": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l3072_r4096",
+    "env": {
+     "AF_L": "3072",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa3328": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l3328_r4096",
+    "env": {
+     "AF_L": "3328",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa3584": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l3584_r4096",
+    "env": {
+     "AF_L": "3584",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa3840": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l3840_r4096",
+    "env": {
+     "AF_L": "3840",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
+    }
+   },
+   "fa4096": {
+    "design": "attn_fa256/attn_fa256.py",
+    "build_dir": "attn_fa256/build_l4096_r4096",
+    "env": {
+     "AF_L": "4096",
+     "AF_HEADS": "16",
+     "AF_KV_HEADS": "2",
+     "AF_KV_LD": "1024",
+     "AF_MAX_ROWS": "4096"
     }
    },
    "gemm_n1024_k2048": {

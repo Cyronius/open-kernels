@@ -70,7 +70,7 @@ def test_the_moe_gguf_section_packs_three_d_experts():
     g = m["gguf"]
     for lt in ("linear_attention", "full_attention"):
         pool = [o["op"] for o in g["layer_types"][lt]["pack"]["pool"]]
-        assert pool[:2] == ["expert_stripes_gguf", "expert_down_gguf"]
+        assert pool[:2] == ["q35_stripes", "q35_down"]       # Q4_K experts keep their codes
         assert pool[2:5] == ["q35_mat"] * 3
         assert "q35_t" in [o["op"] for o in g["layer_types"][lt]["pack"]["consts"]]
         # the container plan keeps its own readers

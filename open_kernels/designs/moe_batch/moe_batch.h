@@ -95,6 +95,43 @@ static inline aie::vector<bfloat16, 64> mb_scale(const bfloat16 *__restrict p, u
 // C += the k-tile `ky` of W's product with the A tile `xa`. The even rows live in the chunk's
 // low nibbles and the odd in the high, and the two are taken as separate passes over the same
 // nibble bytes rather than interleaved in one.
+#ifdef MB_NATIVE
+// OPEN-MOE-NATIVE: aie2p's native bf16 mmul shape is (4, 8, 8). An 8-token sub-tile is two of them, tokens 0-3
+// and 4-7, on the SAME dequantised weight block: the A block [8 tokens][8 k] splits at lane 32 and the C block
+// [8 tokens][8 rows] is the two 4 x 8 results back to back, so every layout outside this function is unchanged.
+// Two 128 B accumulators hold what one emulated 8 x 8 did, and no mac builds its operands with vextbcst.
+template <bool ODD>
+static inline void mb_step_parity(const uint8_t *__restrict nibp, const bfloat16 *__restrict dp,
+                                  const bfloat16 *__restrict mp, unsigned ky, const bfloat16 *__restrict xa,
+                                  float *__restrict cp, unsigned s0) {
+  using MMUL = aie::mmul<4, 8, 8, bfloat16, bfloat16, accfloat>;
+  MMUL acc[2 * MB_PASS_NG];
+  for (unsigned s = 0; s < 2 * MB_PASS_NG; ++s) acc[s] = MMUL(aie::load_v<32>(cp + s * 32));
+  AIE_LOOP_RANGE(2, 2)
+  for (unsigned kb = 0; kb < 2; ++kb) {
+    const unsigned kb_abs = ky * 2 + kb;
+    const aie::vector<bfloat16, 64> d = mb_scale<ODD, true>(dp, kb_abs);
+    const aie::vector<bfloat16, 64> m = mb_scale<ODD, false>(mp, kb_abs);
+    AIE_LOOP_UNROLL_FULL
+    for (unsigned il = 0; il < 4; ++il) {
+      const unsigned i = kb * 4 + il;
+      const aie::vector<uint8_t, 64> q = aie::load_v<64>(nibp + i * 64);
+      const aie::vector<bfloat16, 64> n =
+          aie::to_float<bfloat16>(aie::bit_and((uint8_t)(ODD ? 0xF0 : 0x0F), q), 0);
+      accN<64> se;
+      se.from_vector(m);
+      se = aie::mac(se, n, d);
+      const aie::vector<bfloat16, 64> w = se.template to_vector<bfloat16>();
+      for (unsigned s = 0; s < MB_PASS_NG; ++s) {
+        const aie::vector<bfloat16, 64> a = aie::load_v<64>(xa + (i * MB_NG + s0 + s) * 64);
+        acc[2 * s].mac(a.template extract<32>(0), w);
+        acc[2 * s + 1].mac(a.template extract<32>(1), w);
+      }
+    }
+  }
+  for (unsigned s = 0; s < 2 * MB_PASS_NG; ++s) aie::store_v(cp + s * 32, acc[s].template to_vector<float>());
+}
+#else
 template <bool ODD>
 static inline void mb_step_parity(const uint8_t *__restrict nibp, const bfloat16 *__restrict dp,
                                   const bfloat16 *__restrict mp, unsigned ky, const bfloat16 *__restrict xa,
@@ -135,6 +172,67 @@ static inline void mb_step_parity(const uint8_t *__restrict nibp, const bfloat16
   }
   for (unsigned s = 0; s < MB_PASS_NG; ++s) aie::store_v(cp + s * 64, acc[s].template to_vector<float>());
 }
+#endif
+
+#ifdef MB_DQBUF
+// OPEN-MOE-DQBUF: one PARITY of a 16-row group for EVERY 8-token sub-tile of the slot, the weight dequantised ONCE:
+// the k-tile's eight 8 k x 8 row blocks go to a 1 KB L1 buffer, then each sub-tile's accumulator runs its eight macs
+// on them. One accumulator is live at a time (the register-file constraint above), and above MB_NT 8 the dequant is
+// no longer repeated per sub-tile. The products and their order per sub-tile are mb_step_parity's: the same bits.
+template <bool ODD>
+static inline void mb_step_parity_all(const uint8_t *__restrict nibp, const bfloat16 *__restrict dp,
+                                      const bfloat16 *__restrict mp, unsigned ky, const bfloat16 *__restrict xa,
+                                      float *__restrict cp) {
+  using MMUL = aie::mmul<8, 8, 8, bfloat16, bfloat16, accfloat>;
+  alignas(64) bfloat16 wb[8 * 64];
+  AIE_LOOP_RANGE(2, 2)
+  for (unsigned kb = 0; kb < 2; ++kb) {
+    const unsigned kb_abs = ky * 2 + kb;
+    const aie::vector<bfloat16, 64> d = mb_scale<ODD, true>(dp, kb_abs);
+    const aie::vector<bfloat16, 64> m = mb_scale<ODD, false>(mp, kb_abs);
+    AIE_LOOP_UNROLL_FULL
+    for (unsigned il = 0; il < 4; ++il) {
+      const unsigned i = kb * 4 + il;
+      const aie::vector<uint8_t, 64> q = aie::load_v<64>(nibp + i * 64);
+      const aie::vector<bfloat16, 64> n =
+          aie::to_float<bfloat16>(aie::bit_and((uint8_t)(ODD ? 0xF0 : 0x0F), q), 0);
+      accN<64> se;
+      se.from_vector(m);
+      se = aie::mac(se, n, d);
+      aie::store_v(wb + i * 64, se.template to_vector<bfloat16>());
+    }
+  }
+#ifdef MB_DQNATIVE
+  // the native (4, 8, 8) shape: tokens 0-3 and 4-7 of a sub-tile as two accumulators on the same weight block
+  using M4 = aie::mmul<4, 8, 8, bfloat16, bfloat16, accfloat>;
+  AIE_LOOP_RANGE(MB_NG, MB_NG)
+  for (unsigned s = 0; s < MB_NG; ++s) {
+    M4 lo(aie::load_v<32>(cp + s * 64)), hi(aie::load_v<32>(cp + s * 64 + 32));
+    AIE_LOOP_RANGE(8, 8)
+    for (unsigned i = 0; i < 8; ++i) {
+      const aie::vector<bfloat16, 64> a = aie::load_v<64>(xa + (i * MB_NG + s) * 64);
+      const aie::vector<bfloat16, 64> w = aie::load_v<64>(wb + i * 64);
+      lo.mac(a.template extract<32>(0), w);
+      hi.mac(a.template extract<32>(1), w);
+    }
+    aie::store_v(cp + s * 64, lo.template to_vector<float>());
+    aie::store_v(cp + s * 64 + 32, hi.template to_vector<float>());
+  }
+#else
+  AIE_LOOP_RANGE(MB_NG, MB_NG)
+  for (unsigned s = 0; s < MB_NG; ++s) {
+    MMUL acc(aie::load_v<64>(cp + s * 64));
+#ifdef MB_DQUNROLL
+    AIE_LOOP_UNROLL_FULL
+#else
+    AIE_LOOP_RANGE(8, 8)
+#endif
+    for (unsigned i = 0; i < 8; ++i) acc.mac(aie::load_v<64>(xa + (i * MB_NG + s) * 64), aie::load_v<64>(wb + i * 64));
+    aie::store_v(cp + s * 64, acc.template to_vector<float>());
+  }
+#endif
+}
+#endif
 
 // C[band's 64 rows x MB_NT tokens] += k-tile ky of W[band] times the A tile `xa`: the band's
 // four 16-row groups, each a pair of parity passes over the same 64 bytes of nibbles, and
@@ -149,6 +247,20 @@ static inline void mb_step_tile(const uint8_t *__restrict band, unsigned ky, con
                                 float *__restrict c) {
 #ifdef MB_NULL_MM
   return;   // timing ablation: the streams without any core work
+#endif
+#ifdef MB_DQBUF
+  AIE_LOOP_RANGE(4, 4)
+  for (unsigned g = 0; g < 4; ++g) {
+    const uint8_t *__restrict chunk = band + (g >> 1) * MB_CHUNK;
+    const unsigned half = g & 1;
+    const uint8_t *__restrict nibp = chunk + MB_NIB + half * 2048 + ky * 512;
+    const bfloat16 *__restrict dp = reinterpret_cast<const bfloat16 *>(chunk) + half * 16;
+    const bfloat16 *__restrict mp = reinterpret_cast<const bfloat16 *>(chunk + 512) + half * 16;
+    float *__restrict cb = c + (g * 2 * MB_NG) * 64;
+    mb_step_parity_all<false>(nibp, dp, mp, ky, xa, cb);
+    mb_step_parity_all<true>(nibp, dp, mp, ky, xa, cb + MB_NG * 64);
+  }
+  return;
 #endif
   // The sub-tile pass is the OUTER loop, and is not unrolled: unrolling it, or nesting it
   // inside the row-group loop, emits MB_NG copies of the pair and a 16-row group's pair is

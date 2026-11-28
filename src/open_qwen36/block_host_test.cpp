@@ -602,6 +602,55 @@ int main(int argc, char** argv) {
         check(ok, "argmax_bf16_row: the scalar bf16 greedy's answer, ties to the lowest id");
     }
 
+    // ---- OPEN-SHARED-HOST-Q8: the host shared expert against an fp64 forward of the same Q8 codes
+    {
+        const size_t hid = 256, ff = 64;
+        std::vector<float> wu(ff * hid), wg(ff * hid), wd(hid * ff), gw(hid), xm(hid), res(hid);
+        for (size_t i = 0; i < ff * hid; ++i) {
+            wu[i] = static_cast<float>(std::sin(0.013 * static_cast<double>(i)) * 0.05);
+            wg[i] = static_cast<float>(std::cos(0.007 * static_cast<double>(i)) * 0.05);
+            wd[i] = static_cast<float>(std::sin(0.019 * static_cast<double>(i) + 1.0) * 0.05);
+        }
+        for (size_t i = 0; i < hid; ++i) {
+            gw[i] = static_cast<float>(std::cos(0.05 * static_cast<double>(i)) * 0.02);
+            xm[i] = static_cast<float>(std::sin(0.3 * static_cast<double>(i)) * 2.0);
+            res[i] = static_cast<float>(i % 7) - 3.f;
+        }
+        std::vector<float> ugw(wu);
+        ugw.insert(ugw.end(), wg.begin(), wg.end());
+        const host::Q8Rows ug = host::q8_rows(ugw.data(), 2 * ff, hid), dn = host::q8_rows(wd.data(), hid, ff);
+        auto deq = [](const host::Q8Rows& m, size_t r, size_t c) {
+            return static_cast<double>(m.q[r * m.cols + c]) * m.d[(r * m.cols + c) / 32];
+        };
+        std::vector<double> h(ff), want(hid);
+        for (size_t j = 0; j < ff; ++j) {
+            double u = 0, g = 0;
+            for (size_t i = 0; i < hid; ++i) {
+                u += deq(ug, j, i) * xm[i];
+                g += deq(ug, ff + j, i) * xm[i];
+            }
+            h[j] = g / (1 + std::exp(-g)) * u;
+        }
+        double dot = 0;
+        for (size_t i = 0; i < hid; ++i) dot += static_cast<double>(xm[i]) * gw[i];
+        const double gate = 1 / (1 + std::exp(-dot));
+        for (size_t i = 0; i < hid; ++i) {
+            double y = 0;
+            for (size_t j = 0; j < ff; ++j) y += deq(dn, i, j) * h[j];
+            want[i] = res[i] + gate * y;
+        }
+        double err = 0, mag = 0;
+        host::shared_expert_q8(ug, dn, gw.data(), xm.data(), res.data());
+        for (size_t i = 0; i < hid; ++i) {
+            err = std::max(err, std::fabs(res[i] - want[i]));
+            mag = std::max(mag, std::fabs(want[i]));
+        }
+        check(err < 1e-5 * mag, "shared_expert_q8: the fp64 forward of the same codes (max err " + std::to_string(err) + ")");
+        float rq = 0;
+        for (size_t i = 0; i < ff * hid; ++i) rq = std::max(rq, std::fabs(static_cast<float>(deq(ug, i / hid, i % hid)) - wu[i]));
+        check(rq < 0.05f / 127.f, "q8_rows: codes within half a step of amax / 127");
+    }
+
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

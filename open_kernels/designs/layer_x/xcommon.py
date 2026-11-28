@@ -79,6 +79,8 @@ LN_SPLIT = R.ln_split
 LNI_DEPTH = 3 if LN_SPLIT else 5      # the norm helper's input fifo: [x0 x1 w] at most when split
 ELN = R.layout.ELN                    # the norm helper's element: HID*2 bytes
 NE, NX = C.NE, C.NX                   # routed experts, + the shared one
+# a q8 shared expert runs on the host in decode (recipes/qwen36moe.py shared_host); the streams carry NE slots
+NX_DECODE = NE if R.spec.num_experts and R.spec.quant_of("shared") == "q8" else NX
 HID, FF = C.HID, C.FF
 TILE = C.TILE
 PER_CALL = C.PER_CALL
@@ -283,7 +285,7 @@ def kernels(inc, t):
     if NEED_Q4_GY:
         k["gy"] = ef("gemv_q4_gy", [e, tab, y, i32, i32, i32])      # (t, tab, ye, group, per_band, rs)
     k["gup"] = ef("gemv_q4_gup", [e, tab, ms, i32, i32], GUP_OS)    # (t, tab, ms, group, band)  u | g
-    k["gdown"] = ef("gemv_q4_gdown", [e, tab, ms, i32, i32])        # (t, tab, ms, j, slot)      routed / shared law
+    k["gdown"] = ef("gemv_q4_gdown", [e, tab, ms, i32, i32])   # (t, tab, ms, j, slot)
     # activation tables: x (one element, K = HID) and the two-element og (K = KWIDE)
     k["prep2048"] = ExternalFunction(f"gemv_q4_prep_k{HID}", source_file=str(_gemv_prep_entry(HID)),
                                      arg_types=[x, tab], include_dirs=inc, compile_flags=OS)
@@ -582,7 +584,8 @@ def moe_body(win, ain, yout, B, K, nx=NX):
 
 
 def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
-                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False, ug_bd=False):
+                 A_BYTES, C_BYTES, A_XM, A_ROUT, A_RES, A_HP, C_SGW, nx=NX, early_down=False, ug_bd=False,
+                 xres_t=HID, xres_off=0, slot0=0):
     """Host sequence of the MoE block (one instruction-stream part). Routed slot j's fills carry
     placeholder pool offsets (expert j); moeroute2 rewrites them from the router output.
     nx must match the body's: NE drops the shared expert's fills with its slot.
@@ -597,7 +600,9 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
     stripe apart as the BD's outer (iteration) dimension, the shared expert's two halves likewise --
     instead of two: the channel carries the same bytes in the same order with one transfer fewer a
     slot (the stream issues ~0.7 us a transfer). moeroute2 patches the transfer's base, which is
-    the up half's offset as before."""
+    the up half's offset as before.
+
+    slot0 (vlx.py, two rows): routed slot e compiles as placeholder expert slot0 + e, so moeroute2 tells the rows apart."""
     spp, cps = C.STRIPES_PER_PROJ, C.CORES_PER_STRIPE
     pipe_x.fill(x_prod, a_act, bt(A_BYTES, A_XM, ELEM))
     for c in range(N_CORES):
@@ -607,7 +612,7 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
     for e in range(nx):
         for c in range(N_CORES):
             if e < NE:
-                up = (2 * spp * e + 2 * (c // cps)) * STRIPE + (c % cps) * PAIR
+                up = (2 * spp * (slot0 + e) + 2 * (c // cps)) * STRIPE + (c % cps) * PAIR
                 if ug_bd:
                     pipe_w.fill(w_prods[c], a_pool, TensorAccessPattern(
                         (1, POOL_BYTES), up, [2, HID // 256, 4, PAIR // 4], [STRIPE, 2 * PAIR, PAIR // 4, 1]))
@@ -627,7 +632,7 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
         def down_fills():
             for c in range(N_CORES):
                 if e < NE:
-                    pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + e * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
+                    pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_DOWN + (slot0 + e) * UP_BYTES + c * DOWN_PER_CORE * DOWN_BAND,
                                                        DOWN_PER_CORE * DOWN_BAND))
                 else:
                     pipe_w.fill(w_prods[c], a_pool, bt(POOL_BYTES, POOL_SHARE_DOWN + c * DOWN_PER_CORE * DOWN_BAND,
@@ -639,7 +644,7 @@ def moe_sequence(pipe_w, pipe_x, pipe_y, a_pool, a_consts, a_act, c_xres, w_prod
         if not early_down:
             down_fills()
     for c in range(N_CORES):
-        pipe_y.drain(y_conss[c], c_xres, bt(HID, c * ROWS_PC, ROWS_PC))   # the block output = the new residual
+        pipe_y.drain(y_conss[c], c_xres, bt(xres_t, xres_off + c * ROWS_PC, ROWS_PC))   # the block output = the new residual
     pipe_w.finish()
     pipe_x.finish()
     pipe_y.finish()

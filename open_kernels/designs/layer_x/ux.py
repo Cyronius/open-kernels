@@ -127,9 +127,13 @@ if D is None or A is None:
     sys.exit("ux.py: the merged layer image needs BOTH a linear-attention and a full-attention layer type")
 if X.KIND != "moe":
     sys.exit("ux.py: the merged layer image is the MoE composition's (qwen36moe); the dense tail is lx/ax")
-if X.Q8:
-    sys.exit(f"ux.py: a q8 projection role ({sorted(X.Q8)}) would put two GEMV entries on the main core; "
-             "the merged image assumes both stages take the same q4_1 call")
+# OPEN-DECODE-ONE-CONTEXT-Q8: with EVERY projection role at q8 (the Unsloth GGUF's Q8_0 projections) both stages
+# still take one GEMV entry -- the q8 one -- so the merged program is lx's q8 program with nA and nh read at runtime.
+# A spec with some roles at q8 and some at q4_1 would need two entries and stays on lx / ax.
+ALL_Q8 = {"attn", "linear", "linear_out"} <= set(X.Q8)
+if X.Q8 and not ALL_Q8:
+    sys.exit(f"ux.py: q8 projection roles {sorted(X.Q8)} but not all of attn / linear / linear_out: two GEMV "
+             "entries on the main core; the merged image needs one")
 
 HID = X.HID
 N_CORES = X.N_CORES
@@ -143,6 +147,9 @@ if (OUT_PC, OUT_K, D.OG_ELEMS) != (O_PC, O_K, A.OG_ELEMS):
              f"{D.OG_ELEMS} elements against full {O_PC} of K={O_K} in {A.OG_ELEMS}. One image "
              "can only share that stage while they match.")
 OG_ELEMS = D.OG_ELEMS
+if ALL_Q8 and ((X.role_groups("linear", HID), X.role_per_band("linear", HID)) != (X.role_groups("attn", HID), X.role_per_band("attn", HID))
+               or (X.role_groups("linear_out", OUT_K), X.role_per_band("linear_out", OUT_K)) != (X.role_groups("attn", O_K), X.role_per_band("attn", O_K))):
+    sys.exit("ux.py: the q8 roles' band geometries differ between the layer types; one image cannot share the stages")
 NBANDS_LIN = QKV_PC + Z_PC                       # RTP word 0, linear stream
 NBANDS_FULL = 2 * Q_PC + 2 * KV_PC               # RTP word 0, full stream
 DN_HEADS_PC = X.DN_HEADS_PC                      # RTP word 1, linear stream (full: 0)
@@ -229,7 +236,10 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         nbands = my_rtp[0]                                  # 24 linear | 18 full
         nheads = my_rtp[1]                                  # 4 linear | 0 full
         K["prep2048"](xe, tab)
-        X.gemv_bands(win, yout, tab, K["gy"], nbands, X.n_groups(HID), X.per_band(HID), 2)
+        if ALL_Q8:
+            X.gemv_bands(win, yout, tab, K["gy8"], nbands, X.role_groups("linear", HID), X.role_per_band("linear", HID), 4)
+        else:
+            X.gemv_bands(win, yout, tab, K["gy"], nbands, X.n_groups(HID), X.per_band(HID), 2)
         xin.release(1)
         X.dn_body(win, yout, B, K, nheads)
         oe = xin.acquire(2)                                 # og, K = OUT_K (= O_K)
@@ -237,7 +247,7 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         K["prep4096b"](oe[1], tab)
         X.role_gemv_bands(win, yout, B, K, "linear_out", OUT_PC, OUT_K)
         xin.release(2)
-        X.moe_body(win, xin, yout, B, K)
+        X.moe_body(win, xin, yout, B, K, nx=X.NX_DECODE)
 
     if RSPLIT:
         racc2 = ExternalFunction("router_acc2", source_file=str(X.RT / "router_acc2.cc"),
@@ -293,14 +303,14 @@ def ux(pool: In, xres: InOut, consts: In, state: InOut, act: InOut, ptab: In, *,
         elif part == 1:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, A_XM, A_ROUT, A_RES, A_HP, C_SGW,
-                           early_down=WORDER, ug_bd=SEQ)
+                           early_down=WORDER, ug_bd=SEQ, nx=X.NX_DECODE)
         elif part == 2:
             full_sequence(a_pool, c_xres, a_consts, a_state, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
                           ain_p, aout_c, og_cs, rin_p)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres,
                            w_prods, x_prod, y_conss, ACT_T, CONSTS_T, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW,
-                           early_down=WORDER, ug_bd=SEQ)
+                           early_down=WORDER, ug_bd=SEQ, nx=X.NX_DECODE)
 
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, state_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),

@@ -32,11 +32,13 @@ def q8_gy(pc: int) -> str:
     (OPEN-QUANT-Q8). One symbol, one TU, generated only when a role is q8."""
     return f'''#define GEMV_PER_CALL {pc}
 #include "gemv_q8.h"
-// A q8 projection band into its y element: runtime band law (per_band half-tiles, rs = 4).
+// A q8 projection band into its y element: runtime band law (per_band half-tiles). rs is always 4;
+// the constant keeps a 144 B software divide off the crowded main cores.
 extern "C" {{
 void gemv_q8_gy(const uint8_t *__restrict t, const uint8_t *__restrict tab, float *__restrict y,
                 int32_t group, int32_t per_band, int32_t rs) {{
-  gemv_q8_pool_group_rt(t, tab, (unsigned)group, y, (unsigned)per_band, (unsigned)rs);
+  (void)rs;
+  gemv_q8_pool_group_rt(t, tab, (unsigned)group, y, (unsigned)per_band, 4);
 }}
 }}
 '''

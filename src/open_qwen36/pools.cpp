@@ -917,8 +917,10 @@ void q35_type(GgufFile::Type t, size_t* bb, size_t* bv, const std::string& name)
 /// GGUF block is itself d * q + m with 4-bit q, else its f32 values in `v`.
 struct Q35Block {
     bool exact = false;
-    float d = 0.f, m = 0.f;
+    bool q8 = false;             // a Q8_0 block: s * c exactly (v holds the same values)
+    float d = 0.f, m = 0.f, s = 0.f;
     uint8_t q[32];
+    int8_t c[32];
     float v[32];
 };
 
@@ -990,7 +992,10 @@ void q35_block(GgufFile::Type t, const uint8_t* row, size_t kb, Q35Block& o) {
             std::memcpy(&h, b, 2);
             const float d = fp16_to_f32(h);
             o.exact = false;
-            for (int i = 0; i < 32; ++i) o.v[i] = d * static_cast<int8_t>(b[2 + i]);
+            o.q8 = true;
+            o.s = d;
+            std::memcpy(o.c, b + 2, 32);
+            for (int i = 0; i < 32; ++i) o.v[i] = d * o.c[i];
             return;
         }
         case GgufFile::Type::Q6_K: {
@@ -1086,6 +1091,32 @@ void q35_put(const Q35Block& b, unsigned r, unsigned kb, uint8_t* chunk) {
     }
 }
 
+/// One block into a q8 chunk (8704 B: bf16 scale[kb * 32 + r], then int8 code_index(r, kb, i)), the
+/// q4nx container's q8 chunk. A Q8_0 block keeps its codes and rounds its scale (RNE to bf16); any
+/// other block is requantized: scale = bf16_ceil(amax / 127), codes rounded to nearest.
+void q35_put8(const Q35Block& b, unsigned r, unsigned kb, uint8_t* chunk) {
+    uint16_t su;
+    int8_t q[32];
+    if (b.q8) {
+        su = bf16_rne(b.s);
+        std::memcpy(q, b.c, 32);
+    } else {
+        float v[32], amax = 0.f;
+        for (int i = 0; i < 32; ++i) {
+            v[i] = b.exact ? b.d * b.q[i] + b.m : b.v[i];
+            amax = std::max(amax, std::fabs(v[i]));
+        }
+        su = bf16_ceil(amax / 127.f);
+        const float sf = bf16_to_f32(su), inv = sf > 0.f ? 1.f / sf : 0.f;
+        for (int i = 0; i < 32; ++i) {
+            const long qi = std::lround(v[i] * inv);
+            q[i] = static_cast<int8_t>(qi < -127 ? -127 : qi > 127 ? 127 : qi);
+        }
+    }
+    std::memcpy(chunk + 2 * (kb * 32 + r), &su, 2);
+    for (unsigned i = 0; i < 32; ++i) chunk[512 + code_index(r, kb, i)] = static_cast<uint8_t>(q[i]);
+}
+
 /// A GGUF tensor the q35 ops read: its type, block geometry, [experts,] rows, cols.
 struct Q35Tensor {
     const uint8_t* base = nullptr;
@@ -1131,6 +1162,27 @@ void q35_chunk(const Q35Tensor& t, size_t e, const Q35Map& rmap, const Q35Map& c
             if (sc % 32 || sc >= t.cols) fail("q35 chunk: source column block " + std::to_string(sc));
             q35_block(t.type, row, sc / 32, b);
             q35_put(b, r, kb, chunk);
+        }
+    }
+}
+
+/// q35_chunk's q8 twin: a whole 8704-B q8 chunk (32 rows x 256 columns) of tensor `t`.
+void q35_chunk8(const Q35Tensor& t, size_t e, const Q35Map& rmap, const Q35Map& cmap, size_t row0, size_t kt,
+                size_t rows_lim, size_t cols_lim, uint8_t* chunk) {
+    std::memset(chunk, 0, Q8_CHUNK);
+    Q35Block b;
+    for (unsigned r = 0; r < 32; ++r) {
+        if (row0 + r >= rows_lim) break;
+        const size_t sr = rmap(row0 + r);
+        if (sr >= t.rows) fail("q35 chunk: source row " + std::to_string(sr) + " past " + std::to_string(t.rows));
+        const uint8_t* row = t.row(e, sr);
+        for (unsigned kb = 0; kb < 8; ++kb) {
+            const size_t col = 256 * kt + 32 * kb;
+            if (col >= cols_lim) break;
+            const size_t sc = cmap(col);
+            if (sc % 32 || sc >= t.cols) fail("q35 chunk: source column block " + std::to_string(sc));
+            q35_block(t.type, row, sc / 32, b);
+            q35_put8(b, r, kb, chunk);
         }
     }
 }
@@ -1187,12 +1239,18 @@ std::vector<float> q35_values(const PackOp& op, const WeightFile& m, int layer) 
 }
 }  // namespace
 
+std::vector<float> const_values(const PackOp& op, const WeightFile& m, int layer) {
+    if (op.op == "q35_t" || op.op == "q35_vec" || op.op == "q35_conv") return q35_values(op, m, layer);
+    if (op.op != "put") fail("const_values: " + op.tensor + " is a " + op.op + " const, not a put or q35 one");
+    return m.bf16(with_layer(op.tensor, layer));
+}
+
 uint64_t op_bytes(const PackOp& op, size_t chunk_bytes) {
     if (op.op == "bfp16_dit") return op.nch * 9216;
     if (op.op == "bfp16_gemm") return op.n_total * op.ksplit * op.in_dim / 8 * BFP16_BLOCK_BYTES;
     if (op.op == "gp_bfp16") return op.n_total * op.in_dim / 8 * BFP16_BLOCK_BYTES;
     if (op.op == "gp_mx4") return op.experts * op.expert_bytes;
-    return op.op == "bf16_gemm" ? op.nch * 2 * 8192 : op.nch * chunk_bytes;
+    return op.op == "bf16_gemm" || op.op == "q35_bf16" ? op.nch * 2 * 8192 : op.nch * chunk_bytes;
 }
 
 void requant_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst) {
@@ -1679,10 +1737,69 @@ static void apply_op(const PackOp& op, const WeightFile& m, int layer, uint8_t* 
                                       std::to_string(op.in_dim));
         bounds(op, op.nch * ch, dst_bytes);
         const auto perm = std_perm(op.nch, op.in_dim);
+        if (!op.split.empty()) {
+            // one half of the exact q4_1 split of the q8 chunk q35_q8 streams (the block route's weight)
+            const bool hi = op.split == "hi";
+            pack_dynamic(op.nch, [&](size_t c) {
+                std::vector<uint8_t> q8(Q8_CHUNK);
+                q35_chunk8(t, 0, rmap, cmap, 32 * (perm[c] / ncol), perm[c] % ncol, out_dim, op.in_dim, q8.data());
+                split_q4_1_chunks(q8.data(), 1, hi, dst + op.dst + c * ch);
+            });
+            return;
+        }
         pack_dynamic(op.nch, [&](size_t c) {
             q35_chunk(t, 0, rmap, cmap, 32 * (perm[c] / ncol), perm[c] % ncol, out_dim, op.in_dim,
                       dst + op.dst + c * ch);
         });
+    } else if (op.op == "q35_q8") {
+        // a GGUF [out, in] matrix streamed at q8: q8_perm's half-tiles of the q8 chunks q35_chunk8
+        // builds, through q35_mat's maps. `nch` counts pool half-tiles (5120 B each), as for q8_perm.
+        const std::string name = with_layer(op.tensor, layer);
+        if (ch != Q4_CHUNK) fail("q35_q8 " + name + ": the q8 half-tile is 5120 B, the pool's chunk is " + std::to_string(ch));
+        if (op.nch == 0 || op.in_dim == 0 || op.nch % 2) fail("q35_q8 " + name + " without an even nch / in_dim");
+        const Q35Tensor t = q35_tensor(m, name, 0);
+        const size_t ncol = op.in_dim / 256, out_dim = op.nch / 2 / ncol * 32;
+        const Q35Map rmap = q35_map(op, true), cmap = q35_map(op, false);
+        if (t.cols != op.in_dim) fail("q35_q8 " + name + " has " + std::to_string(t.cols) + " columns, the plan " +
+                                      std::to_string(op.in_dim));
+        bounds(op, op.nch * ch, dst_bytes);
+        const auto perm = q8_perm(op.nch, op.in_dim);
+        // the two half-tiles of a source chunk are not adjacent in the perm: build each chunk once
+        std::vector<std::pair<size_t, size_t>> where(op.nch / 2, {SIZE_MAX, SIZE_MAX});
+        for (size_t c = 0; c < op.nch; ++c) {
+            auto& w = where.at(perm[c].first);
+            (perm[c].second ? w.second : w.first) = c;
+        }
+        pack_dynamic(where.size(), [&](size_t f) {
+            std::vector<uint8_t> q8(Q8_CHUNK);
+            q35_chunk8(t, 0, rmap, cmap, 32 * (f / ncol), f % ncol, out_dim, op.in_dim, q8.data());
+            if (where[f].first != SIZE_MAX) q8_half_tile(q8.data(), 0, dst + op.dst + where[f].first * ch);
+            if (where[f].second != SIZE_MAX) q8_half_tile(q8.data(), 1, dst + op.dst + where[f].second * ch);
+        });
+    } else if (op.op == "q35_bf16") {
+        // a GGUF [out, in] matrix as the bf16 GEMM's weight (bf16_gemm's layout), through q35_mat's maps:
+        // the q8 chunks q35_q8 streams, or with `via` q4_1 the q4_1 chunks q35_mat packs
+        const std::string name = with_layer(op.tensor, layer);
+        if (op.nch == 0 || op.in_dim == 0 || op.in_dim % 256) fail("q35_bf16 " + name + " without nch / in_dim");
+        const size_t ncol = op.in_dim / 256;
+        if (op.nch % ncol || (op.nch / ncol) % 2)
+            fail("q35_bf16 " + name + ": " + std::to_string(op.nch) + " chunks is not whole 64-row bands of a " +
+                 std::to_string(op.in_dim) + "-wide tensor");
+        const Q35Tensor t = q35_tensor(m, name, 0);
+        if (t.cols != op.in_dim) fail("q35_bf16 " + name + " has " + std::to_string(t.cols) + " columns, the plan " +
+                                      std::to_string(op.in_dim));
+        bounds(op, op_bytes(op, ch), dst_bytes);
+        const size_t rows = op.nch / ncol * 32;
+        const Q35Map rmap = q35_map(op, true), cmap = q35_map(op, false);
+        const bool q4 = op.via == "q4_1";
+        const size_t sch = q4 ? Q4_CHUNK : Q8_CHUNK;
+        std::vector<uint8_t> src(op.nch * sch);
+        pack_dynamic(op.nch, [&](size_t f) {
+            uint8_t* c = src.data() + f * sch;
+            if (q4) q35_chunk(t, 0, rmap, cmap, 32 * (f / ncol), f % ncol, rows, op.in_dim, c);
+            else q35_chunk8(t, 0, rmap, cmap, 32 * (f / ncol), f % ncol, rows, op.in_dim, c);
+        });
+        bf16_gemm_pack(src.data(), !q4, rows, op.in_dim, reinterpret_cast<uint16_t*>(dst + op.dst));
     } else if (op.op == "q35_stripes" || op.op == "q35_down") {
         // the routed experts, GGUF [E, rows, cols], in expert_stripes' / expert_down's chunk orders:
         // stripes  per expert 2 * stripes stripes of [up_k | gate_k], stripe chunk c = rows

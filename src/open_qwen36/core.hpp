@@ -61,6 +61,8 @@ struct CoreConfig {
     bool verbose = true;
     std::string prefill_mode = "fast";  ///< OPEN-PREFILL-MODE: fast | lean (accurate is lean) | bfp16
     bool draft = false;      ///< pack the model's draft adapter (uno.q4nx) if it has one; off unless asked (OPEN-UNO-DECODE)
+    bool verify = false;     ///< load the verify pass when every layer has one (OPEN-VERIFY-ROWS-QWEN36MOE); also OFLM_OPEN_VERIFY=1
+    bool mtp = false;        ///< load the MTP layer when the GGUF has one and verify is on (OPEN-SPEC-MTP-QWEN36MOE); also OFLM_OPEN_MTP=1
 };
 
 /// Everything a request needs to be resumed later (the app's checkpoint/restore).
@@ -282,6 +284,14 @@ public:
     /// The MoE kinds (linear / full) here; the dense kind goes to step_gemm_prompt_dense --
     /// layer_major_ok() says whether either can run.
     void step_gemm_prompt(const std::vector<int>& ids, bool want_logits);
+    /// step_gemm_prompt with input rows and M-RoPE positions of the caller's (OPEN-VISION-BLOCK): row t is
+    /// embeds[t] (hidden floats: an image patch from the vision tower) when that is not null, else token
+    /// ids[t]'s embedding, and turns by the (t, h, w) position at mpos[3 t]. Starts the M-RoPE counter
+    /// (mrope_begin) and leaves it at `next_mpos`, the position the next text token takes. The MoE layer-major
+    /// route only (moe_layer_major_ok()); a text prompt after an image goes through step_gemm_prompt, which
+    /// takes the counter's positions by itself.
+    void step_gemm_prompt_mrope(const std::vector<int>& ids, const std::vector<const float*>& embeds,
+                                const std::vector<int64_t>& mpos, int64_t next_mpos, bool want_logits);
     /// Whether step_gemm_prompt() can run this kernel set: a block route whose every
     /// layer is a MoE kind, or the dense kind where dense_layer_major_ok() says so, and
     /// OFLM_OPEN_LAYER_MAJOR not set to 0 -- or GPT-OSS's own route (gptoss_prefill_ok()).
@@ -314,6 +324,21 @@ public:
     size_t rows_l() const { return w_ ? w_->rows.l : 0; }
     // draft: the OPEN-UNO-LORA pass, the LoRA on every row but row 0.
     void step_rows(const int* ids, int* argmax, bool want_logits = false, bool draft = false);
+    // OPEN-VERIFY-ROWS-QWEN36MOE: verify_rows() tokens through every layer in one weight pass, each row bit-identical
+    // to a decode step; writes the rows' KV and state slots but does not move the position (verify_commit does)
+    size_t verify_rows() const { return verify_on_ ? verify_rows_ : 0; }
+    void step_verify(const int* ids, int* argmax, bool want_logits = false);
+    const float* verify_logits(size_t r) const { return verify_logits_.at(r).data(); }
+    /// keep rows 0 .. n - 1 of the last step_verify: their state becomes the committed one, the position moves n
+    void verify_commit(size_t n);
+    double verify_ms() const { return verify_ms_; }
+    // OPEN-SPEC-MTP-QWEN36MOE: the GGUF's MTP layer (blk.<layers>), packed as one more full-attention layer when
+    // OFLM_OPEN_MTP=1. mtp_step writes MTP cache row `pos` from (token, h) -- h the main model's pre-norm output at
+    // position pos, token the one after it -- and returns its guess for the token after that (-1 unless want).
+    bool mtp_ready() const { return mtp_on_; }
+    int mtp_step(int token, const float* h, int pos, bool want);
+    /// the main model's pre-norm output after the last step (row 0) or verify pass (row r)
+    std::vector<float> hidden_row(bool verify, size_t r);
     bool has_draft() const { return !lora_.empty(); }
     /// The draft rows' noise ids are [1, uno_noise_bound()): the adapter's uno_noise_high, else the vocab.
     size_t uno_noise_bound() const { return noise_high_ ? noise_high_ : man_.vocab; }
@@ -390,6 +415,7 @@ private:
         /// executes (consecutive runs of one kernel alternate between the two)
         std::unique_ptr<xrt::bo> instr_alt;
         bool use_alt = false;
+        bool verify = false;                 ///< a verify pass's stream: step() leaves its patches alone
         uint32_t* iw() { return instr->map<uint32_t*>(); }
     };
 
@@ -449,6 +475,10 @@ private:
     int step_trace_ = 0;                       ///< OFLM_OPEN_STEP_TRACE (2 also prints one step dispatch by dispatch)
     bool merged_q41_ = false;
     bool layer_nan_ = false;                   ///< OFLM_OPEN_LAYER_NAN: per-layer xres census
+public:
+    /// --verify-check's bisection: each layer's output rows, decode (serial path) and verify alike, when set
+    std::vector<std::vector<float>>* layer_dump_ = nullptr;
+private:
     size_t dump_seq_ = 0;
     void layer_nan_check(xrt::bo& xres, int layer);                  ///< OFLM_GGUF_POOL_Q41 rewrote the gguf section onto the q4_1 twin
     /// OFLM_OPEN_SPIN_US: poll a command's state for this long before blocking on it. A PROBE,
@@ -469,6 +499,13 @@ private:
     int image_token_id_ = -1;
     bool mrope_on_ = false;
     int64_t mrope_pos_ = 0;
+    // step_gemm_prompt's M-RoPE inputs (step_gemm_prompt_mrope, or the counter after an image): row t of the
+    // prompt starting at position mpos_base_ takes mpos_block_[3 t..]; embeds_ replaces some rows' embeddings
+    const int64_t* mpos_block_ = nullptr;
+    size_t mpos_base_ = 0;
+    const std::vector<const float*>* embeds_ = nullptr;
+    /// the AttnGeom's M-RoPE fields for a block starting at position pos0 (nothing without a prompt's mpos)
+    void block_mrope(size_t pos0, host::AttnGeom& g) const;
     size_t ptab_dirty_ = 0;                    ///< rows [0, dirty) hold per-request records; reset() restores them
 
     // ---- the block route (manifest.hpp's GemmBlockProgram)
@@ -476,6 +513,7 @@ private:
     std::string prefill_route_;  ///< "fast" | "lean" on a set that carries both, "" on a set with one route
     bool moe_batch_on_ = true;   ///< the token-batched expert kernel where the set carries it (OFLM_OPEN_MOE_BATCH=0 off)
     bool attn_block_on_ = true;  ///< the attention products on the NPU where the set carries them (OFLM_OPEN_ATTN_BLOCK=0 off)
+    bool fa256_on_ = true;       ///< a full layer's block attention as one attn_fa256 dispatch where the set carries it (OFLM_OPEN_ATTN_FA=0 off)
     bool layer_major_on_ = true; ///< the whole prompt through each layer before the next (OFLM_OPEN_LAYER_MAJOR=0 off)
     bool stage_major_on_ = true; ///< each GEMM step over every block, overlapping the host (OFLM_OPEN_STAGE_MAJOR=0 off)
     bool attn_shl_on_ = true;    ///< the staged attention's hi / lo scores as one stacked product where the set has it (OFLM_OPEN_ATTN_SHL=0 off)
@@ -704,6 +742,7 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
         double submit_ms = 0;    ///< set_arg + start
         double gap_ms = -1;      ///< host gap since the previous dispatch RETURNED (the timeout diagnostic's)
         bool ctx_change = false; ///< the dispatch before it ran in another hardware context
+        uint64_t id = 0;         ///< dispatches_ after its start: equal at the wait means nothing queued behind it
         std::chrono::steady_clock::time_point t0, t1;   ///< entry, and the moment start() returned
         xrt::run r;
         bool active() const { return k != nullptr; }
@@ -725,6 +764,48 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
         std::vector<float> w, bias, down_bias;   ///< [experts][hidden_real], [experts], [experts][hidden_real]
     };
     std::map<int, GxRouter> gx_router_;
+    struct SharedQ8 {
+        host::Q8Rows ug, down;   ///< [up | gate] rows, down
+        std::vector<float> gw;   ///< the sigmoid gate's weights
+    };
+    std::map<int, SharedQ8> shared_q8_;
+    /// add == nullptr: res += shared(xm) in act. Otherwise add = shared(xm), act untouched (the overlapped decode path).
+    void shared_q8(const Step& s, int layer, float* add = nullptr, xrt::bo* actp = nullptr);
+    void route_rows(Kern& k, int layer, const std::vector<uint64_t>& offs, xrt::bo& act);
+    bool verify_on_ = false;
+    bool mtp_on_ = false;
+    const LayerType* mtp_type_ = nullptr;
+    host::Q8Rows mtp_eh_;
+    std::vector<float> mtp_enorm_, mtp_hnorm_, out_norm_;
+    double mtp_eps_ = 1e-6;
+    size_t verify_rows_ = 0;
+    // a linear layer's state_ is a view of its ring at state_base_: a commit moves the view, not the state
+    static constexpr size_t kStateRing = 16;
+    std::vector<xrt::bo> state_ring_;          ///< per layer: the kStateRing-slot parent, empty when not a ring
+    size_t state_base_ = 0;
+    std::vector<xrt::bo> vact_;                ///< per layer: the verify pass's [row][act] scratch
+    std::map<std::string, xrt::bo> vrow_sub_;  ///< `name@r` row views of the verify globals
+    std::vector<std::vector<float>> verify_logits_;
+    double verify_ms_ = 0;
+    std::vector<float> shared_add_;
+    bool recover_lost_ = true;
+    uint64_t recovered_ = 0;
+    uint64_t force_recover_at_ = 0;
+    bool in_step_ = false;
+    int lost_layer_ = -1;                        ///< a decode layer whose routed dispatch was lost, to run again
+    std::vector<xrt::run> lost_runs_;
+    std::vector<std::unique_ptr<xrt::kernel>> dead_kerns_;
+    std::vector<std::unique_ptr<xrt::hw_context>> dead_ctxs_;
+    /// xres and the recurrent state before a layer's first dispatch, in slot l & 1
+    struct Snap { int state_layer = -1, xres_layer = -1; std::vector<uint8_t> state, xres; };
+    Snap snap_[2];
+    void snapshot_state(int l);
+    void snapshot_xres(int l);
+    bool recoverable(const Inflight& f) const;
+    void redo_layer(int l, bool with_shared);
+    /// A lost command leaves its hardware context dead: make a new one and new kernel objects on it.
+    void rebuild_context(const std::string& ctx);
+    bool shared_overlap_ = true;
     void log(const std::string& s) const;
 
     // ---- the block route's helpers (core.cpp)
@@ -910,6 +991,10 @@ void step_impl(int token, const float* x, bool want_logits, const int64_t* mpos,
     /// sigmoid(gate) -- or ungated when gate is null (a dense layer).
     void attention_npu(int l, const host::AttnGeom& g, const float* Q, const float* gate, const uint16_t* kv,
                        size_t kv_row_elems, float* og);
+    /// The attn_fa256 stream for a window that ends at `rows`, or null when the set has none or the cache is shorter.
+    const std::string* fa256_tier(int l, size_t rows);
+    /// The block's attention as one attn_fa256 dispatch; the block's cache rows must already be on the device.
+    void attention_fa256(int l, const host::AttnGeom& g, const float* Q, const float* gate, float* og);
 };
 
 }  // namespace open_qwen36
