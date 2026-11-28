@@ -16,11 +16,11 @@ metadata and artifact hashes. HTTP remains separately measured with
 |---|---|
 | Block execution | The checked release designs have four operations per layer and four batch tiers per family, under one resident xclbin. MiniLM loaded all 16 streams on the NPU and passed the batch-identity warm-up. The long-input designs need the same runtime check. |
 | Performance | The published OFLM page measures short-input batching. Add matched CPU comparisons, at-limit latency and throughput, and the cost of the host stages. The Windows host is a Ryzen AI 9 HX PRO 370, Windows build 26200, NPU driver 32.0.20102.3930. |
-| Context | MiniLM served its published 256-token limit and BGE served 512-token inputs. GTE matched the publisher at 8,192 tokens. Nomic passed local publisher parity at 8,192 tokens with dynamic RoPE. Phlegm's length routing needs hardware parity and measurement. |
-| NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. The local GTE and Nomic worker also dispatches attention and softmax to the NPU. Tokenization, embedding lookup, normalization, activation, and pooling remain on the host. Release serving integration and profiling are open. |
+| Context | MiniLM served its published 256-token limit and BGE served 512-token inputs. GTE matched the publisher at 8,192 tokens. The Nomic Q8_0 GGUF pack passed Phlegm HTTP parity at 2,048 and 8,192 tokens with dynamic RoPE, at all five Matryoshka widths and in both request orders (2026-11-28). Nomic and GTE need a 512-token tier between 64 and 8,192; see the 2026-11-28 results. |
+| NPU coverage | QKV projection, attention output projection, and both FFN projections dispatch to the NPU. GTE and Nomic run attention and softmax on the NPU. NPU attention passed end-to-end parity for all four absolute-position encoders, but each layer then switches between two xclbins. It is faster than compact host attention only for BGE-large and BGE-base at batch 4. Tokenization, embedding lookup, normalization, activation, and pooling remain on the host. |
 | Speculative decode | Not applicable to an encoder. |
 | Published input weights | The registry currently pulls safetensors. The cold tool rebuilt all six Q8_0 candidates directly from GGUF. Serving evidence covers MiniLM at 256 and BGE, GTE and Nomic at 512. The long quantized Phlegm runs and automatic registry installation remain open. |
-| Serving and features | Run `oflm-test --embedding` on each tag. Exercise Nomic task prefixes and GTE multilingual inputs. Check GTE sparse output support and the publishers' elastic dimensions separately from full-width dense vectors. |
+| Serving and features | Run `oflm-test --embedding` on each tag. GTE sparse output passed live Phlegm parity at 13, 12 and 8,192 tokens (2026-11-28). Nomic Matryoshka widths passed live at 2,048 and 8,192. GTE elastic widths through HTTP remain open. |
 
 | Tag | Published input length to verify | Design family |
 |---|---:|---|
@@ -805,6 +805,119 @@ and hold it through the final control. Their Phlegm children serialize on
 a lock scoped to the acquired lease. A Windows synthetic test verified
 that acquisition waited for an external holder and that the shared lock
 was released after both a passing and a failing trial.
+
+## 2026-11-28 hardware results
+
+Strix Point, Ryzen AI 9 HX PRO 370, Windows 26200, NPU driver 32.0.20102.3930,
+Balanced power scheme. NPU runs held the Arbiter `npu` lease; benchmarks held
+`--measure`. All models served their Q8_0 GGUF through the Phlegm GGUF cache with
+the compact-score worker (SHA-256 prefix `d5c86de9`).
+
+### Length tiers for Nomic and GTE (2026-11-23 run, recorded now)
+
+The bracketed comparison replaced the 64-token short route with a 512-token design.
+For 512-token inputs the 512 design was 10–17 times faster than the 8,192 design.
+For 64-token inputs it was 2–5 times slower than the 64-token design. Medians in ms;
+the 8,192-design figure is the geometric mean of the bracketing controls.
+
+| Model | Case | 8,192 design | 512 design, host attention | 512 design, NPU attention |
+|---|---|---:|---:|---:|
+| Nomic | 512 × 1 | 1,327 | 117.6 | 123.5 |
+| Nomic | 512 × 4 | 5,274 | 418.3 | 304.2 |
+| GTE | 512 × 1 | 1,689 | 134.8 | 163.4 |
+| GTE | 512 × 4 | 6,932 | 484.9 | 422.3 |
+
+Both long-context encoders therefore need three tiers: 64, 512 and 8,192. Summaries
+`nomic-embed-text-v1.5-middle-20261123-163657-summary.json` (SHA-256
+`8c2f009d45dcee4984a05ebd8c881debd0fc2bb3f706fd94a58eb7ee7c928d3b`) and
+`Alibaba-gte-multilingual-base-middle-20261123-163902-summary.json` (SHA-256
+`ada4268e16f1167097f99ff8fdd07e28a6969e01b445f0b5afd8ddd4fde525e8`) under
+`.plans/bert/bench-results/`.
+
+### MiniLM host attention pruning (2026-11-23 run, recorded now)
+
+Speedups against the bracketing single-worker controls. The controls drifted
+8–17%, so treat the ratios as provisional.
+
+| Case | Query pruning | Query and key pruning | Compact scores | Compact scores with 64-token route |
+|---|---:|---:|---:|---:|
+| 64 × 1 | 1.39 | 1.43 | 1.58 | 1.59 |
+| 64 × 4 | 1.60 | 1.68 | 2.04 | 3.59 |
+| 256 × 1 | 1.10 | 1.00 | 1.16 | 0.98 |
+| 256 × 4 | 1.11 | 1.02 | 1.16 | 1.14 |
+
+Summary `minilm-query-pruning-20261123-163140-summary.json`, SHA-256
+`cc172ca4b3f3e6a1a40b29f63cd2be1d93f0bfd43781e920700b5433a6720f72`.
+
+### Attention images for MiniLM and BGE
+
+The equal-tile 12 × 32 images no longer fault: every dispatch completed, at 0.6 ms
+(256) and 1.3 ms (512) warm. Native-BF16 builds of both 12 × 32 capacities built
+and verified their manifests. Device results, worst-head relative L2:
+
+| Image | Synthetic half / full keys | Captured first / last layer |
+|---|---:|---:|
+| 12 × 32 at 256, BFP16 | 0.0342 / 0.0310 | 0.0178 / 0.0214 |
+| 12 × 32 at 256, native BF16 | 0.0319 / 0.0260 | 0.0092 / 0.0200 |
+| 12 × 32 at 512, BFP16 | 0.0309 / 0.0269 | 0.0174 / 0.0121 |
+| 12 × 32 at 512, native BF16 | 0.0339 / 0.0269 | 0.0096 / 0.0111 |
+| 16 × 64 at 512, native BF16 | 0.0304 / 0.0292 | 0.0136 / 0.0095 |
+
+All runs were finite and bit-repeatable, with minimum sampled row cosine above 0.9987.
+Native BF16 roughly halves the error on real captures. It leaves the synthetic
+N(0, 0.5) case at the 0.03 limit. The validated 12 × 64 image scored 0.024–0.026
+on the same check. The limit was not changed. Raw log `hardware-attention-native.log`,
+SHA-256 `3d061e76ec3cc51045b47e76080e282dbfdf2ce634cb61d379f369aa122ca043`.
+
+End to end through Phlegm HTTP with NPU attention, all four encoders matched the
+publisher CPU model on single and batch-4 fixtures up to their limits. The limit
+plus one returned HTTP 400. Worst cosines: MiniLM 0.999466, BGE-small 0.999798,
+BGE-base 0.999483 (12 × 64 image), BGE-large 0.999625. Raw log
+`e2e-attention-native.log`, SHA-256
+`00a13104be405b401b55ccfa6ec8fff5f533123f0645a1fbdface5a7e6517645`.
+
+Full-context `phlegm bench embed`, host / NPU / host bracketing, seven runs after
+two warm-ups, controls within 3.4%. The attention stage is the median of host
+attention plus softmax, or of NPU attention plus its I/O.
+
+| Model | Case | Host ms | NPU attention ms | Speedup | Attention stage, host → NPU ms |
+|---|---|---:|---:|---:|---|
+| MiniLM | 256 × 1 | 10.8 | 40.2 | 0.27 | 3.1 → 16.2 |
+| MiniLM | 256 × 4 | 26.6 | 60.6 | 0.44 | 10.5 → 28.7 |
+| BGE small | 512 × 1 | 46.8 | 97.8 | 0.48 | 21.8 → 42.2 |
+| BGE small | 512 × 4 | 162.3 | 204.7 | 0.79 | 90.3 → 104.7 |
+| BGE base | 512 × 1 | 71.1 | 103.5 | 0.69 | 34.7 → 36.5 |
+| BGE base | 512 × 4 | 266.7 | 246.8 | 1.08 | 145.2 → 97.3 |
+| BGE large | 512 × 1 | 312.0 | 299.1 | 1.04 | 180.2 → 117.9 |
+| BGE large | 512 × 4 | 1,078.5 | 884.8 | 1.22 | 643.3 → 396.4 |
+
+The attention dispatch is 0.6–1.3 ms in the harness, but the served stage costs
+2.7 ms per MiniLM layer at batch one. Each layer switches from the projection
+xclbin to the attention xclbin and back. R-0003 and R-0008 put one switch at
+0.45–3.4 ms. Until attention shares the projection image or one full ELF, host
+attention stays selected for MiniLM, BGE-small and BGE-base at batch one.
+Summary `attention-bench-summary.txt`, SHA-256
+`2efc4546b03777bf62eba6dfcaf3b187dfd2a14b7c603005ae5361eef22dcef6`.
+
+### Live Phlegm gates
+
+- Nomic Q8_0, 8,192-position pack, NPU attention: 2,048 → 8,192 → 2,048 tokens passed
+  at widths 64–768 with minimum cosine 0.996409. The ordered batch of two was
+  byte-identical, and 8,193 tokens returned HTTP 400. Single requests took 1.36–1.52 s.
+  Raw log `phlegm-nomic-q8-20261128.log`, SHA-256
+  `a715c5211707f67233cd7a7b1c57e6b056adaf72a97736c38fce7c88dc035f99`.
+- The first attempt failed the final 2,048-token leg at cosine 0.956. The worker
+  returned identical bytes for that input before and after the 8,192 request. The
+  CPU reference was at fault. Transformers resets its dynamic rotary base only for
+  inputs below 2,048 tokens. An exact 2,048-token call after an 8,192-token call
+  therefore kept the scaled base (CPU self-cosine 0.939820). `check.py` now resets
+  the rotary state before each reference call. The same sequence then gave CPU
+  self-cosine 1.0.
+- GTE Q8_0 with the sparse head: 13-, 12- and 8,192-token inputs kept every positive
+  token ID (8, 7 and 54). Sparse cosines were 0.999957, 0.999996 and 0.999841, with
+  maximum score differences of 0.0292, 0.0067 and 0.0486. Raw log
+  `phlegm-gte-q8-sparse-20261128.log`, SHA-256
+  `a5b9382c0179356b3065b60ec1c6098e45e165d1c94aaab01ceff95495c69fa4`.
 
 ## Cold packing from GGUF
 

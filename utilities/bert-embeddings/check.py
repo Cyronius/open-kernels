@@ -106,6 +106,11 @@ def cpu_reference(directory, prefix, max_length, dimensions=None):
                            truncation=False, padding=False)
         if inputs.input_ids.shape != (len(texts), length):
             raise ValueError("reference tokenizer disagrees with the fixture length")
+        # Transformers keeps a dynamic rotary base after a longer call unless the next is below 2048 tokens.
+        for module in model.modules():
+            if hasattr(module, "original_inv_freq") and hasattr(module, "original_max_seq_len"):
+                module.inv_freq = module.original_inv_freq.clone()
+                module.max_seq_len_cached = module.original_max_seq_len
         hidden = model(**inputs).last_hidden_state
         pooled = hidden[:, 0] if use_cls else hidden.mean(dim=1)
         if config.model_type == "nomic_bert":
