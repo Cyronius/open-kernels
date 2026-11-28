@@ -86,7 +86,7 @@ Audit: `spec.md` OPEN-FAMILY-GPTOSS, "Production bar: gpt-oss:20b" (2026-11-21).
 
 ### qwen3.6-moe:35b-a3b
 
-Audit: `spec.md` OPEN-FAMILY-QWEN36MOE-GGUF, "Production bar: qwen3.6-moe:35b-a3b" (2026-11-24, updated 2026-11-26).
+Audit: `spec.md` OPEN-FAMILY-QWEN36MOE-GGUF, "Production bar: qwen3.6-moe:35b-a3b" (2026-11-24, updated 2026-11-27, closed 2026-11-28).
 Plans: [qwen36moe-production-bar.md](specs/open-engine/plans/qwen36moe-production-bar.md),
 [qwen36moe-attn-fa256.md](specs/open-engine/plans/qwen36moe-attn-fa256.md), handoff
 [qwen36moe-handoff.md](specs/open-engine/plans/qwen36moe-handoff.md).
@@ -108,6 +108,9 @@ Plans: [qwen36moe-production-bar.md](specs/open-engine/plans/qwen36moe-productio
   experts' hidden round trip); the DeltaNet conv and delta rule and the vision tower on the host; the token-batched
   expert kernel core-bound at 8 tokens a visit; `attn_fa256` at 2.3x its transfer floor; the verify pass at 1.67
   plain steps, which leaves MTP near break-even on Strix Halo.
+- Closed 2026-11-28: the bar is met. Next on this model, in order: a verify pass of three or four rows near the
+  price of two (the drafter's payoff on Strix Halo), then a long-context profile on the shipped set (the 131k /
+  262k numbers predate it; at 131k the host stages were over half of prefill).
 - OFLM side: registry entry (Unsloth MTP GGUF, `UD-Q4_K_S`, qwen35moe, 262,144, mmproj and MTP drafter); `oflm add` /
   `serve` / `bench`; benchmark page; README row.
 

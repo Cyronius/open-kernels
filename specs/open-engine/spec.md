@@ -1696,6 +1696,22 @@ images), NPU power mode Default (setting it needs root there), on a box shared w
 | Benchmarks | Done for the kernel side: `phlegm bench --development` on Strix Point (a measure unit) and on Strix Halo (Linux, Default power mode, a shared box), 512 to 4k (below; latest 2026-11-27, the shipped set: prefill 223 / 277 / 313 / 332, decode 13.5 / 13.1 / 12.5 / 11.4 tok/s), with CLI runs to 262k; the docs page and README row are OFLM's | bench tables |
 | Features | Reasoning, tool calling, the MTP head (drafter row) and vision pass. Vision: the mmproj tower on the host CPU (named below), image prompts on the block route at M-RoPE positions, `phlegm serve` image parts, answers equal to llama.cpp's on the test image (OPEN-VISION-BLOCK, SERVER-IMAGE-INPUT). Left out: video input (phlegm takes no video) | this table |
 
+**Closed 2026-11-28: the bar is met.** Every row above is measured. Two rows pass on their evidence but are the
+weakest, and are the next work on this model, not bar gaps:
+
+1. Drafter: MTP's one-token drafts are taken about 90 % of the time, but the two-row verify pass costs 1.67 plain
+   steps, so on Strix Halo's one-context decode MTP nets 1.05x on code and phlegm falls back to plain steps on prose.
+   A verify pass of three or four rows near the price of two would lift MTP and any other drafter (MemDraft too,
+   with a Qwen3.6-trained table).
+2. Long context is not re-profiled on the shipped set: the 131k / 262k rows of the speed table are Strix Point runs
+   from before one-context decode and `attn_fa256`, and at 131k the host stages (DeltaNet conv and delta rule, the
+   layer tails, routers) took 1,066 s of prefill against the NPU's 910 s. The near-optimal audit covers short-context
+   decode.
+
+Caveats on the evidence: the Strix Halo numbers are NPU power mode Default on a shared box; `phlegm bench` stops at
+4k and longer contexts are CLI and `phlegm serve` needle runs; the lost routed dispatch (below) is recovered, not
+gone.
+
 Reliability: about one routed MoE dispatch in 30,000 to 300,000 is lost by the driver or firmware (OPEN-ROUTE-ALT).
 The engine runs the layer again on a new hardware context (OPEN-ROUTE-REDO); 8 real losses in one gate run were
 recovered with bit-identical logits.

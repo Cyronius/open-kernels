@@ -677,3 +677,5 @@ drafter); `oflm add` / `serve` / `bench`; benchmark page; README row; #240 check
   one-token drafts taken against MTP's 90 %, 0.95-1.05x against MTP's 1.20x on a loaded box; MTP stays the drafter. The CLI hook used for this
   (`OFLM_SPEC_MEMDRAFT`) is not committed: a Qwen3.6-trained table, and a verify pass wider than two rows, would come
   first.
+- 2026-11-28: bar closed (spec.md, the production-bar table's closing note). The drafter row and long context are the
+  weakest and the next work: a wider verify pass first, then a long-context profile on the shipped set.
